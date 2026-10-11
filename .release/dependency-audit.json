@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-11T08:55:45+00:00",
+  "checked_at": "2026-10-11T10:47:51+00:00",
   "manifest_sha256": "9b9b06499ac50d3669becf22ac2223879fe1acabcb92ac7606fa8feebf8eaba2",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.2.1",
+  "project_version": "0.3.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -91,7 +91,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.2.1 consumer-integration follow-up: registry candidates remain hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, Ruff 0.17.0 and markdownlint-cli2 0.23.3, all within existing lower bounds and Python 3.14 support. Reviewed official notes at https://hatch.pypa.io/dev/history/hatchling/ https://build.pypa.io/en/stable/changelog.html https://packaging.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 and https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md during this integration. Explicit py314 and selected Ruff rules, standard strict mypy, Node 26.10.0; no changed bounds or pin exceptions. The prior 0.2.0 full gate passed 262 tests and isolated wheel checks. This follow-up only splits one diagnostic string to satisfy consumer E501, without changing its text or runtime behavior; 6 distribution checks and Ruff/mypy/Markdown passed. Fresh 0.2.1 sdist-derived wheel verified all exported components offline. A new clean environment normally resolved the explicit 0.2.1 candidate plus packaging 26.3; package and metadata origins and all original installed wheel members except rewritten RECORD matched the wheel bytes. All six consumer snapshots regenerated from that installed candidate. Windows native remains unexecuted on macOS.",
+    "note": "Release 0.3.0 adds shared exact-candidate review with mandatory first-repository baselines, fixes Windows unit-test host API isolation, and owns Git hook process trees. New git-flow merges now require repository-local Python, so this release advances the compatibility lane. Reviewed official release notes at https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 and https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . Hatchling 1.32.4 restores its build-hook generic interface; this project uses the standard package builder. Build 1.6.1 fixes Windows symlink detection; packaging 26.3 extends version ranges without requiring API changes here. Explicit py314 target and selected Ruff rules avoid changed defaults; standard strict mypy and Node 26 remain supported. Validated installed hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, Ruff 0.17.0 and markdownlint-cli2 0.23.3: 264 independent toolkit tests passed; 50 baseline/chain/policy/path cases and 3 new component-closure regressions passed; strict mypy, Ruff and Markdown passed. A fresh 0.3.0 sdist-derived wheel and all component exports passed the isolated offline distribution check. NT-like interfaces passed 56 process unit cases; native Windows rerun remains pending. Shared online review is POSIX-only; offline verification is portable. No dependency pins, bounds, additions, or quality-policy relaxations. Final exact-candidate review and complete merge gates are separate evidence and remain required before integration.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,8 +91,17 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
         path = tools / name
         path.write_text(
             "#!/usr/bin/env python3\nimport json, os, sys\n"
+            "from pathlib import Path\n"
             "with open(os.environ['BOOTSTRAP_LOG'], 'a') as stream:\n"
             "    stream.write(json.dumps(sys.argv) + '\\n')\n"
+            "if sys.argv[1:2] == ['venv'] and '--clear' not in sys.argv:\n"
+            "    python = Path(sys.argv[-1]) / 'bin/python'\n"
+            "    python.parent.mkdir(parents=True)\n"
+            f"    python.symlink_to({sys.executable!r})\n"
+            "if sys.argv[1:3] == ['pip', 'compile']:\n"
+            "    requirements = Path(sys.argv[5])\n"
+            "    Path(os.environ['BOOTSTRAP_LOG'] + '.requirements').write_text(\n"
+            "        requirements.read_text())\n"
         )
         path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
@@ -102,7 +112,9 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
     result = invoke("rebuild-env.sh", root, "", "--source", f"example={source}")
     assert result.returncode == 0, result.stderr
     commands = [json.loads(line)[1:] for line in log.read_text().splitlines()]
-    assert commands == [
+    assert commands[0][:3] == ["venv", "--python", "3.14"]
+    assert commands[1][:3] == ["pip", "compile", "--python"]
+    assert commands[2:] == [
         ["venv", "--clear", "--python", "3.14", ".venv"],
         [
             "pip",
@@ -110,10 +122,8 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
             "--refresh",
             "--python",
             ".venv/bin/python",
-            "-e",
-            ".[dev]",
-            "--editable",
-            str(source),
+            "--requirements",
+            commands[1][4],
         ],
         [
             "install",
@@ -123,11 +133,17 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
             "--no-fund",
         ],
     ]
+    assert Path(str(log) + ".requirements").read_text() == (
+        f"-e example @ {source.as_uri()}\n-e .[dev]\n"
+    )
     log.unlink()
     (source / "pyproject.toml").unlink()
     invalid = invoke("rebuild-env.sh", root, "", "--source", f"example={source}")
-    assert invalid.returncode == 1
-    assert not log.exists(), "invalid source must be rejected before clearing .venv"
+    assert invalid.returncode != 0
+    assert all(
+        "--clear" not in json.loads(line) for line in log.read_text().splitlines()
+    ), "invalid source must be rejected before clearing .venv"
+    log.unlink()
     help_result = invoke(
         "rebuild-env.sh", root, "scripts/forbidden-after-help.py", "--help"
     )

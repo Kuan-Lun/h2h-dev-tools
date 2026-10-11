@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import runpy
+import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from h2h_dev_tools.ci_dependencies import main
 
 _INSTALLER = Path(__file__).parents[1] / "scripts" / "install-ci-dependencies.py"
 
@@ -54,7 +57,7 @@ required_plugins = ["pytest-xdist>=77,<78", "pytest-custom>=66"]
     monkeypatch.setattr(sys, "argv", arguments)
     monkeypatch.chdir(tmp_path)
 
-    runpy.run_path(str(installer), run_name="__main__")
+    main(repository=installer.parents[1])
 
     expected = [
         "pytest>=99,!=99.1",
@@ -83,7 +86,7 @@ required_plugins = ["pytest>=9"]
     calls = _capture_pip(monkeypatch)
     monkeypatch.setattr(sys, "argv", [str(installer), "--pytest-plugins", "pytest"])
 
-    runpy.run_path(str(installer), run_name="__main__")
+    main(repository=installer.parents[1])
 
     assert calls == [
         [sys.executable, "-m", "pip", "install", "--upgrade", "pytest>=9", "pytest<10"]
@@ -104,7 +107,7 @@ def test_ci_install_rejects_missing_declarations_before_installing(
     monkeypatch.setattr(sys, "argv", [str(installer), *arguments])
 
     with pytest.raises(SystemExit) as error:
-        runpy.run_path(str(installer), run_name="__main__")
+        main(repository=installer.parents[1])
 
     assert error.value.code == 2
     assert not calls
@@ -125,4 +128,46 @@ def test_ci_install_propagates_pip_failure(
     monkeypatch.setattr(sys, "argv", [str(installer), "pytest"])
 
     with pytest.raises(subprocess.CalledProcessError):
-        runpy.run_path(str(installer), run_name="__main__")
+        main(repository=installer.parents[1])
+
+
+def test_ci_source_entry_reads_its_checkout_outside_working_directory(
+    tmp_path: Path,
+) -> None:
+    installer = _fixture_installer(
+        tmp_path, '[project.optional-dependencies]\ndev = ["pytest>=99"]\n'
+    )
+    source = _INSTALLER.parents[1] / "src/h2h_dev_tools"
+    shutil.copytree(
+        source,
+        installer.parents[1] / "src/h2h_dev_tools",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            """
+import json, runpy, subprocess, sys
+subprocess.run = lambda command, **kwargs: print(json.dumps(command))
+sys.argv = [sys.argv[1], 'pytest']
+runpy.run_path(sys.argv[0], run_name='__main__')
+""",
+            str(installer),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "pytest>=99",
+    ]

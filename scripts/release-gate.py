@@ -17,6 +17,20 @@ def candidate() -> tuple[str, str, str]:
     return git("rev-parse", "HEAD"), git("rev-parse", "MERGE_HEAD"), git("write-tree")
 
 
+def verify_review(tree: str) -> None:
+    subprocess.run(
+        (
+            sys.executable,
+            "scripts/review-code.py",
+            "verify",
+            "--index",
+            "--expected-tree",
+            tree,
+        ),
+        check=True,
+    )
+
+
 def main() -> None:
     before = candidate()
     if git("diff", "--name-only"):
@@ -32,12 +46,15 @@ def main() -> None:
     if profile == "documentation":
         command = (sys.executable, "scripts/check-docs.py", "--index", "--base", "HEAD")
     elif profile == "full":
+        verify_review(before[2])
         command = ("scripts/check-full.sh",)
     else:
         raise ValueError(f"unrecognized candidate profile: {profile}")
     subprocess.run(command, check=True)
     if candidate() != before or git("diff", "--name-only"):
         raise ValueError("merge candidate changed during the gate")
+    if profile == "full":
+        verify_review(before[2])
     print(f"Verified {profile} merge candidate {before[2]}")
 
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -44,7 +46,7 @@ def repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
-def write_project(repository: Path, version: str) -> None:
+def write_project(repository: Path, version: str, *, allow_none: bool = False) -> None:
     text = f'''[project]
 name = "release-fixture"
 version = "{version}"
@@ -54,6 +56,7 @@ release-paths = ["src/**"]
 development-paths = ["README.md", "package.json", ".release/**"]
 initial-version = "0.1.0"
 dedicated-release-commit = true
+allow-none-impact = {str(allow_none).lower()}
 '''
     (repository / "pyproject.toml").write_text(text)
     (repository / "package.json").write_text('{"devDependencies": {}}')
@@ -70,6 +73,325 @@ dedicated-release-commit = true
     directory = repository / ".release"
     directory.mkdir(exist_ok=True)
     (directory / "dependency-audit.json").write_text(json.dumps(receipt))
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        (None, 'dev = ["pytest>=9"]'),
+        ('dev = ["pytest>=9"]', None),
+        ('dev = ["pytest>=9"]', 'dev = ["pytest>=10"]'),
+        (None, ""),
+        ("", None),
+        (None, "dev = []"),
+        ('runtime = ["httpx>=0.28"]', 'runtime = ["httpx>=0.28"]\ndev = []'),
+        ('runtime = ["httpx>=0.28"]\ndev = []', 'runtime = ["httpx>=0.28"]'),
+    ],
+)
+def test_dev_extra_changes_do_not_require_a_release(
+    repository: Path, before: str | None, after: str | None
+) -> None:
+    write_project(repository, "0.1.0")
+    manifest = repository / "pyproject.toml"
+    original = manifest.read_text()
+    if before is not None:
+        manifest.write_text(original + "\n[project.optional-dependencies]\n" + before)
+    base = commit(repository, "feat: baseline")
+    manifest.write_text(original)
+    if after is not None:
+        manifest.write_text(original + "\n[project.optional-dependencies]\n" + after)
+    task = commit(repository, "chore!: change development requirements")
+    version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("dev = []", "runtime = []"),
+        ("runtime = []", "dev = []"),
+        ("dev = []", 'dev = []\nruntime = ["httpx>=0.28"]'),
+        ('dev = []\nruntime = ["httpx>=0.28"]', "dev = []"),
+        ('runtime = ["httpx>=0.28"]', 'dev = []\nruntime = ["httpx>=0.29"]'),
+    ],
+)
+def test_dev_extra_normalization_preserves_runtime_extra_changes(
+    repository: Path, before: str, after: str
+) -> None:
+    write_project(repository, "0.1.0")
+    manifest = repository / "pyproject.toml"
+    original = manifest.read_text()
+    manifest.write_text(original + "\n[project.optional-dependencies]\n" + before)
+    base = commit(repository, "feat: baseline")
+    manifest.write_text(original + "\n[project.optional-dependencies]\n" + after)
+    task = commit(repository, "fix: change public optional requirements")
+    with pytest.raises(ValueError, match="release surface changed without"):
+        version_policy.validate(base, task, task)
+
+
+def test_dev_extra_does_not_hide_other_project_metadata(repository: Path) -> None:
+    write_project(repository, "0.1.0")
+    manifest = repository / "pyproject.toml"
+    base = commit(repository, "feat: baseline")
+    manifest.write_text(
+        manifest.read_text().replace(
+            "dependencies = []", 'dependencies = ["packaging>=26"]'
+        )
+        + "\n[project.optional-dependencies]\ndev = []\n"
+    )
+    task = commit(repository, "fix: change runtime and development requirements")
+    with pytest.raises(ValueError, match="release surface changed without"):
+        version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize("quote_paths", ["true", "false"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "說明.py",
+        "line\nbreak.py",
+        "carriage\rreturn.py",
+        "pair\r\nbreak.py",
+        '"quoted".py',
+        "back\\slash.py",
+        "space name.py",
+        "trailing.py\n",
+    ],
+)
+def test_changed_release_paths_preserve_exact_git_names(
+    repository: Path, quote_paths: str, name: str
+) -> None:
+    git(repository, "config", "core.quotePath", quote_paths)
+
+    def store(kind: str, content: bytes) -> str:
+        return (
+            subprocess.run(
+                ("git", "hash-object", "-t", kind, "-w", "--stdin"),
+                cwd=repository,
+                input=content,
+                capture_output=True,
+                check=True,
+            )
+            .stdout.decode("ascii")
+            .strip()
+        )
+
+    # Build raw Git trees without requiring the host filesystem or Windows
+    # index validation to accept every legal filename authored on POSIX.
+    blob = store("blob", b"public runtime behavior\n")
+    subtree = store("tree", b"100644 " + name.encode() + b"\0" + bytes.fromhex(blob))
+    candidate = store("tree", b"40000 src\0" + bytes.fromhex(subtree))
+    assert version_policy._changed_paths("master", candidate) == (f"src/{name}",)
+
+
+@pytest.mark.parametrize("operation", ["add", "rename-out", "delete"])
+def test_unicode_release_paths_require_and_accept_the_correct_version_bump(
+    repository: Path, operation: str
+) -> None:
+    write_project(repository, "0.1.0")
+    (repository / "src").mkdir()
+    public_path = repository / "src/工具.py"
+    if operation != "add":
+        public_path.write_text("public runtime behavior\n")
+    base = commit(repository, "feat: bootstrap development tools")
+    if operation == "add":
+        public_path.write_text("public runtime behavior\n")
+    elif operation == "rename-out":
+        public_path.rename(repository / "README.md")
+    else:
+        public_path.unlink()
+    changed = commit(repository, "fix: change shipped surface")
+    expected = {"src/工具.py"}
+    if operation == "rename-out":
+        expected.add("README.md")
+    assert set(version_policy._changed_paths(base, changed)) == expected
+    with pytest.raises(ValueError, match="release surface changed without"):
+        version_policy.validate(base, changed, changed)
+    write_project(repository, "0.1.1")
+    task = commit(repository, "chore(release): bump version to 0.1.1")
+    version_policy.validate(base, task, task)
+
+
+_NONE_MESSAGE = (
+    "refactor!: clarify source comments\n\n"
+    "Version-Impact: none\nVersion-Reason: Only comments change."
+)
+
+
+def none_history(repository: Path, version: str = "0.1.0") -> str:
+    write_project(repository, version, allow_none=True)
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    return commit(repository, "feat: baseline")
+
+
+@pytest.mark.parametrize("bump", [False, True])
+@pytest.mark.parametrize("version,target", [("0.1.0", "0.1.1"), ("1.2.3", "1.2.4")])
+@pytest.mark.parametrize("exception_first", [False, True])
+def test_none_commit_does_not_exempt_later_runtime_or_promote_its_lane(
+    repository: Path, bump: bool, version: str, target: str, exception_first: bool
+) -> None:
+    base = none_history(repository, version)
+    source = repository / "src/tool.py"
+    if exception_first:
+        source.write_text("# Clarification\nvalue = 1\n")
+        commit(repository, _NONE_MESSAGE)
+    else:
+        source.write_text("value = 2\n")
+        commit(repository, "fix: correct runtime behavior")
+    source.write_text("# Clarification\nvalue = 2\n")
+    task = commit(
+        repository,
+        "fix: correct runtime behavior" if exception_first else _NONE_MESSAGE,
+    )
+    if bump:
+        write_project(repository, target, allow_none=True)
+        task = commit(repository, f"chore(release): bump version to {target}")
+        version_policy.validate(base, task, task)
+    else:
+        with pytest.raises(ValueError, match="release surface changed without"):
+            version_policy.validate(base, task, task)
+
+
+def test_none_cannot_borrow_a_reason_from_another_commit(repository: Path) -> None:
+    base = none_history(repository)
+    (repository / "src/tool.py").write_text("# Clarification\nvalue = 1\n")
+    commit(repository, "style: clarify\n\nVersion-Impact: none")
+    (repository / "README.md").write_text("Documentation\n")
+    task = commit(repository, "docs: explain\n\nVersion-Reason: Only comments change.")
+    with pytest.raises(ValueError, match="must be used together"):
+        version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize("extra", ["runtime", "metadata", "unknown"])
+@pytest.mark.parametrize("committed", [False, True])
+def test_none_does_not_cover_later_commit_or_candidate_changes(
+    repository: Path, extra: str, committed: bool
+) -> None:
+    base = none_history(repository)
+    (repository / "src/tool.py").write_text("# Clarification\nvalue = 1\n")
+    task = commit(repository, _NONE_MESSAGE)
+    if extra == "runtime":
+        (repository / "src/tool.py").write_text("# Clarification\nvalue = 2\n")
+    elif extra == "metadata":
+        manifest = repository / "pyproject.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                "dependencies = []", 'dependencies = ["packaging>=26"]'
+            )
+        )
+    else:
+        (repository / "unknown-path").write_text(
+            "Not covered by the earlier exception\n"
+        )
+    git(repository, "add", ".")
+    candidate = git(repository, "write-tree")
+    if committed:
+        task = commit(repository, "fix: change another surface")
+    message = (
+        "unclassified" if extra == "unknown" else "release surface changed without"
+    )
+    with pytest.raises(ValueError, match=message):
+        version_policy.validate(base, candidate, task)
+
+
+def test_none_unknown_path_does_not_classify_another_unknown_path(
+    repository: Path,
+) -> None:
+    base = none_history(repository)
+    (repository / "one-unknown").write_text("Development support\n")
+    task = commit(
+        repository,
+        "chore: add support\n\nVersion-Impact: none\nVersion-Reason: Development only.",
+    )
+    version_policy.validate(base, task, task)
+    (repository / "another-unknown").write_text("Unclassified\n")
+    task = commit(repository, "chore: add another file")
+    with pytest.raises(ValueError, match="unclassified"):
+        version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_none_only_changes_allow_diverged_primary_and_completed_merge(
+    repository: Path, merged: bool
+) -> None:
+    base = none_history(repository)
+    git(repository, "update-ref", "refs/heads/master", base)
+    source = repository / "src/tool.py"
+    source.write_text("# Task comment\nvalue = 1\n")
+    task = commit(repository, _NONE_MESSAGE)
+    git(repository, "switch", "master")
+    # An independent edit to the same file forces an actual three-way result
+    # whose blob differs from both parents, without changing version metadata.
+    source.write_text("value = 1\n# Primary comment\n")
+    primary = commit(repository, "style: annotate primary")
+    git(repository, "merge", "--no-ff", "--no-commit", "task")
+    candidate = git(repository, "write-tree")
+    version_policy.validate(primary, candidate, task)
+    if merged:
+        git(repository, "commit", "-m", "Merge branch 'task'")
+        revision = git(repository, "rev-parse", "HEAD")
+        version_policy.validate(primary, revision, revision)
+
+
+def test_none_cannot_annotate_its_own_version_transition(repository: Path) -> None:
+    base = none_history(repository)
+    write_project(repository, "0.1.1", allow_none=True)
+    task = commit(
+        repository,
+        "chore(release): bump version to 0.1.1\n\nVersion-Impact: none\nVersion-Reason: No runtime change.",
+    )
+    with pytest.raises(ValueError, match="cannot accompany a version bump"):
+        version_policy.validate(base, task, task)
+
+
+def test_none_does_not_exempt_runtime_added_by_a_history_merge(
+    repository: Path,
+) -> None:
+    base = none_history(repository)
+    git(repository, "branch", "side", base)
+    source = repository / "src/tool.py"
+    source.write_text("# Task comment\nvalue = 1\n")
+    commit(repository, _NONE_MESSAGE)
+    git(repository, "switch", "side")
+    (repository / "README.md").write_text("Independent documentation\n")
+    commit(repository, "docs: add documentation")
+    git(repository, "switch", "task")
+    git(repository, "merge", "--no-ff", "--no-commit", "side")
+    # The merge's own extra content is not present in either normal parent
+    # contribution and must not inherit the earlier same-path annotation.
+    source.write_text("# Task comment\nvalue = 2\n")
+    task = commit(repository, "Merge branch 'side'")
+    with pytest.raises(ValueError, match="release surface changed without"):
+        version_policy.validate(base, task, task)
+    write_project(repository, "0.1.1", allow_none=True)
+    task = commit(repository, "chore(release): bump version to 0.1.1")
+    version_policy.validate(base, task, task)
+
+
+def test_none_fails_closed_when_history_merge_had_conflicts(repository: Path) -> None:
+    none_history(repository)
+    source = repository / "src/tool.py"
+    source.write_text("# Base comment\nvalue = 1\n")
+    base = commit(repository, "style: baseline comment")
+    git(repository, "branch", "side", base)
+    source.write_text("# Task comment\nvalue = 1\n")
+    commit(repository, _NONE_MESSAGE)
+    git(repository, "switch", "side")
+    source.write_text("# Side comment\nvalue = 1\n")
+    commit(repository, "style: independent comment")
+    git(repository, "switch", "task")
+    merge = subprocess.run(
+        ("git", "merge", "--no-ff", "--no-commit", "side"),
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert merge.returncode == 1 and "CONFLICT" in merge.stdout
+    source.write_text("# Resolved comment\nvalue = 1\n")
+    task = commit(repository, "Merge branch 'side'")
+    with pytest.raises(ValueError, match="none scope across a conflicted merge"):
+        version_policy.validate(base, task, task)
 
 
 def test_initial_release_requires_version_bound_candidate_audit(
@@ -151,6 +473,72 @@ def test_development_breaking_signal_does_not_change_tool_lane(
     checker.validate(base, task, task)
 
 
+@pytest.mark.parametrize("version,target", [("0.1.0", "0.1.1"), ("1.2.3", "1.2.4")])
+@pytest.mark.parametrize(
+    "quoted_subject",
+    [
+        "feat!: drop the old parser",
+        "feat(parser)!: drop the old parser",
+        "feat: introduce the parser",
+        "feat(parser): introduce the parser",
+    ],
+)
+def test_quoted_commit_subjects_do_not_promote_the_release(
+    repository: Path, version: str, target: str, quoted_subject: str
+) -> None:
+    write_project(repository, version)
+    base = commit(repository, "feat: baseline")
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    commit(
+        repository,
+        "fix: correct the parser\n\nThe earlier change was:\n"
+        + quoted_subject
+        + "\n\nThis correction preserves the public contract.",
+    )
+    write_project(repository, target)
+    task = commit(repository, f"chore(release): bump version to {target}")
+
+    version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize(
+    "version,target,message",
+    [
+        ("0.1.0", "0.2.0", "fix!: change the public contract"),
+        ("1.2.3", "2.0.0", "fix(parser)!: change the public contract"),
+        ("0.1.0", "0.1.1", "feat: add behavior"),
+        ("1.2.3", "1.3.0", "feat(parser): add behavior"),
+        (
+            "0.1.0",
+            "0.2.0",
+            "fix: change the parser\n\nDetails about the implementation.\n\n"
+            "BREAKING CHANGE: callers must supply the new option.\n"
+            "This replaces the former implicit default.",
+        ),
+        (
+            "1.2.3",
+            "2.0.0",
+            "fix: change the parser\n\nDetails about the implementation.\n\n"
+            "BREAKING CHANGE: callers must supply the new option.\n"
+            "This replaces the former implicit default.",
+        ),
+    ],
+)
+def test_real_subject_and_breaking_footer_keep_their_release_impact(
+    repository: Path, version: str, target: str, message: str
+) -> None:
+    write_project(repository, version)
+    base = commit(repository, "feat: baseline")
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    commit(repository, message)
+    write_project(repository, target)
+    task = commit(repository, f"chore(release): bump version to {target}")
+
+    version_policy.validate(base, task, task)
+
+
 def test_runtime_change_without_version_and_unknown_paths_fail(
     repository: Path,
 ) -> None:
@@ -201,3 +589,82 @@ def test_release_commit_cannot_mix_runtime_work_with_version(repository: Path) -
     task = commit(repository, "chore(release): bump version to 0.1.1")
     with pytest.raises(ValueError, match="may only change version and audit"):
         version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize("environment_ref", ["task", "missing-task"])
+def test_index_version_uses_the_original_merge_parent_after_task_advances(
+    repository: Path, monkeypatch: pytest.MonkeyPatch, environment_ref: str
+) -> None:
+    write_project(repository, "0.1.0")
+    base = commit(repository, "feat: bootstrap development tools")
+    git(repository, "update-ref", "refs/heads/master", base)
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    commit(repository, "fix: add compatible behavior")
+    write_project(repository, "0.1.1")
+    original_task = commit(repository, "chore(release): bump version to 0.1.1")
+    git(repository, "switch", "master")
+    git(repository, "merge", "--no-ff", "--no-commit", "task")
+    candidate = git(repository, "write-tree")
+    later_worktree = repository.parent / "later-worktree"
+    git(repository, "worktree", "add", str(later_worktree), "task")
+    (later_worktree / "src/tool.py").write_text("value = 'breaking'\n")
+    later_task = commit(later_worktree, "feat!: change unrelated later behavior")
+    assert later_task != original_task
+    monkeypatch.setenv("WORKFLOW_MERGE_TASK_REF", environment_ref)
+    selected = version_policy._candidate(
+        argparse.Namespace(index=True, base=None, candidate="HEAD")
+    )
+    assert selected == (base, candidate, f"{base}..{original_task}")
+    version_policy._validate(*selected)
+
+
+@pytest.mark.parametrize("environment_ref", ["task", "HEAD", "missing-task"])
+def test_index_without_active_merge_rejects_mutable_task_refs(
+    repository: Path, monkeypatch: pytest.MonkeyPatch, environment_ref: str
+) -> None:
+    monkeypatch.setenv("WORKFLOW_MERGE_TASK_REF", environment_ref)
+    with pytest.raises(ValueError, match=r"immutable.*commit"):
+        version_policy._candidate(
+            argparse.Namespace(index=True, base=None, candidate="HEAD")
+        )
+
+
+def test_direct_pre_merge_hook_validates_an_immutable_parent_before_merge_head(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_project(repository, "0.1.0")
+    base = commit(repository, "feat: bootstrap development tools")
+    git(repository, "update-ref", "refs/heads/master", base)
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    commit(repository, "fix: add compatible behavior")
+    write_project(repository, "0.1.1")
+    task = commit(repository, "chore(release): bump version to 0.1.1")
+    git(repository, "switch", "master")
+    hooks = repository.parent / "hooks"
+    hooks.mkdir()
+    observed = repository.parent / "observed-hook.json"
+    hook = hooks / "pre-merge-commit"
+    hook.write_text(
+        f"#!{sys.executable}\n"
+        "import argparse, json\nfrom pathlib import Path\n"
+        "from h2h_dev_tools import version_policy\n"
+        "merge_head = Path(version_policy._git('rev-parse', '--git-path', 'MERGE_HEAD'))\n"
+        "assert not merge_head.exists(), 'fixture must exercise the direct hook timing'\n"
+        "selected = version_policy._candidate(argparse.Namespace(index=True))\n"
+        "version_policy._validate(*selected)\n"
+        f"Path({str(observed)!r}).write_text(json.dumps(selected))\n"
+    )
+    hook.chmod(0o755)
+    git(repository, "config", "core.hooksPath", str(hooks))
+    monkeypatch.setenv("PYTHONPATH", str(_ROOT / "src"))
+    monkeypatch.setenv("WORKFLOW_MERGE_TASK_REF", task)
+    git(repository, "merge", "--no-ff", "--no-edit", "task")
+    selected = json.loads(observed.read_text())
+    assert selected == [
+        base,
+        git(repository, "rev-parse", "HEAD^{tree}"),
+        f"{base}..{task}",
+    ]
+    assert git(repository, "show", "-s", "--format=%P", "HEAD").split() == [base, task]

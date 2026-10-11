@@ -6,16 +6,23 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 
-def run(*command: str, cwd: Path) -> str:
+def run(*command: str, cwd: Path, environment: Mapping[str, str] | None = None) -> str:
     return subprocess.run(
-        command, cwd=cwd, check=True, capture_output=True, text=True
+        command,
+        cwd=cwd,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -55,6 +62,7 @@ def main() -> None:
         # build's default flow builds the wheel from the new sdist.
         run(
             sys.executable,
+            "-I",
             "-m",
             "build",
             "--no-isolation",
@@ -65,7 +73,7 @@ def main() -> None:
         wheel = single(dist, "*.whl")
         single(dist, "*.tar.gz")
         environment = scratch / "smoke"
-        run(sys.executable, "-m", "venv", str(environment), cwd=scratch)
+        run(sys.executable, "-I", "-m", "venv", str(environment), cwd=scratch)
         python = environment / (
             "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
         )
@@ -81,6 +89,7 @@ def main() -> None:
         provide_packaging(site)
         run(
             str(python),
+            "-I",
             "-m",
             "pip",
             "install",
@@ -112,7 +121,20 @@ print(installed.version)
             if sys.platform == "win32"
             else "bin/h2h-dev-tools"
         )
-        run(str(entrypoint), "--help", cwd=scratch)
+        # Exercise the actual console launcher without inheriting Python's
+        # source-path/configuration overrides from the development checkout.
+        console_environment = {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("PYTHON")
+        }
+        console_environment.update(PYTHONNOUSERSITE="1", PYTHONSAFEPATH="1")
+        run(
+            str(entrypoint),
+            "--help",
+            cwd=scratch,
+            environment=console_environment,
+        )
         consumer = scratch / "consumer"
         consumer.mkdir()
         # Exercise every shipped component, including packaged shell resources.
@@ -128,14 +150,49 @@ print(installed.version)
         (consumer / "pyproject.toml").write_text(
             "[tool.h2h-dev-tools]\ncomponents = " + components + "\n"
         )
-        run(str(entrypoint), "sync", "--repository", str(consumer), cwd=scratch)
-        run(str(entrypoint), "verify", "--repository", str(consumer), cwd=scratch)
+        for command in ("sync", "verify"):
+            run(
+                str(entrypoint),
+                command,
+                "--repository",
+                str(consumer),
+                cwd=scratch,
+                environment=console_environment,
+            )
+        payload_probe = """
+from pathlib import Path
+import sys
+import h2h_dev_tools
+from h2h_dev_tools.bundle_verify import BUNDLE_DIRECTORY, verify_bundle
+root = Path(sys.argv[1])
+package = Path(h2h_dev_tools.__file__).resolve().parent
+assert package.is_relative_to(Path(sys.prefix).resolve())
+manifest = verify_bundle(root)
+for name in manifest['files']:
+    assert (root / BUNDLE_DIRECTORY / name).read_bytes() == (package / name).read_bytes(), name
+"""
+        run(str(python), "-I", "-c", payload_probe, str(consumer), cwd=scratch)
         run(
             str(python),
             "-I",
             "-S",
             str(consumer / "scripts/_shared/h2h_dev_tools/bundle_verify.py"),
             "--repository",
+            str(consumer),
+            cwd=scratch,
+        )
+        run(
+            str(python),
+            "-I",
+            "-B",
+            "-c",
+            "import runpy, sys; from pathlib import Path; "
+            "root = Path(sys.argv[1]); sys.path.insert(0, str(root / 'scripts')); "
+            "package = root / 'scripts/_shared/h2h_dev_tools'; "
+            "runpy.run_path(str(package / 'source_loader.py'))['load_package']("
+            "package, '_shared.h2h_dev_tools'); "
+            "from _shared.h2h_dev_tools import process; "
+            "assert Path(process.__file__).parent == package",
             str(consumer),
             cwd=scratch,
         )

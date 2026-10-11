@@ -8,11 +8,13 @@ Detached POSIX sessions and daemon-owned resources are outside this contract.
 from __future__ import annotations
 
 import ctypes
+import io
 import math
 import ntpath
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -21,7 +23,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Any, BinaryIO, Final, cast
+from typing import Any, BinaryIO, Final, TextIO, cast
 
 TERMINATION_GRACE_SECONDS = 2.0
 TERMINATION_POLL_SECONDS = 0.05
@@ -53,7 +55,9 @@ class RunnerSignalInterrupt(BaseException):
 
 
 class ProcessOwnershipError(RuntimeError):
-    """The runner could not verify that its managed command process tree exited."""
+    """A command violated ownership; cleanup may still finish before propagation."""
+
+    cleanup_proven: bool = False
 
 
 @dataclass
@@ -339,7 +343,9 @@ def _start_posix_process(phase: ProcessCommand) -> subprocess.Popen[bytes]:
     )
 
 
-def _windows_supervisor_launch(phase: ProcessCommand) -> tuple[str, dict[str, str]]:
+def _windows_supervisor_launch(
+    phase: ProcessCommand,
+) -> tuple[tuple[str, ...], dict[str, str]]:
     executable = sys.executable
     base_executable = getattr(sys, "_base_executable", None)
     if not isinstance(base_executable, str) or not base_executable:
@@ -352,7 +358,16 @@ def _windows_supervisor_launch(phase: ProcessCommand) -> tuple[str, dict[str, st
         if not Path(base_executable).is_file():
             raise RuntimeError("Windows Python base executable is unavailable")
         executable = base_executable
-    return executable, environment
+    return (
+        executable,
+        # Python startup must not run environment/site hooks before Job.assign.
+        # Flags isolate only this supervisor; the admitted child keeps its env.
+        "-I",
+        "-S",
+        str(Path(__file__).resolve()),
+        _WINDOWS_SUPERVISOR_MODE,
+        *phase.argv,
+    ), environment
 
 
 def _cleanup_windows_supervisor(
@@ -405,7 +420,6 @@ def _start_windows_process(
     deadline: float,
     signal_controller: SignalController | None,
 ) -> OwnedProcess:
-    command = phase.argv
     creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     if not isinstance(creation_flag, int) or creation_flag == 0:
         raise ProcessOwnershipError(phase.label) from None
@@ -417,14 +431,9 @@ def _start_windows_process(
         with defer_signal_interrupts(signal_controller):
             try:
                 job = WindowsJob.create()
-                executable, environment = _windows_supervisor_launch(phase)
+                command, environment = _windows_supervisor_launch(phase)
                 supervisor = subprocess.Popen(
-                    (
-                        executable,
-                        str(Path(__file__).resolve()),
-                        _WINDOWS_SUPERVISOR_MODE,
-                        *command,
-                    ),
+                    command,
                     cwd=phase.cwd,
                     env=environment,
                     stdout=phase.stdout,
@@ -612,14 +621,72 @@ def wait_for_owned_tree_exit(
     )
 
 
-def _report_diagnostic(message: str) -> None:
-    """Keep a failed diagnostic stream from interrupting ownership cleanup."""
+def _diagnostic_supports_nonblocking(descriptor: int) -> bool:
+    # Python's Windows get/set_blocking only support pipes. Preserve native
+    # console encoding and regular-file output instead of silently dropping it.
+    return os.name != "nt" or stat.S_ISFIFO(os.fstat(descriptor).st_mode)
 
+
+def _print_memory_or_native_diagnostic(message: str, stream: TextIO) -> None:
     try:
-        print(message, file=sys.stderr, flush=True)
+        print(message, file=stream, flush=True)
     except Exception:
-        # Diagnostics are secondary to process ownership. Even an unusual stream
-        # implementation must not prevent termination, fallback or Job closing.
+        # A failed native TextIOWrapper flush can retain buffered bytes and
+        # overwrite the real exit status during finalization. Retire only its
+        # failed descriptor; in-memory/unknown descriptors simply have no sink.
+        try:
+            descriptor = stream.fileno()
+            sink = os.open(os.devnull, os.O_WRONLY)
+            if sink != descriptor:
+                try:
+                    os.dup2(sink, descriptor)
+                finally:
+                    os.close(sink)
+            stream.flush()
+        except Exception:
+            pass
+
+
+def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
+    """Best-effort human output: pipe backpressure cannot delay owned cleanup."""
+
+    stream = sys.stdout if standard_output else sys.stderr
+    try:
+        descriptor = stream.fileno()
+    except Exception:
+        # Support known memory-only capture, never call a custom no-FD writer
+        # whose blocking behavior cannot be controlled by the process owner.
+        if isinstance(stream, io.StringIO) or (
+            isinstance(stream, io.TextIOWrapper)
+            and isinstance(stream.buffer, io.BytesIO)
+        ):
+            _print_memory_or_native_diagnostic(message, stream)
+        return
+    try:
+        if not _diagnostic_supports_nonblocking(descriptor):
+            _print_memory_or_native_diagnostic(message, stream)
+            return
+        blocking = os.get_blocking(descriptor)
+        try:
+            # dup/inheritance shares these flags with the caller: always restore
+            # the original setting, including after short output or EAGAIN.
+            os.set_blocking(descriptor, False)
+            remaining = memoryview(
+                (message + "\n").encode(
+                    stream.encoding or "utf-8",
+                    errors=stream.errors or "backslashreplace",
+                )
+            )
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    break
+                remaining = remaining[written:]
+        finally:
+            os.set_blocking(descriptor, blocking)
+    except Exception:
+        # Closed/full pipes discard diagnostics without creating a buffered
+        # retry at interpreter exit. Never redirect or flush the caller's data.
         pass
 
 
@@ -641,7 +708,7 @@ def _taskkill_windows_tree(
         return False
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        _report_diagnostic(
+        report_diagnostic(
             f"taskkill failed with exit {completed.returncode}"
             + (f": {detail}" if detail else "")
         )
@@ -660,7 +727,7 @@ def _terminate_windows_tree(
     try:
         job.terminate()
     except OSError as error:
-        _report_diagnostic(str(error))
+        report_diagnostic(str(error))
         if not _taskkill_windows_tree(owner.process, deadline=deadline):
             return False
     return wait_for_owned_tree_exit(owner, deadline=deadline)
@@ -685,7 +752,7 @@ def close_owner(owner: OwnedProcess) -> bool:
     try:
         job.close()
     except OSError as error:
-        _report_diagnostic(str(error))
+        report_diagnostic(str(error))
         return False
     return True
 
@@ -738,13 +805,13 @@ def _run_command(
         if hard_deadline is None
         else f"{max(0.0, hard_deadline - started_at):.1f}s total remaining"
     )
-    print(f"\n==> {phase.label} ({budget_detail})", flush=True)
-    print("+", shlex.join(phase.argv), flush=True)
+    report_diagnostic(f"\n==> {phase.label} ({budget_detail})", standard_output=True)
+    report_diagnostic("+ " + shlex.join(phase.argv), standard_output=True)
     execution_deadline = (
         None if hard_deadline is None else hard_deadline - termination_reserve_seconds
     )
     if execution_deadline is not None and execution_deadline <= started_at:
-        _report_diagnostic(
+        report_diagnostic(
             f"command budget lacks the {termination_reserve_seconds:.1f}s "
             f"termination reserve before {phase.label}"
         )
@@ -756,6 +823,7 @@ def _run_command(
     )
     owner: OwnedProcess | None = None
     tree_empty_proven = False
+    ownership_error: ProcessOwnershipError | None = None
     termination_deadline: float | None = None
     return_code = TERMINATION_FAILED_EXIT_CODE
     try:
@@ -778,7 +846,7 @@ def _run_command(
         except subprocess.TimeoutExpired:
             termination_deadline = hard_deadline
             return_code = TIMEOUT_EXIT_CODE
-            _report_diagnostic(
+            report_diagnostic(
                 f"command budget expired during {phase.label}; "
                 "terminating its process tree"
             )
@@ -798,13 +866,14 @@ def _run_command(
                     owner, deadline=clean_exit_deadline
                 )
             if not tree_empty_proven:
-                _report_diagnostic(
+                report_diagnostic(
                     "command leader exited with surviving process-tree members "
                     f"during {phase.label}"
                 )
-                raise ProcessOwnershipError(phase.label)
+                ownership_error = ProcessOwnershipError(phase.label)
+                raise ownership_error
     except KeyboardInterrupt, RunnerSignalInterrupt:
-        _report_diagnostic(
+        report_diagnostic(
             f"command interrupted during {phase.label}; terminating its process tree"
         )
         raise
@@ -831,7 +900,7 @@ def _run_command(
                         except Exception as error:
                             raise ProcessOwnershipError(phase.label) from error
                         if not tree_empty_proven:
-                            _report_diagnostic(
+                            report_diagnostic(
                                 "could not verify process-tree termination for "
                                 f"{phase.label}"
                             )
@@ -839,12 +908,18 @@ def _run_command(
                 finally:
                     if not close_owner(owner):
                         raise ProcessOwnershipError(phase.label)
-                print(f"owned_tree_empty={tree_empty_proven}", flush=True)
+                if ownership_error is not None:
+                    ownership_error.cleanup_proven = tree_empty_proven
+                report_diagnostic(
+                    f"owned_tree_empty={tree_empty_proven}", standard_output=True
+                )
     finished_at = time.monotonic()
     elapsed = finished_at - started_at
     if hard_deadline is not None and finished_at > hard_deadline and return_code == 0:
         return_code = TIMEOUT_EXIT_CODE
-    print(f"<== {phase.label}: {elapsed:.1f}s (exit {return_code})", flush=True)
+    report_diagnostic(
+        f"<== {phase.label}: {elapsed:.1f}s (exit {return_code})", standard_output=True
+    )
     return return_code
 
 
