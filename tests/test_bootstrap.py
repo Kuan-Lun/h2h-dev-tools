@@ -79,8 +79,13 @@ def test_installer_preserves_existing_hooks(repository: Path, existing: str) -> 
         ).read_text() == "#!/bin/sh\nexit 0\n"
 
 
+@pytest.mark.parametrize("python_layout", ["bin/python", "Scripts/python.exe"])
+@pytest.mark.parametrize("with_callback", [False, True])
 def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    python_layout: str,
+    with_callback: bool,
 ) -> None:
     root = tmp_path / "repo"
     root.mkdir()
@@ -94,10 +99,13 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
             "from pathlib import Path\n"
             "with open(os.environ['BOOTSTRAP_LOG'], 'a') as stream:\n"
             "    stream.write(json.dumps(sys.argv) + '\\n')\n"
-            "if sys.argv[1:2] == ['venv'] and '--clear' not in sys.argv:\n"
-            "    python = Path(sys.argv[-1]) / 'bin/python'\n"
+            "if sys.argv[1:2] == ['venv']:\n"
+            f"    python = Path(sys.argv[-1]) / {python_layout!r}\n"
             "    python.parent.mkdir(parents=True)\n"
             f"    python.symlink_to({sys.executable!r})\n"
+            "if sys.argv[1:3] == ['pip', 'install']:\n"
+            "    python = Path(sys.argv[sys.argv.index('--python') + 1])\n"
+            "    assert python.is_file(), f'missing install interpreter: {python}'\n"
             "if sys.argv[1:3] == ['pip', 'compile']:\n"
             "    requirements = Path(sys.argv[5])\n"
             "    Path(os.environ['BOOTSTRAP_LOG'] + '.requirements').write_text(\n"
@@ -109,7 +117,18 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
     source = tmp_path / "candidate source"
     source.mkdir()
     (source / "pyproject.toml").write_text('[project]\nname="example"\n')
-    result = invoke("rebuild-env.sh", root, "", "--source", f"example={source}")
+    callback = root / "after build.py"
+    callback.write_text(
+        "import json, sys\nfrom pathlib import Path\n"
+        "Path('callback.json').write_text(json.dumps([str(Path.cwd()), sys.executable]))\n"
+    )
+    result = invoke(
+        "rebuild-env.sh",
+        root,
+        callback.name if with_callback else "",
+        "--source",
+        f"example={source}",
+    )
     assert result.returncode == 0, result.stderr
     commands = [json.loads(line)[1:] for line in log.read_text().splitlines()]
     assert commands[0][:3] == ["venv", "--python", "3.14"]
@@ -121,7 +140,7 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
             "install",
             "--refresh",
             "--python",
-            ".venv/bin/python",
+            f".venv/{python_layout}",
             "--requirements",
             commands[1][4],
         ],
@@ -136,6 +155,13 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
     assert Path(str(log) + ".requirements").read_text() == (
         f"-e example @ {source.as_uri()}\n-e .[dev]\n"
     )
+    if with_callback:
+        assert json.loads((root / "callback.json").read_text()) == [
+            str(root),
+            str(root / ".venv" / python_layout),
+        ]
+    else:
+        assert not (root / "callback.json").exists()
     log.unlink()
     (source / "pyproject.toml").unlink()
     invalid = invoke("rebuild-env.sh", root, "", "--source", f"example={source}")
