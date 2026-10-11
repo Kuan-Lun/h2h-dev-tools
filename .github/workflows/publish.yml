@@ -1,0 +1,70 @@
+name: Publish to PyPI
+
+on:
+  push:
+    paths:
+      - pyproject.toml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact project version to publish, including the first release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: >-
+      ${{ github.ref ==
+      format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install declared build dependencies
+        run: |
+          python scripts/install-ci-dependencies.py packaging build hatchling
+      - name: Select explicitly requested version or push transition
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: python scripts/select-publish-version.py
+      - name: Build and verify distributions
+        if: steps.version.outputs.publish == 'true'
+        run: >-
+          python scripts/build-and-verify-distributions.py
+          --output-directory dist
+      - name: Store distributions
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: validate
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

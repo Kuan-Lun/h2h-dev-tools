@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+primary="$(scripts/detect-primary-branch.sh)"
+if git rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
+    exec .githooks/pre-merge-commit
+fi
+[[ -n "$(git branch --show-current)" ]] || {
+    printf 'Commit requires a task branch, not detached HEAD\n' >&2
+    exit 1
+}
+[[ "$(git branch --show-current)" != "$primary" ]] || {
+    printf 'Direct commits on primary are not allowed: %s\n' "$primary" >&2
+    exit 1
+}
+profile="$(.venv/bin/python scripts/check_change_scope.py --index --base HEAD)"
+case "$profile" in
+    documentation) exec .venv/bin/python scripts/check-docs.py --index --base HEAD ;;
+    full) exec scripts/check-fast.sh ;;
+    *) printf 'Unknown check profile: %s\n' "$profile" >&2; exit 1 ;;
+esac

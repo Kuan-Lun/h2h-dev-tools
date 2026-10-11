@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+primary="$(scripts/detect-primary-branch.sh)"
+[[ "$(git branch --show-current)" == "$primary" ]] || {
+    printf 'Merge commits are permitted only on primary: %s\n' "$primary" >&2
+    exit 1
+}
+exec .venv/bin/python scripts/release-gate.py
