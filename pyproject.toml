@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "h2h-dev-tools"
+version = "0.1.0"
+description = "Shared development tools and reproducible repository snapshots for H2H projects"
+readme = "README.md"
+authors = [{ name = "Kuan-Lun Wang" }]
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = ["packaging>=26.0"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+h2h-dev-tools = "h2h_dev_tools.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.5.0",
+    "hatchling>=1.32.0",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kuan-Lun/h2h-dev-tools"
+Source = "https://github.com/Kuan-Lun/h2h-dev-tools"
+Tracker = "https://github.com/Kuan-Lun/h2h-dev-tools/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/h2h_dev_tools"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "PIE", "RUF", "UP"]
+# Ruff formatter owns wrapping of long URLs, strings, and docstrings.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+mypy_path = "src"
+files = ["src", "scripts", "tests"]
+strict = true
+warn_unused_configs = true
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.h2h.version]
+release-paths = ["LICENSE", "src/**"]

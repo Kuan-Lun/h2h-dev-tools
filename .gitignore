@@ -1,0 +1,15 @@
+.DS_Store
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+htmlcov/
+node_modules
+package-lock.json
+uv.lock

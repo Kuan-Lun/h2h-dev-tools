@@ -1,0 +1,83 @@
+{
+  "checked_at": "2026-10-11T06:59:08+00:00",
+  "manifest_sha256": "9b9b06499ac50d3669becf22ac2223879fe1acabcb92ac7606fa8feebf8eaba2",
+  "node": [
+    {
+      "declared": ">=0.23.2",
+      "latest": "0.23.3",
+      "latest_satisfies": true,
+      "name": "markdownlint-cli2"
+    }
+  ],
+  "project_version": "0.1.0",
+  "python": [
+    {
+      "declared": "hatchling>=1.32.0",
+      "group": "build",
+      "latest": "1.32.4",
+      "latest_satisfies": true,
+      "name": "hatchling",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/hatchling/"
+    },
+    {
+      "declared": "packaging>=26.0",
+      "group": "runtime",
+      "latest": "26.3",
+      "latest_satisfies": true,
+      "name": "packaging",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/packaging/"
+    },
+    {
+      "declared": "build>=1.5.0",
+      "group": "optional:dev",
+      "latest": "1.6.1",
+      "latest_satisfies": true,
+      "name": "build",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/build/"
+    },
+    {
+      "declared": "hatchling>=1.32.0",
+      "group": "optional:dev",
+      "latest": "1.32.4",
+      "latest_satisfies": true,
+      "name": "hatchling",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/hatchling/"
+    },
+    {
+      "declared": "mypy>=2.3.1",
+      "group": "optional:dev",
+      "latest": "2.4.0",
+      "latest_satisfies": true,
+      "name": "mypy",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/mypy/"
+    },
+    {
+      "declared": "pytest>=9.1.1",
+      "group": "optional:dev",
+      "latest": "9.1.1",
+      "latest_satisfies": true,
+      "name": "pytest",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/pytest/"
+    },
+    {
+      "declared": "ruff>=0.16.4",
+      "group": "optional:dev",
+      "latest": "0.17.0",
+      "latest_satisfies": true,
+      "name": "ruff",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/ruff/"
+    }
+  ],
+  "review": {
+    "note": "Initial 0.1.0 audit: reviewed Hatchling 1.32.4 release notes (hatch.pypa.io/dev/history/hatchling/), build 1.6.1 changelog (build.pypa.io/en/stable/changelog.html), packaging 26.3 changelog (packaging.pypa.io/en/stable/changelog.html), pytest 9.1.1 release notes, Ruff 0.17.0 GitHub release, markdownlint-cli2 v0.23.3 tagged CHANGELOG. Hatchling plugin regression is fixed in installed 1.32.4; no custom build hooks. Packaging Version/Requirement APIs exercised by transition, dependency and distribution checks. Ruff defaults changed but target py314 and explicit rules are configured. markdownlint uses supported Node 26.10.0. Mypy 2.4.0 official news and tagged release verified; blog blocked by Google, compatibility validated by strict checking all 26 source files. Python 3.14.1 with build 1.6.1/hatchling 1.32.4/packaging 26.3/mypy 2.4.0/pytest 9.1.1/ruff 0.17.0: 152 tests, Ruff, mypy, Markdown passed; fresh sdist-derived wheel installed and CLI verified in isolated offline environment. Separate clean uv environment normally resolved the explicit candidate wheel plus packaging 26.3 and verified installed file origin and metadata. No upper bounds or pinned dependency exceptions; consumer generated payloads verified against installed candidate wheel.",
+    "status": "reviewed"
+  },
+  "schema": "h2h.dependency-audit.v1"
+}
