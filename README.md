@@ -185,8 +185,14 @@ The helper preserves pytest arguments and uses a unique empty bytecode-cache
 prefix with cache writes disabled. It prepends the verified package's import
 root to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix.
 An optional xdist gateway hook revalidates and source-loads the same package in
-each local worker before its pytest plugins and conftests load; path ordering
-alone cannot protect namespace packages from another checkout's regular package.
+each local worker before its pytest plugins and conftests load. It checks the
+controller's original source hashes, captured
+before pytest or its plugins are imported. A valid replacement snapshot is still
+a different generation and is rejected. Worker bootstrap and snapshot verifier
+code are compiled from the exact bytes checked against those hashes; subsequent
+module imports recheck their expected hashes before compiling their bytes.
+Path ordering alone cannot protect namespace packages from another checkout's
+regular package.
 The settings are restored and the temporary directory removed when pytest exits.
 This covers direct local Python workers; remote or chained
 workers need their own explicit source distribution and are not supported by this
@@ -206,7 +212,17 @@ still require the task's single version bump, and extra candidate changes cannot
 borrow that exemption. Exemptions that cannot be established from a clean
 automatic three-way merge are rejected. Hook installation refuses to replace an
 existing third-party hook directory. Rebuild validates explicit source overrides before
-replacing the environment. Merge checks dirty worktrees, in-progress Git operations
+replacing the environment. Relative `--source PACKAGE=SOURCE` paths are resolved
+from the caller's working directory, including when the rebuild script is invoked
+from outside its repository. Local wrappers must preserve that working directory
+while locating the repository. The shared rebuild captures it before changing to
+the repository, then passes it as `--source-base` to the source resolver. The
+repository's `.[dev]` installation, npm and after-build callback still run from
+the repository root; absolute paths, URLs and index sources keep their meaning.
+Repository path changes use command-local `CDPATH=` so an interactive shell's
+search paths cannot redirect tooling or contaminate machine-readable output.
+The caller's environment remains available to invoked commands and callbacks.
+Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Primary worktree discovery queries the exact branch with NUL-delimited fields;
 paths containing line breaks are preserved. Repository-local merge, gate and

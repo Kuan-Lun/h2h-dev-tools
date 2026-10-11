@@ -354,3 +354,62 @@ def test_local_worker_revalidates_snapshot_after_controller_bootstrap(
     assert (candidate.root / "master.json").exists()
     assert not (candidate.root / "gw0.json").exists()
     assert not (candidate.root / "gw1.json").exists()
+
+
+@pytest.mark.parametrize("layout", ["source", "snapshot"])
+@pytest.mark.parametrize(
+    "filename",
+    ["version_policy.py", "source_loader.py", "bundle_verify.py", "__init__.py"],
+)
+def test_local_workers_reject_valid_source_replacement_after_controller_bootstrap(
+    tmp_path: Path, layout: str, filename: str
+) -> None:
+    candidate = _candidate(tmp_path, layout)
+    changed = candidate.package / filename
+    executed = candidate.root / "replacement-initializer-executed"
+    suffix = (
+        f"\nfrom pathlib import Path\nPath({str(executed)!r}).touch()\n".encode()
+        if filename in {"__init__.py", "bundle_verify.py"}
+        else b"\n# a different, independently valid source generation\n"
+    )
+    conftest = candidate.root / "conftest.py"
+    conftest.write_text(
+        conftest.read_text()
+        + "def pytest_configure(config):\n"
+        + "    if not hasattr(config, 'workerinput'):\n"
+        + "        import hashlib\n"
+        + f"        changed = Path({str(changed)!r})\n"
+        + f"        changed.write_bytes(changed.read_bytes() + {suffix!r})\n"
+        + f"        manifest = Path({str(candidate.package / 'manifest.json')!r})\n"
+        + "        if manifest.exists():\n"
+        + "            document = json.loads(manifest.read_text())\n"
+        + "            document['files'][changed.name] = hashlib.sha256(changed.read_bytes()).hexdigest()\n"
+        + "            payload = json.dumps(document['files'], sort_keys=True, separators=(',', ':')).encode()\n"
+        + "            document['payload_sha256'] = hashlib.sha256(payload).hexdigest()\n"
+        + "            manifest.write_text(json.dumps(document))\n"
+    )
+
+    result = _run(
+        candidate,
+        _environment(candidate),
+        "entry.py",
+        "-p",
+        "no:cacheprovider",
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "-q",
+        "test_candidate.py",
+        "-k",
+        "not deliberate_failure",
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "controller" in result.stdout + result.stderr
+    assert (candidate.root / "master.json").exists()
+    assert not (candidate.root / "gw0.json").exists()
+    assert not (candidate.root / "gw1.json").exists()
+    assert not executed.exists(), (
+        "replacement package must not execute before rejection"
+    )

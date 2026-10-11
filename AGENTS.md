@@ -113,6 +113,10 @@
   寫入，並明確傳遞候選來源 import root 給 local xdist workers；worker 載入
   pytest plugins 與 conftest 前重新驗證並載入相同來源，結束還原環境。
   遠端 worker 不在此來源保證內，selectors、owner 與 deadline 仍由各 repo 擁有。
+  Controller 在 pytest/plugins 載入前固定已驗證的完整來源 hashes；local worker
+  必須吻合此集合，不能自行接納另一份有效 snapshot。Worker 的 bootstrap 與
+  snapshot verifier 直接編譯已核對該集合的 bytes，避免重讀路徑的時間窗口；
+  每個 module 的實際 import 仍核對同一來源 hash。
   已安裝 wheel 的隔離 smoke 保留正常 import，不套用 checkout loader。
 - Wheel smoke 僅複製已安裝 `packaging` distribution 供離線 resolver，禁止借用
   editable source 或整個 development site。此結果不代表 registry-backed clean

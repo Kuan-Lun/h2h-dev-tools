@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-11T18:20:06+00:00",
+  "checked_at": "2026-10-11T19:26:21+00:00",
   "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.3.1",
+  "project_version": "0.3.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -102,7 +102,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.3.1 adds the optional shared pytest source runner component without changing snapshot schema, pytest arguments, ownership, deadlines, or runtime requirements. Added dev-only pytest-xdist>=3.8.0. Reviewed https://pytest-xdist.readthedocs.io/en/stable/changelog.html and https://execnet.readthedocs.io/en/latest/changelog.html: xdist 3.8.0 adds optional loadscope ordering controls; default scheduling remains consumer-owned. Its local workers copy the controller import path and inherit Python cache environment settings. Normal resolution installed pytest-xdist 3.8.0 and execnet 2.1.2 with pytest 9.1.1 on Python 3.14.1. Actual two-worker regressions cover candidate versus old sibling source, equal-size/timestamp module caches, pytest assertion caches, worker source identity, private-cache cleanup, exact environment restoration, selection/exit statuses, and corrupt snapshot rejection: 21 tests passed. Another 17 source-entry and snapshot regressions passed; strict mypy, Ruff, formatting and Markdown passed. Registry discovery confirms all existing direct dependencies remain at the versions reviewed for 0.3.0: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, Ruff 0.17.0 and markdownlint-cli2 0.23.3. Their previously reviewed official release notes remain applicable: https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . No bounds are relaxed or pinned. Native Windows execution is delegated to the existing platform CI, not claimed from local tests. Fresh distribution validation, online review and the complete canonical gate remain separate required evidence.",
+    "note": "Release 0.3.2 corrects explicit relative --source paths to use the invoking working directory, independently of the repository installation/callback directory. Source identity is resolved before environment replacement; missing caller artifacts fail without borrowing a repository-local same-name file. No dependency constraints or snapshot schema changed. Four real uv installation counterexamples failed against 0.3.1 (repository decoy installed or missing caller accepted); all four now pass, including installed module bytes, distribution version, direct_url origin, callback cwd and preservation of the old environment on rejection. Complete environment/bootstrap/shell-entry selection: 52 passed. Ruff, formatting, strict mypy and Markdown passed through normal commit hooks. Native Windows is not claimed by local testing; the existing Windows layout regression remains included. Fresh artifact resolution, online code review and the canonical full gate remain separate required evidence. Registry discovery is checked against the previously reviewed 0.3.1 direct dependency releases: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.0 and markdownlint-cli2 0.23.3. Those exact versions are the local validation environment. Previously reviewed primary release notes remain applicable: https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://pytest-xdist.readthedocs.io/en/stable/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . No new pin, relaxed bound or compatibility exception is introduced.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

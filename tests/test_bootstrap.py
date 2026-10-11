@@ -79,6 +79,64 @@ def test_installer_preserves_existing_hooks(repository: Path, existing: str) -> 
         ).read_text() == "#!/bin/sh\nexit 0\n"
 
 
+@pytest.mark.parametrize("directory_search", ["unset", "current", "foreign"])
+def test_installer_resolves_relative_root_once_before_primary_query(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    directory_search: str,
+) -> None:
+    foreign_parent = tmp_path / "foreign search"
+    foreign = foreign_parent / repository.name
+    foreign.mkdir(parents=True)
+    git(foreign, "init", "-b", "main")
+    git(foreign, "config", "user.name", "Foreign Bootstrap Test")
+    git(foreign, "config", "user.email", "foreign@example.invalid")
+    git(foreign, "commit", "--allow-empty", "-m", "test: independent checkout")
+    foreign_config = (foreign / ".git/config").read_bytes()
+    monkeypatch.delenv("CDPATH", raising=False)
+    if directory_search != "unset":
+        monkeypatch.setenv(
+            "CDPATH", "." if directory_search == "current" else str(foreign_parent)
+        )
+
+    result = subprocess.run(
+        ("bash", str(_RESOURCES / "install-git-hooks.sh"), repository.name),
+        cwd=repository.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "Installed repository Git hooks; primary branch: master\n"
+    assert git(repository, "config", "--local", "core.hooksPath") == ".githooks"
+    assert (
+        git(repository, "config", "--local", "branch.master.mergeOptions") == "--no-ff"
+    )
+    assert git(repository, "config", "--local", "branch.master.rebase") == "false"
+    assert git(repository, "config", "--local", "pull.rebase") == "false"
+    assert git(repository, "config", "--local", "pull.ff") == "only"
+    assert (foreign / ".git/config").read_bytes() == foreign_config
+
+
+@pytest.mark.parametrize("invalid_primary", ["ambiguous", "missing"])
+def test_installer_rejects_invalid_primary_without_partial_configuration(
+    repository: Path, invalid_primary: str
+) -> None:
+    if invalid_primary == "ambiguous":
+        git(repository, "branch", "main")
+    else:
+        git(repository, "config", "workflow.primaryBranch", "absent")
+    original_config = (repository / ".git/config").read_bytes()
+
+    result = invoke("install-git-hooks.sh", repository)
+
+    assert result.returncode != 0
+    assert (repository / ".git/config").read_bytes() == original_config
+
+
 @pytest.mark.parametrize("python_layout", ["bin/python", "Scripts/python.exe"])
 @pytest.mark.parametrize("with_callback", [False, True])
 def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(

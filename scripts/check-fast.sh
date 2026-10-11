@@ -3,7 +3,7 @@ set -euo pipefail
 repository_root="$(git rev-parse --show-toplevel && printf '.')"
 repository_root="${repository_root%.}"
 repository_root="${repository_root%$'\n'}"
-cd -- "$repository_root"
+CDPATH= cd -- "$repository_root"
 for executable in .venv/bin/ruff .venv/bin/mypy node_modules/.bin/markdownlint-cli2; do
     [[ -x "$executable" ]] || {
         printf 'Missing local tool: %s; run scripts/rebuild-env.sh\n' "$executable" >&2

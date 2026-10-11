@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "h2h-dev-tools"
-version = "0.3.1"
+version = "0.3.2"
 description = "Shared development tools and reproducible repository snapshots for H2H projects"
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
