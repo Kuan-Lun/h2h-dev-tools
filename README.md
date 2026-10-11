@@ -153,14 +153,32 @@ holds its deletion lock, forwarding every event and its unchanged input to the
 existing hook. This requires Git 2.28 or newer. A task advanced during review or
 cleanup is retained, and cleanup failure never rolls back an already successful
 merge.
-New merges use repository-local Python to own Git and its hook process tree.
-Starting with 0.3.0, consumers of the `git-flow` component must create their local
-`.venv` before a new merge. Run the repository's `scripts/rebuild-env.sh` once if
-it does not exist; branch detection, bootstrap and already-merged task cleanup
-still work without it. Existing application data does not need conversion.
+Workflow commands that change Git state use repository-local Python to own their
+hook process trees, including checkout, merge, failure recovery and task-branch
+deletion. Starting with 0.3.0, consumers of the `git-flow` component must create
+their local `.venv` before merging or cleaning up an already-merged task. Run
+the repository's `scripts/rebuild-env.sh` once if it does not exist; branch
+detection and bootstrap still work without it. Linked-worktree cleanup also
+requires the primary checkout's `.venv`, so removing the task worktree cannot
+remove the interpreter needed to finish cleanup. `--cleanup-only` remains
+available to retry cleanup after
+a successful merge without repeating review. Existing application data does not
+need conversion.
+This contract does not cover custom helpers used by separate read-only Git
+queries, such as an external filesystem monitor, or deliberately detached
+processes outside the owned POSIX group.
 An interruption waits for that cleanup before aborting a pending candidate; a
 commit already completed is retained. Unproven process cleanup retains the
 candidate and task for inspection instead of letting a surviving hook race an abort.
+Normal workflow commands have no automatic timeout and can be interrupted through
+the outer wrapper. During failure recovery, each abort or checkout command has
+a separate 10-second hard budget including the existing 6-second teardown reserve.
+Recovery Git output is captured and replayed after its owner finishes, up to
+64 KiB with an explicit truncation notice. A disconnected log reader therefore
+cannot stop recovery hooks through a broken pipe. Review and machine output
+retain their normal streams.
+A failed abort prevents the recovery checkout; recovery never rolls back an
+already completed merge.
 
 The `code-review` component owns the reviewer implementation; each repository's
 `scripts/review-code.py` calls `code_review.main(repository_root)`, and its merge

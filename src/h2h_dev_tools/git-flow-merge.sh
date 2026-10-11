@@ -159,9 +159,13 @@ HOOK
     H2H_CLEANUP_ORIGINAL_HOOK="$original_hook" \
     H2H_CLEANUP_TASK_REF="$task_ref" H2H_CLEANUP_TASK_OID="$task_oid" \
     H2H_CLEANUP_PRIMARY_REF="$primary_ref" H2H_CLEANUP_PRIMARY_OID="$expected_primary" \
-    git -C "$worktree" -c "core.hooksPath=$cleanup_hooks" \
+    run_tracked process "$worktree" git -C "$worktree" -c "core.hooksPath=$cleanup_hooks" \
         -c "branch.$task_branch.remote=$cleanup_hooks" \
         branch -d "$task_branch" || status=$?
+    if [[ "$owner_cleanup_failed" -ne 0 ]]; then
+        diagnose "process cleanup unproven; hook files retained for inspection: $cleanup_hooks"
+        return "$status"
+    fi
     rm -rf -- "$cleanup_hooks" || fail 'could not remove temporary cleanup directory'
     return "$status"
 }
@@ -174,7 +178,7 @@ abort_merge_if_needed() {
             rev-parse --path-format=absolute --git-path MERGE_HEAD
     )" || fail "could not inspect merge state: $worktree"
     if [[ -e "$merge_head" ]]; then
-        git -C "$worktree" merge --abort || return 1
+        run_tracked process "$worktree" git -C "$worktree" merge --abort || return 1
     fi
 }
 
@@ -185,6 +189,7 @@ restore_after_failure() {
     # Repeated cancellation and closed diagnostic pipes cannot cut short cleanup
     # or replace the original exit status after the owner has proved termination.
     trap '' HUP INT TERM PIPE
+    recovering=1
     if (( status != 0 )); then
         if [[ -n "$active_pid" ]]; then
             # The child owns its descendants. Wait for teardown before aborting
@@ -195,14 +200,21 @@ restore_after_failure() {
         fi
         if [[ "$owner_cleanup_failed" -ne 0 ]]; then
             diagnose 'process cleanup unproven; candidate and task retained'
-        elif abort_merge_if_needed "$merge_worktree"; then
-            # A signal or cleanup failure after the commit must not undo success.
-            if [[ "$merge_worktree" == "$repository_root" ]] \
-                && [[ "$(git -C "$merge_worktree" rev-parse HEAD)" == "$primary_oid" ]]; then
-                git -C "$repository_root" switch "$task_branch" || {
-                    diagnose "task branch retained; could not switch to $task_branch"
-                }
+        elif [[ "$workflow_started" -eq 1 ]]; then
+            if abort_merge_if_needed "$merge_worktree"; then
+                # A signal or cleanup failure after commit must not undo success.
+                if [[ "$merge_worktree" == "$repository_root" ]] \
+                    && [[ "$(git -C "$merge_worktree" rev-parse HEAD)" == "$primary_oid" ]]; then
+                    run_tracked process "$repository_root" git -C "$repository_root" switch "$task_branch" || {
+                        diagnose "recovery incomplete; could not finish switching to $task_branch"
+                    }
+                fi
+            else
+                diagnose 'recovery incomplete; merge abort failed; inspect candidate and task before retrying'
             fi
+        fi
+        if [[ "$owner_cleanup_failed" -ne 0 ]]; then
+            diagnose 'process cleanup unproven; no further Git mutation is permitted'
         fi
     fi
     if [[ -n "$execution_directory" && "$owner_cleanup_failed" -eq 0 ]]; then
@@ -237,6 +249,17 @@ prepare_owner() {
     merge_launcher="$destination/h2h_dev_tools/merge_command.py"
 }
 
+select_local_python() {
+    local worktree=$1
+    if [[ -x "$worktree/.venv/bin/python" ]]; then
+        merge_python="$worktree/.venv/bin/python"
+    elif [[ -x "$worktree/.venv/Scripts/python.exe" ]]; then
+        merge_python="$worktree/.venv/Scripts/python.exe"
+    else
+        fail "missing repository-local Python in $worktree; run scripts/rebuild-env.sh there"
+    fi
+}
+
 run_tracked() {
     local status=0 working_directory=$2
     active_owner=$1
@@ -247,6 +270,9 @@ run_tracked() {
     if [[ "$active_owner" == review ]]; then
         set -- --review "$@"
     fi
+    if [[ "$recovering" -eq 1 ]]; then
+        set -- --recovery "$@"
+    fi
     set -- "$merge_python" -I -B "$merge_launcher" \
         --cleanup-receipt "$active_cleanup_receipt" "$@"
     # Do not leave a forked supervisor unregistered if a signal arrives between
@@ -255,7 +281,9 @@ run_tracked() {
     (cd "$working_directory" && exec "$@") &
     active_pid=$!
     starting_child=0
-    [[ "$pending_signal" -eq 0 ]] || exit "$pending_signal"
+    if [[ "$pending_signal" -ne 0 && "$recovering" -eq 0 ]]; then
+        exit "$pending_signal"
+    fi
     wait "$active_pid" || status=$?
     check_owner_cleanup "$status"
     active_pid=''
@@ -323,6 +351,35 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     esac
 done <<< "$worktree_listing"
 
+if [[ -n "$primary_worktree" ]]; then
+    assert_clean "$primary_worktree"
+    assert_no_operation "$primary_worktree"
+    merge_worktree="$primary_worktree"
+else
+    merge_worktree="$repository_root"
+fi
+
+active_pid=''
+active_owner=''
+active_cleanup_receipt=''
+command_number=0
+starting_child=0
+pending_signal=0
+owner_cleanup_failed=0
+execution_directory=''
+recovering=0
+workflow_started=0
+trap restore_after_failure EXIT
+trap 'receive_signal 129' HUP
+trap 'receive_signal 130' INT
+trap 'receive_signal 143' TERM
+# Pipe consumers may exit before cleanup finishes. Diagnostics must not kill
+# this owner or prevent its EXIT handler from validating the cleanup receipt.
+trap '' PIPE
+select_local_python "$repository_root"
+source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+execution_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-merge-owner.XXXXXX")"
+prepare_owner "$source_directory" "$execution_directory/bootstrap"
 if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
     if [[ -n "$primary_worktree" ]]; then
         assert_clean "$primary_worktree"
@@ -337,18 +394,20 @@ if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
     is_ancestor "$repository_root" "$task_oid" "$primary_oid" \
         || fail 'task is no longer contained in primary; branch was retained'
 
+    workflow_started=1
     if [[ "$cleanup_worktree" == "$repository_root" ]]; then
-        git switch "$primary" \
+        run_tracked process "$cleanup_worktree" git -C "$cleanup_worktree" switch "$primary" \
             || fail "could not switch to primary; task branch was retained: $primary"
     else
         assert_checked_out_ref "$repository_root" "$task_ref"
+        select_local_python "$cleanup_worktree"
         cd "$cleanup_worktree"
-        git -C "$cleanup_worktree" worktree remove "$repository_root" \
+        run_tracked process "$cleanup_worktree" git -C "$cleanup_worktree" worktree remove "$repository_root" \
             || fail "no-op task worktree remains: $repository_root"
     fi
 
     delete_task_branch "$cleanup_worktree" "$primary_oid" \
-        || fail "no-op task branch remains: $task_branch"
+        || fail "no-op task branch cleanup failed; inspect refs: $task_branch"
 
     printf 'Cleaned up no-op task %s already contained in %s at %s\n' \
         "$task_branch" "$primary" "$task_oid"
@@ -367,41 +426,10 @@ if [[ "$strategy" == candidate ]]; then
     [[ -x .githooks/pre-commit ]] || fail '.githooks/pre-commit is missing or not executable'
 fi
 
-if [[ -n "$primary_worktree" ]]; then
-    assert_clean "$primary_worktree"
-    assert_no_operation "$primary_worktree"
-    merge_worktree="$primary_worktree"
-else
-    merge_worktree="$repository_root"
-fi
-
-active_pid=''
-active_owner=''
-active_cleanup_receipt=''
-command_number=0
-starting_child=0
-pending_signal=0
-owner_cleanup_failed=0
-execution_directory=''
-trap restore_after_failure EXIT
-trap 'receive_signal 129' HUP
-trap 'receive_signal 130' INT
-trap 'receive_signal 143' TERM
-# Pipe consumers may exit before cleanup finishes. Diagnostics must not kill
-# this owner or prevent its EXIT handler from validating the cleanup receipt.
-trap '' PIPE
-if [[ -x "$repository_root/.venv/bin/python" ]]; then
-    merge_python="$repository_root/.venv/bin/python"
-elif [[ -x "$repository_root/.venv/Scripts/python.exe" ]]; then
-    merge_python="$repository_root/.venv/Scripts/python.exe"
-else
-    fail 'missing repository-local Python; run scripts/rebuild-env.sh'
-fi
-source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-execution_directory="$(mktemp -d "${TMPDIR:-/tmp}/h2h-merge-owner.XXXXXX")"
-prepare_owner "$source_directory" "$execution_directory/bootstrap"
+workflow_started=1
 if [[ -z "$primary_worktree" ]]; then
-    git switch "$primary"
+    run_tracked process "$merge_worktree" git -C "$merge_worktree" switch "$primary" \
+        || fail "could not switch to primary; task branch was retained: $primary"
 fi
 assert_ref_equals "$merge_worktree" "$primary_ref" "$primary_oid"
 assert_ref_equals "$merge_worktree" "$task_ref" "$task_oid"
@@ -445,12 +473,13 @@ if [[ "$repository_root" != "$merge_worktree" ]]; then
     assert_no_operation "$repository_root"
     assert_checked_out_ref "$repository_root" "$task_ref"
     assert_cleanup_refs "$merge_worktree" "$merge_commit"
-    git -C "$merge_worktree" worktree remove "$repository_root" \
+    select_local_python "$merge_worktree"
+    run_tracked process "$merge_worktree" git -C "$merge_worktree" worktree remove "$repository_root" \
         || fail "merge succeeded, but task worktree remains: $repository_root"
 fi
 
 delete_task_branch "$merge_worktree" "$merge_commit" \
-    || fail "merge succeeded, but task branch remains: $task_branch"
+    || fail "merge succeeded, but task branch cleanup failed; inspect refs: $task_branch"
 
 printf 'Merged %s into %s at %s\n' \
     "$task_branch" "$primary" "$merge_commit"

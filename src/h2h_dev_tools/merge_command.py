@@ -7,10 +7,12 @@ import hashlib
 import os
 import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 
 if TYPE_CHECKING:
     from .process import ProcessCommand
@@ -21,6 +23,8 @@ REVIEW_OWNER_ENVIRONMENT = (
     "H2H_REVIEW_LOCK_TARGET",
     "H2H_REVIEW_PENDING_RECEIPT",
 )
+RECOVERY_TIMEOUT_SECONDS = 10.0
+RECOVERY_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024
 
 
 def without_review_owner(environment: Mapping[str, str]) -> dict[str, str]:
@@ -48,11 +52,11 @@ def owner_source_digest() -> str:
     return digest.hexdigest()
 
 
-def _run_owned(phase: ProcessCommand) -> int:
+def _run_owned(phase: ProcessCommand, *, hard_deadline: float | None = None) -> int:
     from . import process
 
     try:
-        return process.run_command(phase, hard_deadline=None)
+        return process.run_command(phase, hard_deadline=hard_deadline)
     except KeyboardInterrupt:
         return process.INTERRUPTED_EXIT_CODE
     except process.RunnerSignalInterrupt as error:
@@ -64,6 +68,56 @@ def _run_owned(phase: ProcessCommand) -> int:
             f"merge-command: surviving descendants required cleanup: {error}"
         )
         return 1
+
+
+def _replay_recovery_output(output: BinaryIO) -> None:
+    from . import process
+
+    try:
+        output.seek(0)
+        remaining = RECOVERY_DIAGNOSTIC_LIMIT_BYTES
+        while remaining:
+            chunk = output.read(min(8192, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            process.report_diagnostic(
+                chunk.decode("utf-8", errors="replace").rstrip("\n")
+            )
+        if remaining == 0 and output.read(1):
+            process.report_diagnostic(
+                "merge-command: recovery diagnostics truncated after 64 KiB"
+            )
+    except OSError as error:
+        process.report_diagnostic(
+            f"merge-command: could not read recovery diagnostics: {error}"
+        )
+
+
+def _run_git(phase: ProcessCommand, *, recovery: bool) -> int:
+    from . import process
+
+    if not recovery:
+        return _run_owned(phase)
+    # Git resets SIGPIPE itself. A closed caller pipe must not stop a recovery
+    # checkout after updating HEAD but before running its post-checkout hook.
+    # Only this human diagnostic channel is captured; review/data output keeps
+    # its normal semantics. Replay is bounded and follows proven tree cleanup.
+    output = tempfile.TemporaryFile()
+    try:
+        status = _run_owned(
+            replace(phase, stdout=output, stderr=output),
+            hard_deadline=time.monotonic() + RECOVERY_TIMEOUT_SECONDS,
+        )
+        _replay_recovery_output(output)
+        return status
+    finally:
+        try:
+            output.close()
+        except OSError as error:
+            process.report_diagnostic(
+                f"merge-command: could not close recovery diagnostics: {error}"
+            )
 
 
 def _review(
@@ -158,6 +212,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cleanup-receipt", required=True, type=Path)
     parser.add_argument("--review", action="store_true")
+    parser.add_argument(
+        "--recovery",
+        action="store_true",
+        help="bound this failure-recovery command and its cleanup to 10 seconds",
+    )
     parser.add_argument("repository", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
@@ -165,19 +224,22 @@ def main() -> int:
     if command[:1] == ["--"]:
         command = command[1:]
     if not command:
-        parser.error("a Git merge command is required")
+        parser.error("a Git workflow command is required")
+    if arguments.review and arguments.recovery:
+        parser.error("review cannot run as failure recovery")
     environment = without_review_owner(os.environ)
     try:
         if arguments.review:
             status = _review(arguments.repository, tuple(command), environment)
         else:
-            status = _run_owned(
+            status = _run_git(
                 process.ProcessCommand(
-                    "Git merge and hooks",
+                    "Git workflow and hooks",
                     tuple(command),
                     arguments.repository,
                     environment=environment,
-                )
+                ),
+                recovery=arguments.recovery,
             )
     except process.ProcessOwnershipError as error:
         process.report_diagnostic(

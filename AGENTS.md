@@ -49,6 +49,13 @@
 - 中斷須先完成 owned process cleanup 再 abort；若無法證明 cleanup 完成，
   例外保留 candidate 與 task 待確認，避免 surviving hook 與 abort 競爭。
   已成功建立的 merge commit 不得因後續中斷回滾。
+- Merge workflow 的 checkout、merge、failure recovery 與 task branch deletion
+  統一由 canonical process owner 管理 Git hooks。包括已合併 task 的 cleanup
+  都需要 repository-local `.venv`；缺少時先執行 `scripts/rebuild-env.sh`。
+  Linked worktree 移除前，改用 primary checkout 的 `.venv` 完成剩餘清理。
+  正常操作可由外層中斷；failure recovery 的每次 abort 或 checkout 各有
+  10 秒 hard budget（含 6 秒 teardown reserve），abort 失敗不得繼續 checkout。
+  `--cleanup-only` 仍可安全重試清理，不重跑已完成 merge 的 review。
 - Primary 禁止 rebase。Hooks 安裝設定 `pull.rebase=false`、primary rebase=false
   與 `pull.ff=only`。No-op cleanup 只在 task tip 已包含於 primary 時進行。
 - 本機 task branch、commit、merge 及安全清理已獲授權。
