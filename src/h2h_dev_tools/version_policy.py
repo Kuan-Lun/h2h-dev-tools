@@ -461,16 +461,21 @@ def _validate(base_tree: str, candidate_tree: str, message_range: str) -> None:
     if not version_changed:
         return
 
-    release_messages = "\n\0\n".join(
+    release_messages = tuple(
         impact.message
         for impact in impacts
         if impact.release_changed and not impact.exempt
     )
-    breaking = bool(
-        re.search(r"^[a-z]+(?:\([^\n)]+\))?!:", release_messages, re.MULTILINE)
-        or re.search(r"^BREAKING CHANGE:", release_messages, re.MULTILINE)
+    # Commit types and the bang marker belong to the subject. The body may
+    # quote older subjects; only the explicit breaking footer is independent.
+    subjects = tuple(message.partition("\n")[0] for message in release_messages)
+    breaking = any(
+        re.match(r"[a-z]+(?:\([^\n)]+\))?!:", subject) for subject in subjects
+    ) or any(
+        re.search(r"^BREAKING CHANGE:", message, re.MULTILINE)
+        for message in release_messages
     )
-    feature = bool(re.search(r"^feat(?:\([^\n)]+\))?:", release_messages, re.MULTILINE))
+    feature = any(re.match(r"feat(?:\([^\n)]+\))?:", subject) for subject in subjects)
     expected = _expected_version(
         base_version,
         breaking=breaking,

@@ -473,6 +473,72 @@ def test_development_breaking_signal_does_not_change_tool_lane(
     checker.validate(base, task, task)
 
 
+@pytest.mark.parametrize("version,target", [("0.1.0", "0.1.1"), ("1.2.3", "1.2.4")])
+@pytest.mark.parametrize(
+    "quoted_subject",
+    [
+        "feat!: drop the old parser",
+        "feat(parser)!: drop the old parser",
+        "feat: introduce the parser",
+        "feat(parser): introduce the parser",
+    ],
+)
+def test_quoted_commit_subjects_do_not_promote_the_release(
+    repository: Path, version: str, target: str, quoted_subject: str
+) -> None:
+    write_project(repository, version)
+    base = commit(repository, "feat: baseline")
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    commit(
+        repository,
+        "fix: correct the parser\n\nThe earlier change was:\n"
+        + quoted_subject
+        + "\n\nThis correction preserves the public contract.",
+    )
+    write_project(repository, target)
+    task = commit(repository, f"chore(release): bump version to {target}")
+
+    version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize(
+    "version,target,message",
+    [
+        ("0.1.0", "0.2.0", "fix!: change the public contract"),
+        ("1.2.3", "2.0.0", "fix(parser)!: change the public contract"),
+        ("0.1.0", "0.1.1", "feat: add behavior"),
+        ("1.2.3", "1.3.0", "feat(parser): add behavior"),
+        (
+            "0.1.0",
+            "0.2.0",
+            "fix: change the parser\n\nDetails about the implementation.\n\n"
+            "BREAKING CHANGE: callers must supply the new option.\n"
+            "This replaces the former implicit default.",
+        ),
+        (
+            "1.2.3",
+            "2.0.0",
+            "fix: change the parser\n\nDetails about the implementation.\n\n"
+            "BREAKING CHANGE: callers must supply the new option.\n"
+            "This replaces the former implicit default.",
+        ),
+    ],
+)
+def test_real_subject_and_breaking_footer_keep_their_release_impact(
+    repository: Path, version: str, target: str, message: str
+) -> None:
+    write_project(repository, version)
+    base = commit(repository, "feat: baseline")
+    (repository / "src").mkdir()
+    (repository / "src/tool.py").write_text("value = 1\n")
+    commit(repository, message)
+    write_project(repository, target)
+    task = commit(repository, f"chore(release): bump version to {target}")
+
+    version_policy.validate(base, task, task)
+
+
 def test_runtime_change_without_version_and_unknown_paths_fail(
     repository: Path,
 ) -> None:
