@@ -60,9 +60,8 @@ def _run_owned(phase: ProcessCommand) -> int:
     except process.ProcessOwnershipError as error:
         if not error.cleanup_proven:
             raise
-        print(
-            f"merge-command: surviving descendants required cleanup: {error}",
-            file=sys.stderr,
+        process.report_diagnostic(
+            f"merge-command: surviving descendants required cleanup: {error}"
         )
         return 1
 
@@ -95,15 +94,17 @@ def _review(
         output.seek(0)
         scope = output.read().decode("utf-8").strip()
     if scope == "documentation":
-        print("Documentation-only candidate: online code review is not required.")
+        process.report_diagnostic(
+            "Documentation-only candidate: online code review is not required.",
+            standard_output=True,
+        )
         return 0
     if scope != "full":
-        print(f"merge-command: invalid check scope: {scope}", file=sys.stderr)
+        process.report_diagnostic(f"merge-command: invalid check scope: {scope}")
         return 1
     if os.name != "posix":
-        print(
-            "merge-command: online code review currently requires POSIX",
-            file=sys.stderr,
+        process.report_diagnostic(
+            "merge-command: online code review currently requires POSIX"
         )
         return 1
 
@@ -125,7 +126,7 @@ def _review(
             )
             pending = Path(pending_directory) / "receipt.json"
         except (code_review.ReviewError, OSError, ValueError) as error:
-            print(f"merge-command: {error}", file=sys.stderr)
+            process.report_diagnostic(f"merge-command: {error}")
             return 1
         environment.update(
             H2H_REVIEW_PROCESS_OWNER=str(os.getpid()),
@@ -141,9 +142,12 @@ def _review(
         if status == 0:
             try:
                 published = reviewer._publish_managed_receipt(target, pending)
-                print(f"Code review passed after owned cleanup; wrote {published}")
+                process.report_diagnostic(
+                    f"Code review passed after owned cleanup; wrote {published}",
+                    standard_output=True,
+                )
             except (code_review.ReviewError, OSError, ValueError) as error:
-                print(f"merge-command: {error}", file=sys.stderr)
+                process.report_diagnostic(f"merge-command: {error}")
                 status = 1
         return status
 
@@ -176,7 +180,9 @@ def main() -> int:
                 )
             )
     except process.ProcessOwnershipError as error:
-        print(f"merge-command: cleanup could not be proven: {error}", file=sys.stderr)
+        process.report_diagnostic(
+            f"merge-command: cleanup could not be proven: {error}"
+        )
         return process.TERMINATION_FAILED_EXIT_CODE
     # An exit status alone cannot distinguish a cleaned interrupt from an owner
     # killed before/during teardown. Every started phase must complete cleanup

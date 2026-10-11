@@ -2,8 +2,14 @@
 
 set -euo pipefail
 
+diagnose() {
+    # Bash can retry buffered text from a failed builtin write in a later command
+    # substitution. Isolate diagnostics so a closed pipe cannot corrupt Git data.
+    (printf 'git-flow-merge: %s\n' "$1" >&2) || true
+}
+
 fail() {
-    printf 'git-flow-merge: %s\n' "$1" >&2
+    diagnose "$1"
     exit 1
 }
 
@@ -64,6 +70,102 @@ is_ancestor() {
     return 1
 }
 
+assert_checked_out_ref() {
+    local actual worktree=$1 expected=$2
+
+    actual="$(git -C "$worktree" symbolic-ref --quiet HEAD)" \
+        || fail "worktree no longer has its expected branch: $worktree"
+    [[ "$actual" == "$expected" ]] \
+        || fail "worktree branch changed during cleanup: $worktree"
+}
+
+assert_cleanup_refs() {
+    local worktree=$1 expected_primary=$2
+
+    assert_ref_equals "$worktree" "$task_ref" "$task_oid"
+    assert_ref_equals "$worktree" "$primary_ref" "$expected_primary"
+    is_ancestor "$worktree" "$task_oid" "$expected_primary" \
+        || fail 'task is no longer contained in primary; branch was retained'
+}
+
+assert_reference_transaction_support() {
+    local version
+
+    version="$(git version)" || fail 'could not inspect Git version'
+    if [[ "$version" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] \
+        && (( 10#${BASH_REMATCH[1]} > 2 \
+            || (10#${BASH_REMATCH[1]} == 2 && 10#${BASH_REMATCH[2]} >= 28) )); then
+        return 0
+    fi
+    fail 'safe branch cleanup requires Git 2.28 or newer (reference-transaction hooks)'
+}
+
+delete_task_branch() {
+    local worktree=$1 expected_primary=$2 cleanup_hooks original_hook status=0
+
+    assert_clean "$worktree"
+    assert_no_operation "$worktree"
+    assert_checked_out_ref "$worktree" "$primary_ref"
+    assert_cleanup_refs "$worktree" "$expected_primary"
+    original_hook="$(git -C "$worktree" rev-parse --path-format=absolute \
+        --git-path hooks/reference-transaction)" \
+        || fail 'could not locate the existing reference transaction hook'
+    cleanup_hooks="$(mktemp -d "${TMPDIR:-/tmp}/h2h-cleanup-hooks.XXXXXX")" \
+        || fail 'could not isolate branch deletion from its upstream'
+    # Keep the guard in this already-loaded function: the linked task worktree
+    # may have been removed, so no implementation can be loaded from it here.
+    if ! cat > "$cleanup_hooks/reference-transaction" <<'HOOK'
+#!/bin/sh
+set -eu
+input="$H2H_CLEANUP_HOOK_DIRECTORY/input-$$"
+trap 'rm -f -- "$input" || :' EXIT
+cat > "$input"
+# Preserve all original events and the exact input, including aborted events
+# emitted by a backend's internal transaction. Its rejection takes precedence.
+if [ -x "$H2H_CLEANUP_ORIGINAL_HOOK" ]; then
+    "$H2H_CLEANUP_ORIGINAL_HOOK" "$@" < "$input" || exit "$?"
+fi
+[ "$1" = prepared ] || exit 0
+while read -r old new ref; do
+    [ "$ref" = "$H2H_CLEANUP_TASK_REF" ] || continue
+    case "$new" in ''|*[!0]*) continue ;; esac
+    # branch -d sends a zero old OID rather than requesting a compare-and-swap.
+    # At prepared, Git holds the reference locks: read the actual old value now.
+    actual_task=$(git rev-parse --verify "$ref^{commit}") || exit 1
+    actual_primary=$(git rev-parse --verify "$H2H_CLEANUP_PRIMARY_REF^{commit}") || exit 1
+    actual_head=$(git symbolic-ref --quiet HEAD) || exit 1
+    if [ "$actual_task" != "$H2H_CLEANUP_TASK_OID" ] \
+        || [ "$actual_primary" != "$H2H_CLEANUP_PRIMARY_OID" ] \
+        || [ "$actual_head" != "$H2H_CLEANUP_PRIMARY_REF" ]; then
+        printf 'git-flow-merge: ref changed while locking branch deletion; task retained\n' >&2 || true
+        exit 1
+    fi
+    git merge-base --is-ancestor "$actual_task" "$actual_primary" || exit 1
+done < "$input"
+HOOK
+    then
+        rm -rf -- "$cleanup_hooks"
+        fail 'could not write the branch deletion guard; task retained'
+    fi
+    if ! chmod +x "$cleanup_hooks/reference-transaction" \
+        || [[ ! -x "$cleanup_hooks/reference-transaction" ]]; then
+        rm -rf -- "$cleanup_hooks"
+        fail 'could not enable the branch deletion guard; task retained'
+    fi
+    # An unconfigured remote has no fetch mapping, making primary HEAD Git's
+    # ancestry authority. Do not override merge: that setting is multivalued.
+    # The prepared hook supplies the locked check that branch -d itself omits.
+    H2H_CLEANUP_HOOK_DIRECTORY="$cleanup_hooks" \
+    H2H_CLEANUP_ORIGINAL_HOOK="$original_hook" \
+    H2H_CLEANUP_TASK_REF="$task_ref" H2H_CLEANUP_TASK_OID="$task_oid" \
+    H2H_CLEANUP_PRIMARY_REF="$primary_ref" H2H_CLEANUP_PRIMARY_OID="$expected_primary" \
+    git -C "$worktree" -c "core.hooksPath=$cleanup_hooks" \
+        -c "branch.$task_branch.remote=$cleanup_hooks" \
+        branch -d "$task_branch" || status=$?
+    rm -rf -- "$cleanup_hooks" || fail 'could not remove temporary cleanup directory'
+    return "$status"
+}
+
 abort_merge_if_needed() {
     local worktree=$1 merge_head
 
@@ -80,8 +182,9 @@ restore_after_failure() {
     local status=$? child_status=0
 
     trap - EXIT
-    # Repeated signals cannot cut short the owned supervisor's cleanup.
-    trap '' HUP INT TERM
+    # Repeated cancellation and closed diagnostic pipes cannot cut short cleanup
+    # or replace the original exit status after the owner has proved termination.
+    trap '' HUP INT TERM PIPE
     if (( status != 0 )); then
         if [[ -n "$active_pid" ]]; then
             # The child owns its descendants. Wait for teardown before aborting
@@ -91,14 +194,13 @@ restore_after_failure() {
             check_owner_cleanup "$child_status"
         fi
         if [[ "$owner_cleanup_failed" -ne 0 ]]; then
-            printf 'git-flow-merge: process cleanup unproven; candidate and task retained\n' >&2
+            diagnose 'process cleanup unproven; candidate and task retained'
         elif abort_merge_if_needed "$merge_worktree"; then
             # A signal or cleanup failure after the commit must not undo success.
             if [[ "$merge_worktree" == "$repository_root" ]] \
                 && [[ "$(git -C "$merge_worktree" rev-parse HEAD)" == "$primary_oid" ]]; then
                 git -C "$repository_root" switch "$task_branch" || {
-                    printf 'git-flow-merge: task branch retained; could not switch to %s\n' \
-                        "$task_branch" >&2
+                    diagnose "task branch retained; could not switch to $task_branch"
                 }
             fi
         fi
@@ -199,6 +301,7 @@ task_oid="$(git rev-parse --verify "$task_ref^{commit}")" \
     || fail "task branch is not a commit: $task_branch"
 git merge-base "$primary_oid" "$task_oid" >/dev/null \
     || fail "task branch and primary have no common ancestor: $primary"
+assert_reference_transaction_support
 
 primary_worktree=''
 candidate_worktree=''
@@ -238,18 +341,13 @@ if is_ancestor "$repository_root" "$task_oid" "$primary_oid"; then
         git switch "$primary" \
             || fail "could not switch to primary; task branch was retained: $primary"
     else
+        assert_checked_out_ref "$repository_root" "$task_ref"
         cd "$cleanup_worktree"
         git -C "$cleanup_worktree" worktree remove "$repository_root" \
             || fail "no-op task worktree remains: $repository_root"
     fi
 
-    assert_clean "$cleanup_worktree"
-    assert_no_operation "$cleanup_worktree"
-    assert_ref_equals "$cleanup_worktree" "$task_ref" "$task_oid"
-    assert_ref_equals "$cleanup_worktree" "$primary_ref" "$primary_oid"
-    is_ancestor "$cleanup_worktree" "$task_oid" "$primary_oid" \
-        || fail 'task is no longer contained in primary; branch was retained'
-    git -C "$cleanup_worktree" branch -d "$task_branch" \
+    delete_task_branch "$cleanup_worktree" "$primary_oid" \
         || fail "no-op task branch remains: $task_branch"
 
     printf 'Cleaned up no-op task %s already contained in %s at %s\n' \
@@ -289,6 +387,9 @@ trap restore_after_failure EXIT
 trap 'receive_signal 129' HUP
 trap 'receive_signal 130' INT
 trap 'receive_signal 143' TERM
+# Pipe consumers may exit before cleanup finishes. Diagnostics must not kill
+# this owner or prevent its EXIT handler from validating the cleanup receipt.
+trap '' PIPE
 if [[ -x "$repository_root/.venv/bin/python" ]]; then
     merge_python="$repository_root/.venv/bin/python"
 elif [[ -x "$repository_root/.venv/Scripts/python.exe" ]]; then
@@ -336,15 +437,20 @@ else
 fi
 
 cd "$merge_worktree"
+merge_commit="$(git -C "$merge_worktree" rev-parse HEAD)"
+assert_checked_out_ref "$merge_worktree" "$primary_ref"
+assert_cleanup_refs "$merge_worktree" "$merge_commit"
 if [[ "$repository_root" != "$merge_worktree" ]]; then
     assert_clean "$repository_root"
+    assert_no_operation "$repository_root"
+    assert_checked_out_ref "$repository_root" "$task_ref"
+    assert_cleanup_refs "$merge_worktree" "$merge_commit"
     git -C "$merge_worktree" worktree remove "$repository_root" \
         || fail "merge succeeded, but task worktree remains: $repository_root"
 fi
 
-git -C "$merge_worktree" branch -d "$task_branch" \
+delete_task_branch "$merge_worktree" "$merge_commit" \
     || fail "merge succeeded, but task branch remains: $task_branch"
 
-merge_commit="$(git -C "$merge_worktree" rev-parse HEAD)"
 printf 'Merged %s into %s at %s\n' \
     "$task_branch" "$primary" "$merge_commit"

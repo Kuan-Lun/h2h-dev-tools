@@ -619,11 +619,11 @@ def wait_for_owned_tree_exit(
     )
 
 
-def _report_diagnostic(message: str) -> None:
+def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
     """Keep a failed diagnostic stream from interrupting ownership cleanup."""
 
     try:
-        print(message, file=sys.stderr, flush=True)
+        print(message, file=sys.stdout if standard_output else sys.stderr, flush=True)
     except Exception:
         # Diagnostics are secondary to process ownership. Even an unusual stream
         # implementation must not prevent termination, fallback or Job closing.
@@ -648,7 +648,7 @@ def _taskkill_windows_tree(
         return False
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        _report_diagnostic(
+        report_diagnostic(
             f"taskkill failed with exit {completed.returncode}"
             + (f": {detail}" if detail else "")
         )
@@ -667,7 +667,7 @@ def _terminate_windows_tree(
     try:
         job.terminate()
     except OSError as error:
-        _report_diagnostic(str(error))
+        report_diagnostic(str(error))
         if not _taskkill_windows_tree(owner.process, deadline=deadline):
             return False
     return wait_for_owned_tree_exit(owner, deadline=deadline)
@@ -692,7 +692,7 @@ def close_owner(owner: OwnedProcess) -> bool:
     try:
         job.close()
     except OSError as error:
-        _report_diagnostic(str(error))
+        report_diagnostic(str(error))
         return False
     return True
 
@@ -745,13 +745,13 @@ def _run_command(
         if hard_deadline is None
         else f"{max(0.0, hard_deadline - started_at):.1f}s total remaining"
     )
-    print(f"\n==> {phase.label} ({budget_detail})", flush=True)
-    print("+", shlex.join(phase.argv), flush=True)
+    report_diagnostic(f"\n==> {phase.label} ({budget_detail})", standard_output=True)
+    report_diagnostic("+ " + shlex.join(phase.argv), standard_output=True)
     execution_deadline = (
         None if hard_deadline is None else hard_deadline - termination_reserve_seconds
     )
     if execution_deadline is not None and execution_deadline <= started_at:
-        _report_diagnostic(
+        report_diagnostic(
             f"command budget lacks the {termination_reserve_seconds:.1f}s "
             f"termination reserve before {phase.label}"
         )
@@ -786,7 +786,7 @@ def _run_command(
         except subprocess.TimeoutExpired:
             termination_deadline = hard_deadline
             return_code = TIMEOUT_EXIT_CODE
-            _report_diagnostic(
+            report_diagnostic(
                 f"command budget expired during {phase.label}; "
                 "terminating its process tree"
             )
@@ -806,14 +806,14 @@ def _run_command(
                     owner, deadline=clean_exit_deadline
                 )
             if not tree_empty_proven:
-                _report_diagnostic(
+                report_diagnostic(
                     "command leader exited with surviving process-tree members "
                     f"during {phase.label}"
                 )
                 ownership_error = ProcessOwnershipError(phase.label)
                 raise ownership_error
     except KeyboardInterrupt, RunnerSignalInterrupt:
-        _report_diagnostic(
+        report_diagnostic(
             f"command interrupted during {phase.label}; terminating its process tree"
         )
         raise
@@ -840,7 +840,7 @@ def _run_command(
                         except Exception as error:
                             raise ProcessOwnershipError(phase.label) from error
                         if not tree_empty_proven:
-                            _report_diagnostic(
+                            report_diagnostic(
                                 "could not verify process-tree termination for "
                                 f"{phase.label}"
                             )
@@ -850,12 +850,16 @@ def _run_command(
                         raise ProcessOwnershipError(phase.label)
                 if ownership_error is not None:
                     ownership_error.cleanup_proven = tree_empty_proven
-                print(f"owned_tree_empty={tree_empty_proven}", flush=True)
+                report_diagnostic(
+                    f"owned_tree_empty={tree_empty_proven}", standard_output=True
+                )
     finished_at = time.monotonic()
     elapsed = finished_at - started_at
     if hard_deadline is not None and finished_at > hard_deadline and return_code == 0:
         return_code = TIMEOUT_EXIT_CODE
-    print(f"<== {phase.label}: {elapsed:.1f}s (exit {return_code})", flush=True)
+    report_diagnostic(
+        f"<== {phase.label}: {elapsed:.1f}s (exit {return_code})", standard_output=True
+    )
     return return_code
 
 

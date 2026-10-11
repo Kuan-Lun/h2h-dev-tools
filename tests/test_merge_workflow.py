@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -68,9 +69,34 @@ def executable(path: Path, text: str) -> None:
     path.chmod(0o755)
 
 
-def fixture_repository(root: Path, *, succeeds: bool, profile: str = "full") -> str:
+def fixture_repository(
+    root: Path,
+    *,
+    succeeds: bool,
+    profile: str = "full",
+    ref_format: str = "files",
+) -> str:
     root.mkdir()
-    git(root, "init", "-b", "master")
+    if ref_format == "files":
+        git(root, "init", "-b", "master")
+    else:
+        initialized = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(root),
+                "init",
+                "-b",
+                "master",
+                f"--ref-format={ref_format}",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if "unknown option" in initialized.stderr:
+            pytest.skip("Installed Git does not support the reftable backend")
+        assert initialized.returncode == 0, initialized.stderr
     git(root, "config", "user.name", "Merge Test")
     git(root, "config", "user.email", "merge@example.invalid")
     (root / ".gitignore").write_text(".venv/\n")
@@ -140,6 +166,399 @@ def test_selected_merge_component_exports_the_complete_owner(
     )
     for name in result.stdout.splitlines():
         assert (package / name).is_file(), f"Missing exported owner dependency: {name}"
+
+
+def test_successful_merge_preserves_a_task_advanced_during_the_gate(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    base = fixture_repository(primary, succeeds=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    executable(
+        primary / "scripts/check-full.sh",
+        f"#!{sys.executable}\n"
+        "import time\nfrom pathlib import Path\n"
+        f"state = Path({str(state)!r})\n"
+        "(state / 'ready').touch()\n"
+        "deadline = time.monotonic() + 15\n"
+        "while not (state / 'release').exists():\n"
+        "    assert time.monotonic() < deadline, 'fixture gate release timed out'\n"
+        "    time.sleep(0.01)\n",
+    )
+    git(primary, "add", ".")
+    git(primary, "commit", "-m", "test: pause the merge gate")
+    reviewed_tip = git(primary, "rev-parse", "task")
+    git(primary, "branch", "upstream", "task")
+    git(primary, "branch", "--set-upstream-to=upstream", "task")
+    git(primary, "switch", "master")
+    task = tmp_path / "task"
+    git(primary, "worktree", "add", str(task), "task")
+    local_bin = task / ".venv/bin"
+    local_bin.mkdir(parents=True)
+    (local_bin / "python").symlink_to(sys.executable)
+    with (state / "output").open("w+") as output:
+        wrapper = subprocess.Popen(
+            ("scripts/git-flow-merge.sh",),
+            cwd=task,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not (state / "ready").exists():
+                assert wrapper.poll() is None, (state / "output").read_text()
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            (task / "later-work.txt").write_text("Must remain on the task branch.\n")
+            git(task, "add", ".")
+            git(task, "commit", "-m", "test: add work while the old tip is reviewed")
+            advanced_tip = git(task, "rev-parse", "task")
+            git(task, "update-ref", "refs/heads/upstream", advanced_tip)
+            assert git(task, "status", "--porcelain") == ""
+            (state / "release").touch()
+            wrapper.wait(timeout=15)
+            assert wrapper.returncode != 0, (state / "output").read_text()
+            assert task.is_dir(), "The newly advanced task worktree was removed"
+            assert git(primary, "rev-parse", "task") == advanced_tip
+            assert git(primary, "show", "-s", "--format=%P", "HEAD").split() == [
+                base,
+                reviewed_tip,
+            ]
+            assert not Path(
+                git(
+                    primary,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "MERGE_HEAD",
+                )
+            ).exists()
+            assert git(primary, "status", "--porcelain") == ""
+            assert git(task, "config", "branch.task.merge") == "refs/heads/upstream"
+        finally:
+            (state / "release").touch()
+            if wrapper.poll() is None:
+                wrapper.terminate()
+            wrapper.wait(timeout=15)
+
+
+@pytest.mark.parametrize("cleanup_only", [False, True])
+def test_branch_deletion_rechecks_primary_when_task_moves_after_cleanup_checks(
+    tmp_path: Path, cleanup_only: bool
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    task = git(root, "rev-parse", "task")
+    git(root, "branch", "upstream", "task")
+    git(root, "branch", "--set-upstream-to=upstream", "task")
+    # merge is multivalued; a command-line value must not silently leave the
+    # old first upstream authoritative for Git's deletion check.
+    git(root, "config", "--add", "branch.task.merge", "refs/heads/another-upstream")
+    original_config = git(root, "config", "--get-regexp", r"^branch\.task\.")
+    later = git(
+        root,
+        "commit-tree",
+        "HEAD^{tree}",
+        "-p",
+        task,
+        "-m",
+        "test: concurrent task commit at branch deletion",
+    )
+    if cleanup_only:
+        git(root, "update-ref", "refs/heads/master", task)
+    binary = tmp_path / "late-update-bin"
+    binary.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    executable(
+        binary / "git",
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys\n"
+        f"real_git = {real_git!r}\n"
+        "if sys.argv[-3:] == ['branch', '-d', 'task']:\n"
+        f"    subprocess.run([real_git, '-C', {str(root)!r}, 'update-ref', "
+        f"'refs/heads/task', {later!r}, {task!r}], check=True)\n"
+        f"    subprocess.run([real_git, '-C', {str(root)!r}, 'update-ref', "
+        f"'refs/heads/upstream', {later!r}], check=True)\n"
+        "os.execv(real_git, [real_git, *sys.argv[1:]])\n",
+    )
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", *(["--cleanup-only"] if cleanup_only else [])),
+        cwd=root,
+        env=os.environ
+        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "not fully merged" in result.stderr
+    assert git(root, "rev-parse", "task") == later
+    assert git(root, "config", "--get-regexp", r"^branch\.task\.") == original_config
+    assert git(root, "branch", "--show-current") == "master"
+    assert git(root, "status", "--porcelain") == ""
+    if cleanup_only:
+        assert git(root, "rev-parse", "HEAD") == task
+    else:
+        assert git(root, "show", "-s", "--format=%P", "HEAD").split() == [base, task]
+
+
+@pytest.mark.parametrize("ref_format", ["files", "reftable"])
+def test_branch_deletion_checks_the_locked_ref_after_git_reads_a_stale_tip(
+    tmp_path: Path, ref_format: str
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True, ref_format=ref_format)
+    task = git(root, "rev-parse", "task")
+    git(root, "update-ref", "refs/heads/master", task)
+    later = git(root, "commit-tree", "HEAD^{tree}", "-p", task, "-m", "later task")
+    state = tmp_path / "state"
+    state.mkdir()
+    hooks = state / "original-hooks"
+    hooks.mkdir()
+    executable(
+        hooks / "reference-transaction",
+        f"#!{sys.executable}\n"
+        "import json, sys, time\nfrom pathlib import Path\n"
+        f"state = Path({str(state)!r})\n"
+        "rows = sys.stdin.read()\n"
+        "with (state / 'hook-events').open('a') as output:\n"
+        "    output.write(json.dumps([sys.argv[1:], rows]) + '\\n')\n"
+        f"if sys.argv[1] == 'prepared' and {later!r} in rows:\n"
+        "    (state / 'writer-locked').touch()\n"
+        "    deadline = time.monotonic() + 15\n"
+        "    while not (state / 'release-writer').exists():\n"
+        "        assert time.monotonic() < deadline\n"
+        "        time.sleep(0.01)\n",
+    )
+    git(root, "config", "core.hooksPath", str(hooks))
+    binary = state / "bin"
+    binary.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    executable(
+        binary / "git",
+        f"#!{sys.executable}\n"
+        "import os, sys, time\nfrom pathlib import Path\n"
+        f"real_git = {real_git!r}\nstate = Path({str(state)!r})\n"
+        "arguments = sys.argv[1:]\n"
+        "if arguments[-3:] == ['branch', '-d', 'task']:\n"
+        "    (state / 'deletion-ready').touch()\n"
+        "    deadline = time.monotonic() + 15\n"
+        "    while not (state / 'writer-locked').exists():\n"
+        "        assert time.monotonic() < deadline\n"
+        "        time.sleep(0.01)\n"
+        "    os.environ['GIT_TRACE_REFS'] = str(state / 'refs-trace')\n"
+        "    arguments = ['-c', 'core.filesRefLockTimeout=15000', "
+        "'-c', 'reftable.lockTimeout=15000', *arguments]\n"
+        "os.execv(real_git, [real_git, *arguments])\n",
+    )
+    writer: subprocess.Popen[str] | None = None
+    with (state / "output").open("w+") as output:
+        wrapper = subprocess.Popen(
+            ("scripts/git-flow-merge.sh", "--cleanup-only"),
+            cwd=root,
+            env=os.environ
+            | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not (state / "deletion-ready").exists():
+                assert wrapper.poll() is None, (state / "output").read_text()
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            writer = subprocess.Popen(
+                (
+                    real_git,
+                    "-C",
+                    str(root),
+                    "update-ref",
+                    "refs/heads/task",
+                    later,
+                    task,
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            trace = state / "refs-trace"
+            while not trace.exists() or (
+                f"read_raw_ref: refs/heads/task: {task}" not in trace.read_text()
+            ):
+                assert wrapper.poll() is None, (state / "output").read_text()
+                assert writer.poll() is None, writer.communicate()
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            # Git has already checked the old tip, while this writer owns the
+            # actual ref lock. Releasing it makes deletion acquire the NEW tip.
+            (state / "release-writer").touch()
+            stdout, stderr = writer.communicate(timeout=15)
+            assert writer.returncode == 0, stdout + stderr
+            wrapper.wait(timeout=15)
+            assert wrapper.returncode != 0, (state / "output").read_text()
+            assert (
+                "ref changed while locking branch deletion"
+                in (state / "output").read_text()
+            )
+            assert git(root, "rev-parse", "task") == later
+            assert git(root, "rev-parse", "master") == task
+            assert git(root, "status", "--porcelain") == ""
+            assert git(root, "config", "core.hooksPath") == str(hooks)
+            events = [
+                json.loads(line)
+                for line in (state / "hook-events").read_text().splitlines()
+            ]
+            deletion_events = [
+                (arguments, rows)
+                for arguments, rows in events
+                if any(
+                    row.split()[1:] == ["0" * len(task), "refs/heads/task"]
+                    for row in rows.splitlines()
+                )
+            ]
+            assert any(arguments == ["prepared"] for arguments, _ in deletion_events)
+            assert any(arguments == ["aborted"] for arguments, _ in deletion_events)
+            assert not any(
+                arguments == ["committed"] for arguments, _ in deletion_events
+            )
+        finally:
+            (state / "release-writer").touch()
+            if writer is not None:
+                if writer.poll() is None:
+                    writer.terminate()
+                writer.wait(timeout=15)
+            if wrapper.poll() is None:
+                wrapper.terminate()
+            wrapper.wait(timeout=15)
+
+
+@pytest.mark.parametrize("reject", [False, True])
+def test_linked_merge_cleanup_preserves_reference_hook_input_and_rejection(
+    tmp_path: Path, reject: bool
+) -> None:
+    primary = tmp_path / "primary"
+    base = fixture_repository(primary, succeeds=True)
+    events_path = tmp_path / "hook-events"
+    executable(
+        primary / ".githooks/reference-transaction",
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "rows = sys.stdin.read()\n"
+        "deleting = any(row.split()[1:] == ['0' * len(row.split()[0]), "
+        "'refs/heads/task'] for row in rows.splitlines())\n"
+        "if deleting:\n"
+        f"    with open({str(events_path)!r}, 'a') as output:\n"
+        "        output.write(json.dumps([sys.argv[1:], rows]) + '\\n')\n"
+        f"    if {reject!r} and sys.argv[1] == 'prepared':\n"
+        "        print('original reference hook refused deletion', file=sys.stderr)\n"
+        "        sys.exit(42)\n",
+    )
+    git(primary, "add", ".")
+    git(primary, "commit", "-m", "test: preserve the existing reference hook")
+    task_oid = git(primary, "rev-parse", "task")
+    git(primary, "switch", "master")
+    task = tmp_path / "linked-task"
+    git(primary, "worktree", "add", str(task), "task")
+    local_bin = task / ".venv/bin"
+    local_bin.mkdir(parents=True)
+    (local_bin / "python").symlink_to(sys.executable)
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=task,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert (result.returncode != 0) is reject, result.stdout + result.stderr
+    assert not task.exists()
+    assert git(primary, "show", "-s", "--format=%P", "HEAD").split() == [base, task_oid]
+    assert git(primary, "status", "--porcelain") == ""
+    assert git(primary, "config", "core.hooksPath") == ".githooks"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert ["prepared"] in [arguments for arguments, _ in events]
+    assert (["committed"] in [arguments for arguments, _ in events]) is not reject
+    # All-zero old OIDs are Git's original branch -d payload; the chained hook
+    # must receive those bytes rather than a substituted expected old value.
+    assert {rows for _, rows in events} == {
+        f"{'0' * len(task_oid)} {'0' * len(task_oid)} refs/heads/task\n"
+    }
+    if reject:
+        assert "original reference hook refused deletion" in result.stderr
+        assert git(primary, "rev-parse", "task") == task_oid
+    else:
+        assert git(primary, "branch", "--list", "task") == ""
+
+
+@pytest.mark.parametrize(
+    "failed_command,status", [("cat", 1), ("chmod", 1), ("chmod", 0)]
+)
+def test_cleanup_retains_task_if_reference_guard_cannot_be_prepared(
+    tmp_path: Path, failed_command: str, status: int
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True)
+    task = git(root, "rev-parse", "task")
+    git(root, "update-ref", "refs/heads/master", task)
+    binary = tmp_path / "failed-guard-bin"
+    binary.mkdir()
+    executable(binary / failed_command, f"#!/bin/sh\nexit {status}\n")
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", "--cleanup-only"),
+        cwd=root,
+        env=os.environ
+        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode != 0
+    assert "branch deletion guard; task retained" in result.stderr
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "rev-parse", "master") == task
+    assert git(root, "status", "--porcelain") == ""
+
+
+def test_cleanup_without_reference_transaction_support_retains_task(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True)
+    task = git(root, "rev-parse", "task")
+    git(root, "update-ref", "refs/heads/master", task)
+    binary = tmp_path / "old-git-bin"
+    binary.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    executable(
+        binary / "git",
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "if sys.argv[1:] == ['version']:\n"
+        "    print('git version 2.27.0')\n"
+        "    sys.exit(0)\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+    )
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", "--cleanup-only"),
+        cwd=root,
+        env=os.environ
+        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode != 0
+    assert "reference-transaction hooks" in result.stderr
+    assert git(root, "branch", "--show-current") == "task"
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "rev-parse", "master") == task
 
 
 @pytest.mark.parametrize("succeeds", [True, False])
@@ -841,6 +1260,8 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
         ("classifier", "cancel"),
         ("version", "cancel"),
         ("execute", "cancel"),
+        ("execute", "closed-pipe"),
+        ("execute", "closed-pipe-crash"),
         ("execute", "crash"),
         ("execute", "timeout"),
     ],
@@ -893,7 +1314,9 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 if interruption == "timeout"
                 else "900",
             },
-            stdout=output,
+            stdout=subprocess.PIPE
+            if interruption.startswith("closed-pipe")
+            else output,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -905,12 +1328,17 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                     "The review descendant never started"
                 )
                 time.sleep(0.01)
-            if interruption == "crash":
+            if interruption.startswith("closed-pipe"):
+                assert wrapper.stdout is not None
+                wrapper.stdout.close()
+            if interruption in {"crash", "closed-pipe-crash"}:
                 os.kill(int((state / "reviewer-pid").read_text()), signal.SIGKILL)
-            elif interruption == "cancel":
+            elif interruption in {"cancel", "closed-pipe"}:
                 wrapper.send_signal(signal.SIGTERM)
             wrapper.wait(timeout=15)
             assert wrapper.returncode != 0, (state / "output").read_text()
+            if interruption in {"cancel", "closed-pipe"}:
+                assert wrapper.returncode == 143
             _assert_gate_lock_released(state / "leader-lock")
             _assert_gate_lock_released(state / "child-lock")
             assert not (root / ".git/MERGE_HEAD").exists()
