@@ -604,6 +604,24 @@ def test_windows_normal_leader_survivor_is_cleaned_and_fails_phase(
     terminate.assert_called_once_with(owner, deadline=110.0)
 
 
+@pytest.mark.parametrize("terminated", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
+def test_ownership_failure_reports_cleanup_only_after_empty_tree_and_owner_close(
+    monkeypatch: pytest.MonkeyPatch, terminated: bool, closed: bool
+) -> None:
+    child = Mock(returncode=1)
+    child.wait.return_value = 1
+    owner = runner.OwnedProcess(child)
+    monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
+    monkeypatch.setattr(runner, "wait_for_owned_tree_exit", Mock(return_value=False))
+    monkeypatch.setattr(runner, "terminate_owned_tree", Mock(return_value=terminated))
+    monkeypatch.setattr(runner, "close_owner", Mock(return_value=closed))
+    monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
+    with pytest.raises(runner.ProcessOwnershipError) as failure:
+        runner.run_command(COMMAND, hard_deadline=110.0)
+    assert failure.value.cleanup_proven is (terminated and closed)
+
+
 def test_windows_job_termination_falls_back_to_taskkill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

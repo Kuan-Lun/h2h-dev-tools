@@ -381,8 +381,9 @@ def test_merge_only_aborts_after_owned_cleanup_is_proven(
 
 
 @pytest.mark.parametrize("exit_status", [0, 1, 125])
+@pytest.mark.parametrize("stage", ["review", "commit"])
 def test_launcher_unexpected_exit_without_receipt_preserves_candidate(
-    tmp_path: Path, exit_status: int
+    tmp_path: Path, exit_status: int, stage: str
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True)
@@ -391,7 +392,7 @@ def test_launcher_unexpected_exit_without_receipt_preserves_candidate(
         source.read_text()
         + "\n_original_run_command = run_command\n"
         + "def run_command(phase, **kwargs):\n"
-        + '    if phase.argv[-2:] == ("commit", "--no-edit"):\n'
+        + f"    if phase.argv[-1] == {('scripts/review-merge-candidate.sh' if stage == 'review' else '--no-edit')!r}:\n"
         + f"        raise SystemExit({exit_status})\n"
         + "    return _original_run_command(phase, **kwargs)\n"
     )
@@ -451,6 +452,171 @@ def _assert_gate_lock_released(path: Path) -> None:
 
     with path.open("a") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Online review requires POSIX ownership")
+@pytest.mark.parametrize("surviving_child", [False, True])
+def test_passing_managed_review_requires_an_empty_stage_before_commit(
+    tmp_path: Path, surviving_child: bool
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
+    (root / "AGENTS.md").write_text("# Review policy\n\nReport concrete defects.\n")
+    shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: validate successful managed review")
+    task = git(root, "rev-parse", "HEAD")
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable(
+        binary / "codex",
+        f"#!{sys.executable}\n"
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli managed-review-fixture')\n"
+        "    raise SystemExit(0)\n"
+        "sys.stdin.read()\n"
+        "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n"
+        f"if {surviving_child!r}:\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "    Path(os.environ['REVIEW_GROUP_FILE']).write_text(str(os.getpgrp()))\n",
+    )
+    group_file = tmp_path / "review-group"
+    try:
+        result = subprocess.run(
+            ("scripts/git-flow-merge.sh",),
+            cwd=root,
+            env=os.environ
+            | {
+                "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+                "REVIEW_GROUP_FILE": str(group_file),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        assert (result.returncode == 0) is not surviving_child, (
+            result.stdout + result.stderr
+        )
+        assert not (root / ".git/MERGE_HEAD").exists()
+        if surviving_child:
+            with pytest.raises(ProcessLookupError):
+                os.killpg(int(group_file.read_text()), 0)
+            assert git(root, "rev-parse", "master") == base
+            assert git(root, "rev-parse", "task") == task
+            assert not (root / ".git/fixture-gate").exists()
+        else:
+            assert git(root, "show", "-s", "--format=%P", "master").split() == [
+                base,
+                task,
+            ]
+            assert (root / ".git/fixture-gate").read_text() == "checked\n"
+    finally:
+        if group_file.exists():
+            try:
+                os.killpg(int(group_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX process signals")
+@pytest.mark.parametrize(
+    ("stage", "interruption"),
+    [
+        ("classifier", "cancel"),
+        ("version", "cancel"),
+        ("execute", "cancel"),
+        ("execute", "crash"),
+        ("execute", "timeout"),
+    ],
+)
+def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
+    tmp_path: Path, stage: str, interruption: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
+    (root / "AGENTS.md").write_text("# Review policy\n\nReport concrete defects.\n")
+    shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
+    (root / "scripts/check_change_scope.py").write_text(
+        "import os, runpy\n"
+        "if os.environ.get('MERGE_REVIEW_STAGE') == 'classifier':\n"
+        "    runpy.run_path('scripts/blocking-review.py', run_name='__main__')\n"
+        "print('full')\n"
+    )
+    (root / "scripts/blocking-review.py").write_text(_BLOCKING_GATE)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable(
+        binary / "codex",
+        f"#!{sys.executable}\n"
+        "import os, runpy, sys\n"
+        "from pathlib import Path\n"
+        "stage = os.environ['MERGE_REVIEW_STAGE']\n"
+        "if sys.argv[1:] == ['--version'] and stage != 'version':\n"
+        "    print('codex-cli review-lifecycle-fixture')\n"
+        "else:\n"
+        "    state = Path(os.environ['MERGE_INTERRUPTION_STATE'])\n"
+        "    (state / 'reviewer-pid').write_text(str(os.getppid()))\n"
+        "    runpy.run_path('scripts/blocking-review.py', run_name='__main__')\n",
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: exercise the complete review lifecycle")
+    task = git(root, "rev-parse", "HEAD")
+    with (state / "output").open("w+") as output:
+        wrapper = subprocess.Popen(
+            ("scripts/git-flow-merge.sh",),
+            cwd=root,
+            env=os.environ
+            | {
+                "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+                "MERGE_INTERRUPTION_STATE": str(state),
+                "MERGE_REVIEW_STAGE": stage,
+                "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "1"
+                if interruption == "timeout"
+                else "900",
+            },
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not (state / "ready").exists():
+                assert wrapper.poll() is None, (state / "output").read_text()
+                assert time.monotonic() < deadline, (
+                    "The review descendant never started"
+                )
+                time.sleep(0.01)
+            if interruption == "crash":
+                os.kill(int((state / "reviewer-pid").read_text()), signal.SIGKILL)
+            elif interruption == "cancel":
+                wrapper.send_signal(signal.SIGTERM)
+            wrapper.wait(timeout=15)
+            assert wrapper.returncode != 0, (state / "output").read_text()
+            _assert_gate_lock_released(state / "leader-lock")
+            _assert_gate_lock_released(state / "child-lock")
+            assert not (root / ".git/MERGE_HEAD").exists()
+            assert git(root, "rev-parse", "master") == base
+            assert git(root, "rev-parse", "task") == task
+            assert git(root, "branch", "--show-current") == "task"
+            assert git(root, "status", "--porcelain") == ""
+        finally:
+            groups = {wrapper.pid}
+            if (state / "group").exists():
+                groups.add(int((state / "group").read_text()))
+            for group in groups:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            wrapper.wait(timeout=5)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX process signals")

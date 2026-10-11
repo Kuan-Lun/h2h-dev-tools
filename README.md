@@ -154,6 +154,13 @@ commit, then offline verification before and after the existing full gate.
 Documentation-only changes retain their documentation gate without online review.
 Review reads the repository's root `AGENTS.md`; findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
+The merge launcher owns the complete review stage, including classification,
+CLI-version preflight, reviewer and Codex descendants, in one process group.
+The managed reviewer validates its direct parent and group leader before sharing
+that ownership. It does not create a separate Codex session that could survive
+the reviewer's unexpected death. The launcher proves group cleanup before Git
+aborts; missing cleanup evidence retains the candidate for inspection. Standalone
+review instead owns its CLI-version and Codex command groups directly.
 
 The first review covers the complete candidate repository, including unchanged
 code, tests and configuration. Only a passing full-repository candidate that

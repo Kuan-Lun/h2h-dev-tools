@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from h2h_dev_tools import bundle_verify, code_review
+from h2h_dev_tools import bundle_verify, code_review, merge_command
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -762,6 +762,9 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
         return child
 
     def stop_with_repeated_signals(child: subprocess.Popen[bytes]) -> None:
+        if child not in owned:
+            original_stop(child)
+            return
         cleanup_started.append(child.pid)
         os.kill(os.getpid(), signal_number)
         os.kill(os.getpid(), signal_number)
@@ -1105,3 +1108,49 @@ def test_review_policy_uses_git_paths_even_with_windows_filesystem_semantics(
     # backslashes and rev-parse rejected the candidate implementation blobs.
     monkeypatch.setattr(code_review, "Path", windows_relative_path)
     assert reviewer._policy_digest(tree) == expected
+
+
+@pytest.mark.parametrize("value", ["invalid", "0", "-1", "999999999"])
+def test_external_review_owner_rejects_unrelated_or_invalid_parent(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("H2H_REVIEW_PROCESS_OWNER", value)
+    with pytest.raises(code_review.ReviewError, match=r"[Ii]nvalid|does not match"):
+        code_review._external_process_owner()
+
+
+def test_external_review_owner_requires_the_direct_process_group_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("H2H_REVIEW_PROCESS_OWNER", "100")
+    namespace = SimpleNamespace(
+        environ=os.environ,
+        name="posix",
+        getpid=lambda: 201,
+        getppid=lambda: 100,
+        getpgrp=lambda: 200,
+    )
+    monkeypatch.setattr(code_review, "os", namespace)
+    with pytest.raises(code_review.ReviewError, match="does not match"):
+        code_review._external_process_owner()
+    namespace.getpgrp = lambda: 201
+    with pytest.raises(code_review.ReviewError, match="implementation differs"):
+        code_review._external_process_owner()
+    monkeypatch.setenv("H2H_REVIEW_OWNER_SOURCE", merge_command.owner_source_digest())
+    assert code_review._external_process_owner()
+
+
+def test_review_fingerprints_the_loaded_external_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_review_repository(tmp_path)
+    reviewer = code_review.Reviewer(repo.path)
+    tree = repo.git("write-tree")
+    original = reviewer._policy_digest(tree)
+    loaded = tmp_path / "loaded_merge_command.py"
+    loaded.write_bytes(Path(merge_command.__file__).read_bytes())
+    monkeypatch.setattr(merge_command, "__file__", str(loaded))
+    assert reviewer._policy_digest(tree) == original
+    with loaded.open("a", encoding="utf-8") as stream:
+        stream.write("\n# The actual external owner import differs.\n")
+    assert reviewer._policy_digest(tree) != original
