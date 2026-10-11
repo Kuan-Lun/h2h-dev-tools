@@ -164,8 +164,10 @@ Test launchers select the `git-environment` component and call
 building a test child's environment. Shell entry points can execute
 `python scripts/_shared/h2h_dev_tools/git_environment.py --repository ROOT -- COMMAND`.
 Both use Git's `rev-parse --local-env-vars` inventory, reject failed or malformed
-queries and preserve other environment values. The CLI replaces itself with the
-test command under the existing process owner. Apply this only to test children:
+queries and preserve other environment values. On POSIX the CLI replaces itself
+with the test command; on Windows it waits for the child and returns its exit code
+inside the existing Job. Neither path creates another process owner.
+Apply this only to test children:
 gate checks before and after pytest must retain the real candidate's Git environment.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes

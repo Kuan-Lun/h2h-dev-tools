@@ -8,12 +8,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from h2h_dev_tools import git_environment
+from h2h_dev_tools import git_environment, process
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -135,6 +137,103 @@ def test_git_query_failure_does_not_return_an_unsanitized_environment(
         git_environment.without_local_git_environment(original, repository=tmp_path)
 
     assert original == {"GIT_INDEX_FILE": "candidate-index"}
+
+
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_windows_launcher_waits_in_the_existing_process_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int
+) -> None:
+    clean_environment = {"H2H_TEST_SENTINEL": "preserved"}
+    monkeypatch.setattr(
+        git_environment,
+        "without_local_git_environment",
+        Mock(return_value=clean_environment),
+    )
+    execute = Mock(side_effect=AssertionError("Windows must not use CRT overlay"))
+    monkeypatch.setattr(
+        git_environment,
+        "os",
+        SimpleNamespace(name="nt", environ=os.environ, execvpe=execute),
+    )
+    child = Mock(return_value=subprocess.CompletedProcess([], returncode))
+    monkeypatch.setattr(subprocess, "run", child)
+    monkeypatch.setattr(
+        sys, "argv", ["git-environment", "--repository", str(tmp_path), "--", "pytest"]
+    )
+
+    assert git_environment.main() == returncode
+
+    child.assert_called_once_with(["pytest"], env=clean_environment, check=False)
+    execute.assert_not_called()
+
+
+def test_windows_branch_observes_real_child_completion_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    environment, _ = _environment()
+    environment["GIT_INDEX_FILE"] = "must-not-reach-the-test-child"
+    marker = tmp_path / "child-completed"
+    execute = Mock(side_effect=AssertionError("Windows must not use CRT overlay"))
+    monkeypatch.setattr(
+        git_environment,
+        "os",
+        SimpleNamespace(name="nt", environ=environment, execvpe=execute),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "git-environment",
+            "--repository",
+            str(ROOT),
+            "--",
+            sys.executable,
+            "-c",
+            "import os, time\nfrom pathlib import Path\n"
+            "assert 'GIT_INDEX_FILE' not in os.environ\n"
+            "time.sleep(0.1)\n"
+            f"Path({str(marker)!r}).write_text('completed')\n"
+            "raise SystemExit(7)\n",
+        ],
+    )
+
+    assert git_environment.main() == 7
+    assert marker.read_text() == "completed"
+    execute.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires the native Windows Job backend")
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_windows_cli_waits_for_the_test_child_within_its_job(
+    tmp_path: Path, returncode: int
+) -> None:
+    environment, _ = _environment()
+    environment["GIT_INDEX_FILE"] = "must-not-reach-the-test-child"
+    marker = tmp_path / "job-child-completed"
+    command = process.ProcessCommand(
+        "Git-isolated test command",
+        (
+            sys.executable,
+            str(ROOT / "src/h2h_dev_tools/git_environment.py"),
+            "--repository",
+            str(ROOT),
+            "--",
+            sys.executable,
+            "-c",
+            "import os, time\nfrom pathlib import Path\n"
+            "assert 'GIT_INDEX_FILE' not in os.environ\n"
+            "time.sleep(0.1)\n"
+            f"Path({str(marker)!r}).write_text('completed')\n"
+            f"raise SystemExit({returncode})\n",
+        ),
+        tmp_path,
+        environment=environment,
+    )
+
+    assert (
+        process.run_command(command, hard_deadline=time.monotonic() + 10) == returncode
+    )
+    assert marker.read_text() == "completed"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX exec keeps the same owned PID")

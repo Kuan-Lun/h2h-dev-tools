@@ -4,7 +4,9 @@ on:
   push:
     paths:
       - src/h2h_dev_tools/process.py
+      - src/h2h_dev_tools/git_environment.py
       - tests/test_process*.py
+      - tests/test_git_environment.py
       - pyproject.toml
       - .github/workflows/windows-process.yml
   workflow_dispatch:
@@ -25,7 +27,8 @@ jobs:
         run: |
           python -m venv .venv
           .venv/Scripts/python -m pip install ".[dev]"
-      - name: Verify Windows Job ownership and command execution
+      - name: Verify Windows Job ownership and isolated test execution
         run: >-
           .venv/Scripts/python -B -m pytest -p no:cacheprovider
           tests/test_process.py tests/test_process_integration.py
+          tests/test_git_environment.py

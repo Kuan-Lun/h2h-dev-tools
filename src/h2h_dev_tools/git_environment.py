@@ -65,7 +65,11 @@ def main() -> int:
         environment = without_local_git_environment(
             os.environ, repository=arguments.repository
         )
-        # Reuse the surrounding process owner/session; do not add a supervisor.
+        # Windows CRT overlay does not preserve a waitable parent for the child.
+        # Wait explicitly inside the existing Job; never start another owner.
+        if os.name == "nt":
+            return subprocess.run(command, env=environment, check=False).returncode
+        # POSIX exec preserves the surrounding owner's PID and process group.
         os.execvpe(command[0], command, environment)
     except (GitEnvironmentError, OSError) as error:
         parser.exit(1, f"git-environment: {error}\n")
