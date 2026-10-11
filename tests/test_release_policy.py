@@ -1,29 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import subprocess
 import tomllib
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import pytest
 
+from h2h_dev_tools import version_policy
 from h2h_dev_tools.dependency_manifest import dependency_manifest
 
 _ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_script(name: str) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        name.replace("-", "_"), _ROOT / "scripts" / name
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def git(repository: Path, *arguments: str) -> str:
@@ -62,6 +51,9 @@ version = "{version}"
 dependencies = []
 [tool.h2h.version]
 release-paths = ["src/**"]
+development-paths = ["README.md", "package.json", ".release/**"]
+initial-version = "0.1.0"
+dedicated-release-commit = true
 '''
     (repository / "pyproject.toml").write_text(text)
     (repository / "package.json").write_text('{"devDependencies": {}}')
@@ -83,7 +75,7 @@ release-paths = ["src/**"]
 def test_initial_release_requires_version_bound_candidate_audit(
     repository: Path,
 ) -> None:
-    checker = load_script("check-version.py")
+    checker = version_policy
     base = git(repository, "rev-parse", "master")
     write_project(repository, "0.1.0")
     task = commit(repository, "feat: bootstrap development tools")
@@ -101,7 +93,7 @@ def test_initial_release_rejects_another_version(
     write_project(repository, version)
     task = commit(repository, "feat: bootstrap development tools")
     with pytest.raises(ValueError):
-        load_script("check-version.py").validate("master", task, task)
+        version_policy.validate("master", task, task)
 
 
 def test_initial_release_does_not_apply_to_nonempty_missing_metadata(
@@ -112,7 +104,7 @@ def test_initial_release_does_not_apply_to_nonempty_missing_metadata(
     write_project(repository, "0.1.0")
     task = commit(repository, "feat: add package")
     with pytest.raises(ValueError, match="empty baseline"):
-        load_script("check-version.py").validate(base, task, task)
+        version_policy.validate(base, task, task)
 
 
 def test_candidate_audit_rejects_stale_dependency_hash(repository: Path) -> None:
@@ -121,14 +113,14 @@ def test_candidate_audit_rejects_stale_dependency_hash(repository: Path) -> None
         '{"devDependencies": {"markdownlint-cli2": ">=0.23.2"}}'
     )
     task = commit(repository, "feat: bootstrap development tools")
-    with pytest.raises(ValueError, match="manifest mismatch"):
-        load_script("check-version.py").validate("master", task, task)
+    with pytest.raises(ValueError, match="does not match dependencies"):
+        version_policy.validate("master", task, task)
 
 
 def test_compatible_tool_release_has_one_dedicated_version_transition(
     repository: Path,
 ) -> None:
-    checker = load_script("check-version.py")
+    checker = version_policy
     write_project(repository, "0.1.0")
     base = commit(repository, "feat: bootstrap development tools")
     (repository / "src").mkdir()
@@ -146,7 +138,7 @@ def test_compatible_tool_release_has_one_dedicated_version_transition(
 def test_development_breaking_signal_does_not_change_tool_lane(
     repository: Path,
 ) -> None:
-    checker = load_script("check-version.py")
+    checker = version_policy
     write_project(repository, "0.1.0")
     base = commit(repository, "feat: bootstrap development tools")
     (repository / "README.md").write_text("Changed contributor instructions\n")
@@ -162,7 +154,7 @@ def test_development_breaking_signal_does_not_change_tool_lane(
 def test_runtime_change_without_version_and_unknown_paths_fail(
     repository: Path,
 ) -> None:
-    checker = load_script("check-version.py")
+    checker = version_policy
     write_project(repository, "0.1.0")
     base = commit(repository, "feat: bootstrap development tools")
     (repository / "unknown").write_text("unclassified\n")
@@ -173,7 +165,7 @@ def test_runtime_change_without_version_and_unknown_paths_fail(
     (repository / "src").mkdir()
     (repository / "src/tool.py").write_text("value = 1\n")
     task = commit(repository, "feat: add behavior without bump")
-    with pytest.raises(ValueError, match="version transition"):
+    with pytest.raises(ValueError, match="without a project version bump"):
         checker.validate(base, task, task)
 
 
@@ -197,7 +189,7 @@ def test_candidate_audit_requires_the_full_dependency_inventory(
     receipt_path.write_text(json.dumps(receipt))
     task = commit(repository, "feat: bootstrap development tools")
     with pytest.raises(ValueError, match="Python inventory is incomplete"):
-        load_script("check-version.py").validate("master", task, task)
+        version_policy.validate("master", task, task)
 
 
 def test_release_commit_cannot_mix_runtime_work_with_version(repository: Path) -> None:
@@ -208,4 +200,4 @@ def test_release_commit_cannot_mix_runtime_work_with_version(repository: Path) -
     (repository / "src/tool.py").write_text("value = 1\n")
     task = commit(repository, "chore(release): bump version to 0.1.1")
     with pytest.raises(ValueError, match="may only change version and audit"):
-        load_script("check-version.py").validate(base, task, task)
+        version_policy.validate(base, task, task)

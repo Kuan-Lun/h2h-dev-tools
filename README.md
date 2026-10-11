@@ -10,15 +10,57 @@ Use Python 3.14 or newer. Install the package in a development environment:
 
 ```bash
 python -m pip install h2h-dev-tools
-h2h-dev-tools sync --repository /absolute/path/to/consumer
-h2h-dev-tools verify --repository /absolute/path/to/consumer
 ```
 
 For an unpublished candidate, install an explicitly supplied wheel instead:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.1.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.2.0-py3-none-any.whl
 ```
+
+Declare the components the consumer actually uses in its `pyproject.toml`:
+
+```toml
+[tool.h2h-dev-tools]
+components = ["change-scope", "dependencies", "documentation", "git-flow"]
+```
+
+Then generate or update the snapshot:
+
+```bash
+h2h-dev-tools sync --repository /absolute/path/to/consumer
+h2h-dev-tools verify --repository /absolute/path/to/consumer
+```
+
+Selection is explicit. The generator includes each selected component's complete
+dependency closure and removes previously verified files that are no longer
+selected. Verification rejects stale selection, modified files and unknown files.
+Python modules and shell resources share the same hash-bound manifest.
+
+| Component | Responsibility |
+| --- | --- |
+| `atomic-files` | Atomic byte publication with explicit replace or no-replace semantics; callers own JSON and directory policy |
+| `change-scope`, `documentation` | Exact Git candidate classification and documentation checks |
+| `dependencies`, `dependency-audit` | Declared dependencies, registry candidates and reviewed audit receipts |
+| `version-policy` | Task-level release impact, version and audit validation |
+| `primary-branch`, `git-flow`, `hooks`, `environment` | Local branch selection, safe merge lifecycle, hook installation and environment rebuild |
+| `publish-version` | Version transition across a complete push |
+| `distribution-check` | Installed requirements, RECORD and import-origin validation |
+| `offline-wheel` | Temporary candidate-wheel environment with development dependencies and a local smoke callback |
+| `process` | Owned process trees, deadlines, signal deferral and Windows Job start gates |
+| `formal` | Pinned TLC download and offline host/Docker execution |
+
+Schema-1 snapshots from 0.1 use a fixed payload and are not accepted by normal
+schema-2 verification or sync. After declaring components, convert once:
+
+```bash
+h2h-dev-tools migrate-v1 --repository /absolute/path/to/consumer
+```
+
+The converter verifies the complete old manifest, file set and hashes before
+updating generated files. It preserves unrelated files and rejects edited or
+incomplete snapshots. This conversion changes development tools only; application
+databases, archives and runtime environments do not need conversion.
 
 Review the resulting consumer diff, run that repository's checks and commit the
 snapshot update on its task branch. Sync is an explicit source update; it does
@@ -61,11 +103,48 @@ For an interrupted first sync with no committed bundle, preserve the incomplete
 directory outside `scripts/_shared/` after inspecting its contents, then sync into
 the vacant destination. The tool never treats unknown files as disposable.
 
-The shared modules cover dependency manifest encoding, Git change classification,
-exact-candidate documentation checks, declared CI dependency selection and publish
-version transitions. Thin repository entry points supply their own root and
-policies. Core schema checks, adapter tests, process deadlines and deployment
-acceptance remain owned by their original repositories.
+Thin repository entry points supply their own root and policies. Core schema
+checks, adapter tests, pytest selectors, timeout budgets, formal targets and
+deployment acceptance remain owned by their original repositories. Shell bootstrap
+resources run before a `.venv` exists; they do not import the Python package.
+
+Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
+from the project manifests. Shared version evaluation considers only commits that
+actually change release surface. Hook installation refuses to replace an existing
+third-party hook directory. Rebuild validates explicit source overrides before
+replacing the environment. Merge checks dirty worktrees, in-progress Git operations
+and stable refs; it runs the local candidate review/gate and aborts on failure.
+Already-integrated tasks use checked cleanup without another merge or gate.
+
+The low-level process launch API is silent and accepts file-backed stdout/stderr.
+Its caller must defer signals until it owns the returned process. `run_command`
+provides that lifecycle, reserves cleanup time, rejects surviving descendants and
+verifies the final absolute deadline. Local callers select their budgets and
+signals. POSIX children that deliberately detach and Docker-daemon-owned resources
+are outside the owned-tree guarantee. Windows behavior also runs in the dedicated
+Windows workflow; a POSIX test run does not substitute for it.
+
+The `offline-wheel` component owns temporary build/install directories for
+consumer wheel smoke checks. A consumer supplies its own validation script:
+
+```bash
+.venv/bin/python scripts/_shared/h2h_dev_tools/offline_wheel.py \
+  --repository . --smoke-script scripts/check-installed-wheel.py
+```
+
+Arguments following `--` are forwarded unchanged to that script. The helper
+builds fresh distributions with the repository's development Python and build
+backend, requires exactly one wheel, then installs only that wheel in a temporary
+venv with `uv` in offline mode. It explicitly adds the development site for the
+callback's dependencies and runs the callback with `python -I` from the temporary
+directory. The callback owns package import/metadata checks, CLI checks and domain
+oracles; arguments naming repository files must therefore be absolute paths.
+Success and ordinary failure both remove the temporary environment. A surrounding
+runner still owns the aggregate deadline and process-tree termination policy.
+This checks the candidate artifact with development dependencies; it does **not**
+prove clean dependency resolution or compatibility of an index-selected cohort.
+The toolkit's own isolated resolver smoke and hbrowser's target-directory smoke
+have different contracts and do not use this component.
 
 ## Develop this repository
 

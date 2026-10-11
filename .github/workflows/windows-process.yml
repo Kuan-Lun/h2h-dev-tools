@@ -1,0 +1,31 @@
+name: Windows process ownership
+
+on:
+  push:
+    paths:
+      - src/h2h_dev_tools/process.py
+      - tests/test_process*.py
+      - pyproject.toml
+      - .github/workflows/windows-process.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-process:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install project-local test environment
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python -m pip install ".[dev]"
+      - name: Verify Windows Job ownership and command execution
+        run: >-
+          .venv/Scripts/python -B -m pytest -p no:cacheprovider
+          tests/test_process.py tests/test_process_integration.py

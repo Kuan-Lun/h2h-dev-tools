@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import json
 import shutil
 import subprocess
 import sys
@@ -114,6 +115,19 @@ print(installed.version)
         run(str(entrypoint), "--help", cwd=scratch)
         consumer = scratch / "consumer"
         consumer.mkdir()
+        # Exercise every shipped component, including packaged shell resources.
+        components = run(
+            str(python),
+            "-I",
+            "-c",
+            "import json; from h2h_dev_tools.bundle_verify import COMPONENT_FILES; "
+            "print(json.dumps(sorted(COMPONENT_FILES)))",
+            cwd=scratch,
+        )
+        assert isinstance(json.loads(components), list)
+        (consumer / "pyproject.toml").write_text(
+            "[tool.h2h-dev-tools]\ncomponents = " + components + "\n"
+        )
         run(str(entrypoint), "sync", "--repository", str(consumer), cwd=scratch)
         run(str(entrypoint), "verify", "--repository", str(consumer), cwd=scratch)
         run(

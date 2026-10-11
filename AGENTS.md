@@ -21,6 +21,10 @@
   manifest；不得以任意 sibling checkout 或已安裝的最新版替換 candidate 工具。
 - Snapshot 更新是明確動作，不可在 hooks、一般 pytest 或 merge gate 中下載、
   安裝、同步或自動修正檔案。產物來源版本及 payload hash 必須可驗證。
+- Consumer 在 `[tool.h2h-dev-tools].components` 明列使用的機制；generator
+  產生完整依賴集合，verifier 必須核對選擇、檔案集合與 bytes。
+  Schema-1 只由明確的 `migrate-v1` 一次性轉換工具接納；一般 gate 不保留
+  舊格式 fallback。Shell bootstrap 不得依賴尚未建立的 `.venv`。
 - 工具不得依賴 `h2hdb`、consumer runtime、Pillow 或 FastAPI。
   Consumer 只能在開發流程使用本工具；不得加入 consumer runtime dependencies
   或由 shipped consumer `src/` import 本工具。

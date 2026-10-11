@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "h2h-dev-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shared development tools and reproducible repository snapshots for H2H projects"
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -61,4 +61,20 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 
 [tool.h2h.version]
+development-paths = [
+    ".github/**",
+    ".githooks/**",
+    ".gitignore",
+    ".markdownlint-cli2.jsonc",
+    ".release/**",
+    ".vscode/**",
+    "AGENTS.md",
+    "README.md",
+    "docs/**",
+    "package.json",
+    "scripts/**",
+    "tests/**",
+]
+initial-version = "0.1.0"
+dedicated-release-commit = true
 release-paths = ["LICENSE", "src/**"]
