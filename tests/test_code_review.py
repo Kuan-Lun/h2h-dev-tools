@@ -1154,3 +1154,30 @@ def test_review_fingerprints_the_loaded_external_owner(
     with loaded.open("a", encoding="utf-8") as stream:
         stream.write("\n# The actual external owner import differs.\n")
     assert reviewer._policy_digest(tree) != original
+
+
+@pytest.mark.parametrize("change", ["candidate", "baseline"])
+def test_managed_receipt_revalidates_candidate_and_coverage_before_publication(
+    review_repository: ReviewRepository, change: str
+) -> None:
+    repo = review_repository
+    _baseline, baseline_path = _merge_full_baseline(repo)
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    receipt = reviewer._receipt_path(target)
+    pending = repo.state / "pending-review.json"
+    receipt.replace(pending)
+    if change == "candidate":
+        (repo.path / "feature.py").write_text("value = 100\n")
+        repo.git("add", "feature.py")
+    else:
+        baseline_path.unlink()
+    with (
+        reviewer._review_lock(target, exclusive=True),
+        pytest.raises(code_review.ReviewError, match=r"candidate|coverage"),
+    ):
+        reviewer._publish_managed_receipt(target, pending)
+    assert not receipt.exists()
+    assert pending.exists()

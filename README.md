@@ -156,8 +156,13 @@ Review reads the repository's root `AGENTS.md`; findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
 The merge launcher owns the complete review stage, including classification,
 CLI-version preflight, reviewer and Codex descendants, in one process group.
-The managed reviewer validates its direct parent and group leader before sharing
-that ownership. It does not create a separate Codex session that could survive
+The owner is exported from the actual staged candidate after the three-way merge,
+so an independently updated primary does not require rebasing the task. The owner
+holds the candidate review lock through cleanup and publication. Managed reviewers
+write only pending evidence; the owner publishes it after successful group exit
+and fresh candidate/coverage validation. The managed reviewer validates its direct
+parent, group leader and complete owner source closure before sharing ownership.
+It does not create a separate Codex session that could survive
 the reviewer's unexpected death. The launcher proves group cleanup before Git
 aborts; missing cleanup evidence retains the candidate for inspection. Standalone
 review instead owns its CLI-version and Codex command groups directly.

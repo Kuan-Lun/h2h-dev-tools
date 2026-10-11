@@ -136,8 +136,11 @@
   `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
 - Merge 的 review stage（分類、CLI version preflight、reviewer 與 Codex）由
   外部 owner 管理同一 process group，reviewer 驗證 parent PID 及 group leader
-  與 owner execution closure 完全符合 candidate 後才共用 ownership；不得建立
-  逃出該 owner 的第二個 Codex session。Reviewer
+  與 owner execution closure 完全符合 candidate 後才共用 ownership；owner 從真正
+  staged candidate 匯出完整 review closure，不要求 task 包含最新 primary。
+  Owner 持有 candidate lock 至清理及 evidence publication 完成；managed reviewer
+  只產生 pending result，整組成功退出且 candidate／coverage 重驗後才發布 receipt。
+  不得建立逃出該 owner 的第二個 Codex session。Reviewer
   非預期死亡仍須清理整組，取得 cleanup receipt 後才可 abort；缺少證據保留
   candidate。Standalone review 自行管理 CLI version 與 Codex command groups。
 - Evidence 存於 Git common metadata 的 `h2h-review`，綁定 exact tree、ordered

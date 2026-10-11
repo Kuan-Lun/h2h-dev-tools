@@ -7,10 +7,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from h2h_dev_tools import merge_command, process
+from h2h_dev_tools import bundle_verify, merge_command, process
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REVIEWER = """import json
@@ -84,6 +85,7 @@ def fixture_repository(root: Path, *, succeeds: bool, profile: str = "full") -> 
         shutil.copy2(_ROOT / ".githooks" / name, hooks / name)
     (scripts / "check-version.py").write_text("print('version fixture passed')\n")
     (scripts / "check_change_scope.py").write_text(f"print({profile!r})\n")
+    (root / "AGENTS.md").write_text("# Review policy\n\nReport concrete defects.\n")
     (scripts / "review-code.py").write_text(_REVIEWER)
     (scripts / "check-docs.py").write_text("print('documentation fixture passed')\n")
     executable(scripts / "check-fast.sh", "#!/bin/sh\nexit 0\n")
@@ -100,6 +102,30 @@ def fixture_repository(root: Path, *, succeeds: bool, profile: str = "full") -> 
     (local_bin / "python").symlink_to(sys.executable)
     git(root, "config", "core.hooksPath", ".githooks")
     return base
+
+
+@pytest.mark.parametrize("component", ["git-flow", "code-review"])
+def test_selected_merge_component_exports_the_complete_owner(
+    tmp_path: Path, component: str
+) -> None:
+    package = tmp_path / "h2h_dev_tools"
+    package.mkdir()
+    for name in bundle_verify.component_files([component]):
+        shutil.copy2(_ROOT / "src/h2h_dev_tools" / name, package / name)
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            str(package / "merge_command.py"),
+            "--print-source-files",
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for name in result.stdout.splitlines():
+        assert (package / name).is_file(), f"Missing exported owner dependency: {name}"
 
 
 @pytest.mark.parametrize("succeeds", [True, False])
@@ -337,6 +363,54 @@ def test_launcher_reserves_125_for_unproven_cleanup(
     assert (tmp_path / "cleanup").exists() is cleanup_proven
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Uses POSIX fixture shell hooks")
+def test_windows_documentation_stage_does_not_activate_online_review_protocol(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True, profile="documentation")
+    git(root, "switch", "master")
+    git(root, "merge", "--no-ff", "--no-commit", "task")
+    # Only the dispatcher's platform changes. Its command runner separately owns
+    # Windows Job Objects; documentation classification must not request a POSIX
+    # review lock or managed-online-review environment on that platform.
+    monkeypatch.setattr(
+        merge_command,
+        "os",
+        SimpleNamespace(name="nt", environ=os.environ, getpid=os.getpid),
+    )
+
+    def run_command(
+        phase: process.ProcessCommand, *, hard_deadline: float | None
+    ) -> int:
+        assert hard_deadline is None
+        assert phase.environment is not None
+        assert (
+            not set(merge_command.REVIEW_OWNER_ENVIRONMENT) & phase.environment.keys()
+        )
+        assert phase.argv == ("bash", "scripts/review-merge-candidate.sh")
+        return 0
+
+    monkeypatch.setattr(process, "run_command", run_command)
+    receipt = tmp_path / "cleanup"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "merge-command",
+            "--cleanup-receipt",
+            str(receipt),
+            "--review",
+            str(root),
+            "--",
+            "bash",
+            "scripts/review-merge-candidate.sh",
+        ],
+    )
+    assert merge_command.main() == 0
+    assert receipt.read_text() == "owned_tree_empty\n"
+
+
 @pytest.mark.parametrize("cleanup_proven", [False, True])
 def test_merge_only_aborts_after_owned_cleanup_is_proven(
     tmp_path: Path, cleanup_proven: bool
@@ -456,16 +530,60 @@ def _assert_gate_lock_released(path: Path) -> None:
 
 @pytest.mark.skipif(os.name == "nt", reason="Online review requires POSIX ownership")
 @pytest.mark.parametrize("surviving_child", [False, True])
+@pytest.mark.parametrize(
+    ("diverged_primary", "separate_filesystem"),
+    [(False, False), (True, False), (False, True)],
+)
 def test_passing_managed_review_requires_an_empty_stage_before_commit(
-    tmp_path: Path, surviving_child: bool
+    tmp_path: Path,
+    surviving_child: bool,
+    diverged_primary: bool,
+    separate_filesystem: bool,
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True)
     (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
     (root / "AGENTS.md").write_text("# Review policy\n\nReport concrete defects.\n")
     shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
+    if separate_filesystem:
+        # Model a Git common directory on another volume: atomic renames may not
+        # cross between review metadata and the system temporary directory.
+        reviewer_source = root / "src/h2h_dev_tools/code_review.py"
+        reviewer_source.write_text(
+            reviewer_source.read_text()
+            + "\n_original_replace = os.replace\n"
+            + "def _replace_same_filesystem(source, destination):\n"
+            + "    import errno\n"
+            + "    source_is_metadata = 'h2h-review' in Path(source).parts\n"
+            + "    destination_is_metadata = 'h2h-review' in Path(destination).parts\n"
+            + "    if source_is_metadata != destination_is_metadata:\n"
+            + "        raise OSError(errno.EXDEV, 'Cross-device atomic rename')\n"
+            + "    return _original_replace(source, destination)\n"
+            + "os.replace = _replace_same_filesystem\n"
+        )
     git(root, "add", ".")
     git(root, "commit", "-m", "test: validate successful managed review")
+    if diverged_primary:
+        # Both branches share the tools, then primary changes the owner while the
+        # task independently changes a different file. No rebase is required.
+        git(root, "switch", "master")
+        git(root, "merge", "--ff-only", "task")
+        source = root / "src/h2h_dev_tools/process.py"
+        source.write_text(source.read_text() + "\n# Updated primary owner.\n")
+        git(root, "add", ".")
+        git(
+            root,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            "fix: update primary process owner",
+        )
+        base = git(root, "rev-parse", "HEAD")
+        git(root, "switch", "task")
+        (root / "independent.py").write_text("VALUE = 1\n")
+        git(root, "add", ".")
+        git(root, "commit", "-m", "feat: change an unrelated task file")
     task = git(root, "rev-parse", "HEAD")
     binary = tmp_path / "bin"
     binary.mkdir()
@@ -474,6 +592,7 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
         f"#!{sys.executable}\n"
         "import json, os, subprocess, sys, time\n"
         "from pathlib import Path\n"
+        "assert not any(name.startswith('H2H_REVIEW_') for name in os.environ)\n"
         "if sys.argv[1:] == ['--version']:\n"
         "    print('codex-cli managed-review-fixture')\n"
         "    raise SystemExit(0)\n"
@@ -509,6 +628,19 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
             assert git(root, "rev-parse", "master") == base
             assert git(root, "rev-parse", "task") == task
             assert not (root / ".git/fixture-gate").exists()
+            # Recreating the exact failed candidate must not resurrect a passing
+            # result written before its outer process owner rejected the stage.
+            git(root, "switch", "master")
+            git(root, "merge", "--no-ff", "--no-commit", "task")
+            verification = subprocess.run(
+                (sys.executable, "scripts/review-code.py", "verify", "--index"),
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert verification.returncode != 0, verification.stdout
+            git(root, "merge", "--abort")
         else:
             assert git(root, "show", "-s", "--format=%P", "master").split() == [
                 base,
@@ -521,6 +653,119 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
                 os.killpg(int(group_file.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Online review requires POSIX ownership")
+@pytest.mark.parametrize("owner_result", ["publish", "crash", "corrupt"])
+def test_managed_review_lock_covers_cleanup_and_evidence_publication(
+    tmp_path: Path, owner_result: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
+    shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
+    owner = root / "src/h2h_dev_tools/merge_command.py"
+    owner.write_text(
+        owner.read_text().replace(
+            "        if managed_review and status == 0 and pending.exists():",
+            "        if arguments.review:\n"
+            "            import time\n"
+            "            state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
+            "            (state / 'ready').touch()\n"
+            "            while not (state / 'release').exists():\n"
+            "                time.sleep(0.01)\n"
+            f"            if {owner_result!r} == 'crash':\n"
+            "                os._exit(1)\n"
+            f"            if {owner_result!r} == 'corrupt':\n"
+            "                pending.write_text('{}')\n"
+            "        if managed_review and status == 0 and pending.exists():",
+        )
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: pause owner after command cleanup")
+    state = tmp_path / "state"
+    state.mkdir()
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable(
+        binary / "codex",
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli publication-fixture')\n"
+        "    raise SystemExit(0)\n"
+        "sys.stdin.read()\n"
+        "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n",
+    )
+    environment = os.environ | {
+        "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+        "REVIEW_OWNER_STATE": str(state),
+    }
+    with (state / "output").open("w+") as output:
+        wrapper = subprocess.Popen(
+            ("scripts/git-flow-merge.sh",),
+            cwd=root,
+            env=environment,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not (state / "ready").exists():
+                assert wrapper.poll() is None, (state / "output").read_text()
+                assert time.monotonic() < deadline, "Owner did not reach publication"
+                time.sleep(0.01)
+            for command in ("verify", "run"):
+                overlapping = subprocess.run(
+                    (sys.executable, "scripts/review-code.py", command, "--index"),
+                    cwd=root,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                assert overlapping.returncode != 0, overlapping.stdout
+                assert "already running" in overlapping.stderr
+            assert not list((root / ".git/h2h-review/receipts").glob("*.json"))
+            (state / "release").touch()
+            wrapper.wait(timeout=20)
+            assert (wrapper.returncode == 0) is (owner_result == "publish"), (
+                state / "output"
+            ).read_text()
+            verify_arguments: tuple[str, ...]
+            if owner_result == "publish":
+                verify_arguments = ("--revision", "HEAD")
+                assert not (root / ".git/MERGE_HEAD").exists()
+            else:
+                assert git(root, "rev-parse", "master") == base
+                assert git(root, "branch", "--list", "task")
+                if owner_result == "corrupt":
+                    assert not (root / ".git/MERGE_HEAD").exists()
+                    git(root, "switch", "master")
+                    git(root, "merge", "--no-ff", "--no-commit", "task")
+                else:
+                    assert (root / ".git/MERGE_HEAD").exists()
+                    assert "process cleanup unproven" in (state / "output").read_text()
+                verify_arguments = ("--index",)
+            verification = subprocess.run(
+                (sys.executable, "scripts/review-code.py", "verify", *verify_arguments),
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert (verification.returncode == 0) is (owner_result == "publish"), (
+                verification.stdout + verification.stderr
+            )
+        finally:
+            (state / "release").touch()
+            if wrapper.poll() is None:
+                wrapper.send_signal(signal.SIGTERM)
+            wrapper.wait(timeout=10)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX process signals")
