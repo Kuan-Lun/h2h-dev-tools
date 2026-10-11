@@ -329,6 +329,7 @@ if [[ $# -eq 1 ]]; then
 fi
 
 CDPATH= cd "$repository_root"
+repository_root=$PWD
 
 primary="$(scripts/detect-primary-branch.sh)"
 task_branch="$(git branch --show-current)"
