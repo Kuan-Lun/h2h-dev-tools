@@ -41,6 +41,11 @@ def fixture_repository(root: Path, *, succeeds: bool) -> str:
     hooks.mkdir()
     for name in ("git-flow-merge.sh", "detect-primary-branch.sh", "release-gate.py"):
         shutil.copy2(_ROOT / "scripts" / name, scripts / name)
+    shutil.copytree(
+        _ROOT / "src/h2h_dev_tools",
+        root / "src/h2h_dev_tools",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     for name in ("pre-commit", "pre-merge-commit", "commit-msg", "pre-rebase"):
         shutil.copy2(_ROOT / ".githooks" / name, hooks / name)
     (scripts / "check-version.py").write_text("print('version fixture passed')\n")

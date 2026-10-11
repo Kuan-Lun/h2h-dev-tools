@@ -61,4 +61,20 @@ testpaths = ["tests"]
 addopts = "--strict-markers"
 
 [tool.h2h.version]
+development-paths = [
+    ".github/**",
+    ".githooks/**",
+    ".gitignore",
+    ".markdownlint-cli2.jsonc",
+    ".release/**",
+    ".vscode/**",
+    "AGENTS.md",
+    "README.md",
+    "docs/**",
+    "package.json",
+    "scripts/**",
+    "tests/**",
+]
+initial-version = "0.1.0"
+dedicated-release-commit = true
 release-paths = ["LICENSE", "src/**"]
