@@ -32,7 +32,8 @@ def check_runtime_requirements(
         ):
             raise RuntimeError(
                 f"{package.metadata['Name']} requires {requirement}; "
-                f"installed {requirement.name}=={dependency.version} does not satisfy {requirement}"
+                f"installed {requirement.name}=={dependency.version} "
+                f"does not satisfy {requirement}"
             )
         selected[requirement.name] = dependency.version
     return selected
