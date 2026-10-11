@@ -296,8 +296,10 @@ when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
 review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not
 converted: run the new review to establish evidence for the current implementation.
 
-Process-owner human diagnostics use nonblocking writes on POSIX descriptors and
-Windows pipes. A closed or full pipe can discard diagnostic text; it cannot delay
+Process-owner and code-review human diagnostics use nonblocking writes on POSIX
+descriptors and Windows pipes. A closed or full pipe can discard diagnostic text;
+it cannot change the review result or leave buffered output to fail after receipt
+publication. It cannot delay
 cancellation, timeout cleanup or completion. Each write restores the original
 blocking flags, but inherited descriptors share those flags while the write runs;
 this is not isolation from concurrent writers during failure teardown. Child data

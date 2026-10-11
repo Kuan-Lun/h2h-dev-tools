@@ -542,6 +542,72 @@ def test_terminated_review_releases_its_lock_without_a_passing_receipt(
     assert len(repo.calls()) == 3
 
 
+@pytest.mark.parametrize(
+    "mode,stream_name,expected",
+    [
+        ("hold-pass", "stdout", 0),
+        ("hold-failure", "stdout", 1),
+        ("hold-failure", "stderr", 1),
+    ],
+)
+def test_standalone_review_preserves_result_after_diagnostic_reader_closes(
+    review_repository: ReviewRepository, mode: str, stream_name: str, expected: int
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    receipt = reviewer._receipt_path(reviewer._target(index=True))
+    with _held_review(repo, mode) as owner:
+        assert owner.stdout is not None
+        assert owner.stdout.readline().startswith("Reviewing repository scope:")
+        assert owner.stdout.readline().startswith("Review logs:")
+        assert not receipt.exists(), "Codex must still be held before publication"
+        stream = getattr(owner, stream_name)
+        assert stream is not None
+        stream.close()
+        # communicate must not read our deliberately closed pipe endpoint.
+        setattr(owner, stream_name, None)
+        (repo.state / "release").write_text("release review", encoding="utf-8")
+        stdout, stderr = owner.communicate(timeout=5)
+
+    if expected == 0:
+        assert receipt.exists(), "A successful real review must publish its evidence"
+        _assert_passed(repo.review("verify", "--index"))
+    else:
+        assert not receipt.exists()
+        _assert_blocked(repo.review("verify", "--index"))
+    assert len(repo.calls()) == 1
+    assert owner.returncode == expected, (stdout or "") + (stderr or "")
+
+
+def test_offline_verify_succeeds_when_stdout_has_no_reader(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _assert_passed(repo.review("run", "--index"))
+    reviewer = code_review.Reviewer(repo.path)
+    receipt = reviewer._receipt_path(reviewer._target(index=True))
+    original_receipt = receipt.read_bytes()
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        result = subprocess.run(
+            (sys.executable, "scripts/review-code.py", "verify", "--index"),
+            cwd=repo.path,
+            env=repo.environment,
+            stdout=writer,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    finally:
+        os.close(writer)
+
+    assert receipt.read_bytes() == original_receipt
+    assert len(repo.calls()) == 1, "Offline verify must not invoke Codex"
+    assert result.returncode == 0, result.stderr
+
+
 def test_candidate_changes_during_review_cannot_receive_a_passing_receipt(
     review_repository: ReviewRepository,
 ) -> None:
