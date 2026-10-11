@@ -1,15 +1,16 @@
 {
-  "checked_at": "2026-10-11T06:59:08+00:00",
+  "checked_at": "2026-10-11T08:49:11+00:00",
   "manifest_sha256": "9b9b06499ac50d3669becf22ac2223879fe1acabcb92ac7606fa8feebf8eaba2",
   "node": [
     {
       "declared": ">=0.23.2",
       "latest": "0.23.3",
       "latest_satisfies": true,
-      "name": "markdownlint-cli2"
+      "name": "markdownlint-cli2",
+      "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.1.0",
+  "project_version": "0.2.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -18,6 +19,8 @@
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/hatchling/",
+      "release_notes": "https://hatch.pypa.io/dev/history/hatchling/",
       "url": "https://pypi.org/project/hatchling/"
     },
     {
@@ -27,6 +30,8 @@
       "latest_satisfies": true,
       "name": "packaging",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/packaging/",
+      "release_notes": null,
       "url": "https://pypi.org/project/packaging/"
     },
     {
@@ -36,6 +41,8 @@
       "latest_satisfies": true,
       "name": "build",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/build/",
+      "release_notes": "https://build.pypa.io/en/stable/changelog.html",
       "url": "https://pypi.org/project/build/"
     },
     {
@@ -45,6 +52,8 @@
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/hatchling/",
+      "release_notes": "https://hatch.pypa.io/dev/history/hatchling/",
       "url": "https://pypi.org/project/hatchling/"
     },
     {
@@ -54,6 +63,8 @@
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/mypy/",
+      "release_notes": "https://github.com/python/mypy/blob/master/CHANGELOG.md",
       "url": "https://pypi.org/project/mypy/"
     },
     {
@@ -63,6 +74,8 @@
       "latest_satisfies": true,
       "name": "pytest",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/pytest/",
+      "release_notes": "https://docs.pytest.org/en/stable/changelog.html",
       "url": "https://pypi.org/project/pytest/"
     },
     {
@@ -72,11 +85,13 @@
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
+      "registry_url": "https://pypi.org/project/ruff/",
+      "release_notes": "https://github.com/astral-sh/ruff/blob/main/CHANGELOG.md",
       "url": "https://pypi.org/project/ruff/"
     }
   ],
   "review": {
-    "note": "Initial 0.1.0 audit: reviewed Hatchling 1.32.4 release notes (hatch.pypa.io/dev/history/hatchling/), build 1.6.1 changelog (build.pypa.io/en/stable/changelog.html), packaging 26.3 changelog (packaging.pypa.io/en/stable/changelog.html), pytest 9.1.1 release notes, Ruff 0.17.0 GitHub release, markdownlint-cli2 v0.23.3 tagged CHANGELOG. Hatchling plugin regression is fixed in installed 1.32.4; no custom build hooks. Packaging Version/Requirement APIs exercised by transition, dependency and distribution checks. Ruff defaults changed but target py314 and explicit rules are configured. markdownlint uses supported Node 26.10.0. Mypy 2.4.0 official news and tagged release verified; blog blocked by Google, compatibility validated by strict checking all 26 source files. Python 3.14.1 with build 1.6.1/hatchling 1.32.4/packaging 26.3/mypy 2.4.0/pytest 9.1.1/ruff 0.17.0: 152 tests, Ruff, mypy, Markdown passed; fresh sdist-derived wheel installed and CLI verified in isolated offline environment. Separate clean uv environment normally resolved the explicit candidate wheel plus packaging 26.3 and verified installed file origin and metadata. No upper bounds or pinned dependency exceptions; consumer generated payloads verified against installed candidate wheel.",
+    "note": "Release 0.2.0: rechecked PyPI/npm latest candidates and reviewed official release notes: https://hatch.pypa.io/dev/history/hatchling/ (1.32.4 fixes plugin typing regression; no custom hooks), https://build.pypa.io/en/stable/changelog.html (1.6.1 Windows symlink regression fix), https://packaging.pypa.io/en/stable/changelog.html (26.3 retains required Version/Requirement/SpecifierSet APIs; Python 3.14 satisfies support), https://mypy.readthedocs.io/en/stable/changelog.html (2.4.0 native parser changes validated by strict checking), https://docs.pytest.org/en/stable/changelog.html (9.1.1 parametrization/conftest fixes), https://github.com/astral-sh/ruff/releases/tag/0.17.0 (explicit py314 target and selected rules avoid default-policy drift), https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md (dependency refresh; Node 26.10.0). All latest versions satisfy current open lower bounds; no new upper bound or exact-pin exception. With Python 3.14.1 and these installed versions: 262 tests passed; Ruff, strict mypy 42 source files and local Markdown checks passed. Fresh sdist-derived 0.2.0 wheel and all component resources verified offline. A separate clean uv environment normally resolved the explicit candidate wheel plus packaging 26.3; installed package/metadata origin and every wheel member except rewritten RECORD were byte-verified. Six consumer bundles regenerated from that installed candidate. Windows-native workflow remains separate and was not executed on this macOS host.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
