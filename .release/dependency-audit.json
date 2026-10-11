@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-11T21:26:53+00:00",
+  "checked_at": "2026-10-11T22:19:23+00:00",
   "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.3.3",
+  "project_version": "0.3.4",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -102,7 +102,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.3.3 corrects POSIX nested process ownership: a canonical owner registers its cleanup obligation before starting a new session; outer cleanup closes admission and cannot force-kill the inner owner or claim an empty tree until nested groups are proven empty. Unexpected inner-owner death, unavailable ledger evidence, or an unproven cleanup remain fail-closed. Existing public CLI arguments, snapshot schema and dependency constraints are unchanged. The added private process-scope module is included in the authoritative process component and reviewer dependency closure. Quality-first design uses one shared ownership protocol rather than longer grace periods or a parallel watchdog. Real nested-owner, interrupted Git-hook, standalone-reviewer and exported-snapshot regressions validate the implementation; native Windows Job behavior remains a separate CI responsibility and is not claimed as locally executed. A fresh live registry discovery found exactly the direct dependency candidates already reviewed for 0.3.2: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.0 and markdownlint-cli2 0.23.3. Installed Python versions match these candidates. Previously reviewed primary release notes remain applicable: https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://pytest-xdist.readthedocs.io/en/latest/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . No new pin, relaxed bound, fallback ownership claim or compatibility exception is introduced. Fresh artifact resolution, online review and the canonical full gate remain distinct required evidence.",
+    "note": "Release 0.3.4 removes the forced Codex --ephemeral option so normal persistent CLI parent threads can create subagents. A bounded read-only A/B probe with Codex CLI 0.154.0, unchanged user configuration and no model override reproduced missing-thread spawn failure with --ephemeral and successful child spawn/wait without it; both canonical owners proved empty process trees, and all 10 externally sampled PIDs exited. Read-only sandbox, approval_policy=never, invocation-only notify=[], user model/authentication/tools/security hooks, full-review coverage and exact-candidate receipt validation remain unchanged. CLI rollout files are normally retained and are not deleted by the reviewer. Public toolkit arguments, snapshot schema/file closure and dependency bounds are unchanged; quality-first correction is compatible with existing consumers. Four actual source/snapshot and default/explicit-model argv regressions failed on the old implementation; all 208 reviewer tests and full fast checks passed after the repair. The live registry discovery exactly matches every Python and Node candidate in the previously reviewed 0.3.3 audit (SHA256 421d6200eb70e0a98d76e786b4164dceeecc9834267d8a0174e5674ad620428e): hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.0 and markdownlint-cli2 0.23.3. The new worktree environment installed exactly these versions; all reported Python candidates support Python 3.14 and satisfy the existing bounds. The existing primary release-note compatibility conclusions remain applicable to the identical versions and unchanged constraints: https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://pytest-xdist.readthedocs.io/en/latest/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . This regenerated receipt binds 0.3.4 and its dependency manifest. No pin, relaxed bound or compatibility fallback is introduced. Fresh artifact resolution, true repository review and the canonical full gate remain separate required evidence; no Windows online-review support or remote deployment is claimed.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

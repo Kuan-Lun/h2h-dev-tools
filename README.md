@@ -9,13 +9,13 @@ run offline against the code present in that repository's Git tree.
 Use Python 3.14 or newer. Install the package in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.3.1
+python -m pip install h2h-dev-tools==0.3.4
 ```
 
 For an unpublished candidate, install an explicitly supplied wheel instead:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.3.1-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.3.4-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -289,6 +289,11 @@ can otherwise outlive the CLI and violate its process ownership contract.
 This override applies only to that invocation. Model preferences, authentication,
 plugins, MCP servers and security hooks retain their existing configuration;
 their descendants remain subject to the same cleanup requirements.
+Reviews use normal persistent CLI sessions rather than forcing `--ephemeral`,
+so subagents can resolve their parent thread. Normal CLI session rollouts are
+retained and are not automatically deleted by the reviewer. The raw review
+results, diagnostics and exact-candidate evidence in Git metadata remain separate
+and continue to follow the same verification rules.
 The merge launcher first owns classification in a dedicated process group and
 proves that group empty. Only a full-profile candidate then requires the local
 review entry and starts the reviewer, CLI-version preflight and Codex descendants

@@ -313,12 +313,14 @@ def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
         and "'" not in value.partition("=")[0]
         for value in configuration
     )
-    # Only completion notifications are disabled. Do not suppress user model,
+    # Preserve normal CLI session persistence so subagent spawning can resolve
+    # its parent thread. Only completion notifications are disabled.
+    assert "--ephemeral" not in arguments
+    # Do not suppress user model,
     # authentication, tools/plugins, feature flags, or safety-hook settings.
     expected_options = {
         "--sandbox",
         "-c",
-        "--ephemeral",
         "--json",
         "--output-schema",
         "--output-last-message",
@@ -333,7 +335,6 @@ def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
         "--json",
         "--output-schema",
         "--output-last-message",
-        "--ephemeral",
         "-",
     } <= set(arguments)
     prompt = str(calls[0]["prompt"])
