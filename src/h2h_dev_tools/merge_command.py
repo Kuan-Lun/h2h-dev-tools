@@ -313,7 +313,7 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--print-source-files"]:
         print("\n".join(owner_source_files()))
         raise SystemExit(0)
-    if len(sys.argv) == 3 and sys.argv[1] == "--recovery-diagnostic":
+    if len(sys.argv) == 3 and sys.argv[1] == "--workflow-diagnostic":
         # The shell gives only this diagnostic FD to us; startup errors use
         # /dev/null and must never fall back to its potentially blocked stderr.
         from .process import report_diagnostic

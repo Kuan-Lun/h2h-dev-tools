@@ -3,14 +3,17 @@
 set -euo pipefail
 
 diagnose() {
-    if [[ "${recovering:-0}" -eq 1 ]]; then
-        # The recovery trap ignores cancellation: even its own diagnostics must
-        # not wait on a pipe reader. Startup failures are silent, never a printf
-        # fallback. FD 3 preserves the destination while startup stderr is null.
-        "${merge_python-}" -I -B "${merge_launcher-}" --recovery-diagnostic "$1" \
+    if [[ -n "${merge_launcher-}" || "${recovering:-0}" -eq 1 ]]; then
+        # A failure must reach EXIT recovery even when the caller stops reading.
+        # Use the prepared owner for normal failures as well as recovery. Startup
+        # failures are silent, never a blocking printf fallback. FD 3 preserves
+        # the destination while startup stderr is null.
+        "${merge_python-}" -I -B "${merge_launcher-}" --workflow-diagnostic "$1" \
             3>&2 >/dev/null 2>&1 || true
         return
     fi
+    # Preflight has no owned child or Git mutation to recover. It must still
+    # explain missing Python before a diagnostic helper is available.
     # Bash can retry buffered text from a failed builtin write in a later command
     # substitution. Isolate diagnostics so a closed pipe cannot corrupt Git data.
     (printf 'git-flow-merge: %s\n' "$1" >&2) || true

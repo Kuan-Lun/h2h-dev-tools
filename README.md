@@ -218,7 +218,10 @@ Recovery Git output is captured and replayed after its owner finishes, up to
 startup errors are suppressed; a failed startup has no cleanup receipt and blocks
 further mutation. Owner progress, replay and shell failure messages use the shared
 best-effort diagnostic writer described below, so a closed or stalled pipe cannot
-delay recovery cleanup or receipt publication.
+delay recovery cleanup or receipt publication. Once the owner is prepared,
+this also covers ordinary failures before the shell enters its recovery trap.
+Preflight messages before an owner exists retain normal stdio behavior; no Git
+mutation or owned child has started at that point.
 A failed abort prevents the recovery checkout; recovery never rolls back an
 already completed merge.
 

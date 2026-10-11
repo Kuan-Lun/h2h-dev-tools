@@ -1945,3 +1945,69 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
             except ProcessLookupError:
                 pass
         wrapper.communicate(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
+@pytest.mark.parametrize("missing_python", [False, True])
+def test_failed_gate_recovers_without_waiting_for_diagnostic_reader(
+    tmp_path: Path, *, missing_python: bool
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    ready = tmp_path / "gate-failed"
+    gate = root / "scripts/fill-diagnostic-pipe.py"
+    gate.write_text(
+        "import os\nfrom pathlib import Path\n"
+        "os.set_blocking(2, False)\n"
+        "try:\n"
+        "    while True:\n        os.write(2, b'x' * 8192)\n"
+        "except BlockingIOError:\n    pass\n"
+        "finally:\n    os.set_blocking(2, True)\n"
+        + ("Path('.venv/bin/python').unlink()\n" if missing_python else "")
+        + f"Path({str(ready)!r}).touch()\n"
+    )
+    executable(
+        root / "scripts/check-full.sh",
+        "#!/bin/sh\nexit 7\n",
+    )
+    # Git itself can print after a hook returns, so fill the pipe only once
+    # the real failed command has exited and its owner proved cleanup. This
+    # isolates the shell's pre-EXIT failure diagnostic from child command I/O.
+    shell = root / "src/h2h_dev_tools/git-flow-merge.sh"
+    terminal_status = '    [[ "$owner_cleanup_failed" -eq 0 ]] || return 125\n'
+    shell.write_text(
+        shell.read_text().replace(
+            terminal_status,
+            terminal_status
+            + '    if [[ "$status" -ne 0 && " $* " == *" commit "* ]]; then\n'
+            + '        "$merge_python" "$repository_root/scripts/fill-diagnostic-pipe.py"\n'
+            + "    fi\n",
+        )
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: fail the gate with an undrained diagnostic pipe")
+    task = git(root, "rev-parse", "HEAD")
+    wrapper = subprocess.Popen(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        # Keep the pipe open without reading it. No external signal is needed:
+        # the failed gate must automatically reach recovery and exit.
+        assert wrapper.wait(timeout=15) == 1
+        assert ready.exists()
+        assert git(root, "rev-parse", "master") == base
+        assert git(root, "rev-parse", "task") == task
+        assert (root / ".git/MERGE_HEAD").exists() is missing_python
+        if missing_python:
+            assert git(root, "branch", "--show-current") == "master"
+        else:
+            assert git(root, "branch", "--show-current") == "task"
+            assert git(root, "status", "--porcelain") == ""
+    finally:
+        if wrapper.poll() is None:
+            os.killpg(wrapper.pid, signal.SIGKILL)
+        wrapper.communicate(timeout=5)
