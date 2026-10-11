@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import py_compile
-import runpy
 import shutil
 import subprocess
 import sys
@@ -36,7 +35,6 @@ def _candidate(tmp_path: Path, layout: str) -> _Candidate:
             '[tool.h2h-dev-tools]\ncomponents = ["pytest", "version-policy"]\n'
         )
         bundle.sync_bundle(root)
-        (root / "scripts/_shared/__init__.py").write_text("")
         package = root / "scripts/_shared/h2h_dev_tools"
         namespace = "_shared.h2h_dev_tools"
         import_root = root / "scripts"
@@ -65,6 +63,7 @@ def _candidate(tmp_path: Path, layout: str) -> _Candidate:
         "    worker = os.environ.get('PYTEST_XDIST_WORKER', 'master')\n"
         "    report = {\n"
         "        'source': str(Path(candidate.__file__).resolve()),\n"
+        "        'source_registered': getattr(candidate.__loader__, '_h2h_source_registration', None) is not None,\n"
         "        'prefix': sys.pycache_prefix,\n"
         "        'dont_write': sys.dont_write_bytecode,\n"
         "        'environment_prefix': os.environ.get('PYTHONPYCACHEPREFIX'),\n"
@@ -206,6 +205,7 @@ def test_local_xdist_workers_use_candidate_source_and_fresh_caches(
     assert len(prefixes) == 1
     for report in reports.values():
         assert report["source"] == str(candidate.package / "version_policy.py")
+        assert report["source_registered"] is True
         assert report["dont_write"] is True
         assert report["environment_prefix"] == report["prefix"]
         assert report["pythonpath"].split(os.pathsep)[0] == str(candidate.import_root)
@@ -255,8 +255,9 @@ def test_source_runner_restores_process_state_even_when_pytest_raises(
     original_arguments = sys.argv
     observed: list[Path] = []
 
-    def run_pytest(module: str, *, run_name: str, alter_sys: bool) -> None:
-        assert (module, run_name, alter_sys) == ("pytest", "__main__", True)
+    def run_pytest(*, plugins: list[object]) -> int:
+        assert len(plugins) == 1
+        assert hasattr(plugins[0], "pytest_xdist_newgateway")
         assert sys.argv is original_arguments
         assert sys.pycache_prefix is not None
         prefix = Path(sys.pycache_prefix)
@@ -273,9 +274,9 @@ def test_source_runner_restores_process_state_even_when_pytest_raises(
         assert os.environ["PYTHONPATH"] == expected_path
         if failure:
             raise RuntimeError("pytest plugin failed")
-        raise SystemExit(5)
+        return 5
 
-    monkeypatch.setattr(runpy, "run_module", run_pytest)
+    monkeypatch.setattr(pytest, "main", run_pytest)
     for _ in range(2):
         with pytest.raises(RuntimeError if failure else SystemExit) as caught:
             pytest_source.main()
@@ -314,3 +315,42 @@ def test_snapshot_runner_rejects_invalid_authority_before_loading_pytest(
     assert result.returncode != 0
     assert "BundleError" in result.stderr
     assert not (candidate.root / "master.json").exists()
+
+
+@pytest.mark.parametrize("corruption", ["missing-manifest", "changed-source"])
+def test_local_worker_revalidates_snapshot_after_controller_bootstrap(
+    tmp_path: Path, corruption: str
+) -> None:
+    candidate = _candidate(tmp_path, "snapshot")
+    mutation = (
+        f"Path({str(candidate.package / 'manifest.json')!r}).unlink()"
+        if corruption == "missing-manifest"
+        else f"Path({str(candidate.package / 'version_policy.py')!r}).write_text('raise RuntimeError(\\'unverified worker source\\')')"
+    )
+    conftest = candidate.root / "conftest.py"
+    conftest.write_text(
+        conftest.read_text()
+        + "def pytest_configure(config):\n"
+        + "    if not hasattr(config, 'workerinput'):\n"
+        + f"        {mutation}\n"
+    )
+
+    result = _run(
+        candidate,
+        _environment(candidate),
+        "entry.py",
+        "-p",
+        "no:cacheprovider",
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "-q",
+        "test_candidate.py",
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BundleError" in result.stdout + result.stderr
+    assert (candidate.root / "master.json").exists()
+    assert not (candidate.root / "gw0.json").exists()
+    assert not (candidate.root / "gw1.json").exists()

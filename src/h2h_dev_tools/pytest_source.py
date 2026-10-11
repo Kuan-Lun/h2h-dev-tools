@@ -3,18 +3,61 @@
 from __future__ import annotations
 
 import os
-import runpy
 import sys
 import tempfile
 from pathlib import Path
+from typing import Protocol
+
+
+class _GatewaySpec(Protocol):
+    @property
+    def popen(self) -> object: ...
+
+    @property
+    def via(self) -> object: ...
+
+
+class _Channel(Protocol):
+    def waitclose(self) -> None: ...
+
+
+class _Gateway(Protocol):
+    @property
+    def spec(self) -> _GatewaySpec: ...
+
+    def remote_exec(self, source: str) -> _Channel: ...
+
+
+def _run_pytest(package: Path, namespace: str, import_root: str) -> None:
+    # Pytest is an invocation dependency, not a runtime requirement of the
+    # toolkit distribution or of consumers that select other components.
+    import pytest
+
+    class WorkerSource:
+        @pytest.hookimpl(optionalhook=True)
+        def pytest_xdist_newgateway(self, gateway: _Gateway) -> None:
+            # A popen gateway reached through another gateway may be remote.
+            # Only local workers share the controller's filesystem authority.
+            if not gateway.spec.popen or gateway.spec.via:
+                return
+            gateway.remote_exec(
+                "import runpy, sys\nfrom pathlib import Path\n"
+                f"sys.path.insert(0, {import_root!r})\n"
+                f"package = Path({str(package)!r})\n"
+                "runpy.run_path(str(package / 'source_loader.py'))['load_package'](\n"
+                f"    package, {namespace!r})\n"
+            ).waitclose()
+
+    raise SystemExit(pytest.main(plugins=[WorkerSource()]))
 
 
 def main() -> None:
     """Preserve pytest arguments while isolating caches for this invocation.
 
     Call from a source-bootstrapped package before importing pytest or xdist.
-    Local xdist workers inherit the cache settings and the verified package's
-    import root; test selection, process ownership and deadlines stay local.
+    Local xdist workers inherit cache settings and bootstrap the same verified
+    source before their pytest plugins and conftests load. Test selection,
+    process ownership and deadlines stay local.
     """
     package = Path(__file__).resolve().parent
     parts = __package__.split(".")
@@ -43,7 +86,7 @@ def main() -> None:
                 if previous_pythonpath is not None
                 else ""
             )
-            runpy.run_module("pytest", run_name="__main__", alter_sys=True)
+            _run_pytest(package, __package__, import_root)
         finally:
             sys.pycache_prefix = previous_prefix
             sys.dont_write_bytecode = previous_write_flag

@@ -183,10 +183,12 @@ Pytest entry points select the `pytest` component, source-bootstrap their packag
 as above, then call its `pytest_source.main()` before importing pytest or plugins.
 The helper preserves pytest arguments and uses a unique empty bytecode-cache
 prefix with cache writes disabled. It prepends the verified package's import
-root to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix,
-so local xdist workers use that checkout rather than another editable source.
+root to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix.
+An optional xdist gateway hook revalidates and source-loads the same package in
+each local worker before its pytest plugins and conftests load; path ordering
+alone cannot protect namespace packages from another checkout's regular package.
 The settings are restored and the temporary directory removed when pytest exits.
-This covers local Python workers inheriting the invocation environment; remote
+This covers direct local Python workers; remote or chained
 workers need their own explicit source distribution and are not supported by this
 entry's source guarantee. Each repository still owns selectors, dependencies,
 process ownership and deadlines; the toolkit has no runtime pytest dependency.
