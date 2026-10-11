@@ -863,6 +863,47 @@ def test_merged_repository_review_supports_a_continuous_incremental_chain(
     _assert_passed(repo.review("verify", "--index"))
 
 
+def test_incremental_revalidation_does_not_duplicate_ancestor_file_descriptors(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    reviewer = code_review.Reviewer(repo.path)
+    for index in range(40):
+        repo.commit_file("README.md", f"# Documented change {index}\n")
+        # Lock files legitimately persist after an admitted review is cancelled,
+        # even when documentation can bridge that commit without a receipt.
+        with reviewer._review_lock(
+            reviewer._target(index=False, revision="HEAD"), exclusive=True
+        ):
+            pass
+    _next_candidate(repo)
+    # One retained descriptor per ancestor fits. Opening a second complete lock
+    # chain at publication exhausts this real OS budget after Codex succeeds.
+    command = (
+        "import resource, runpy, sys; "
+        "_, hard = resource.getrlimit(resource.RLIMIT_NOFILE); "
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (int(sys.argv[1]), hard)); "
+        "sys.argv = ['scripts/review-code.py', 'run', '--index']; "
+        "runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
+    for limit, expected_scope in ((64, "incremental"), (32, "repository")):
+        result = subprocess.run(
+            (sys.executable, "-c", command, str(limit)),
+            cwd=repo.path,
+            env=repo.environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        _assert_passed(result)
+        # If even one lock per ancestor exceeds the budget, release all guards
+        # and do a new repository review; never issue unlocked incremental proof.
+        assert _candidate_receipt(repo)[1]["scope"] == expected_scope
+        _assert_passed(repo.review("verify", "--index"))
+
+
 def test_aborted_full_candidate_cannot_establish_a_baseline(
     review_repository: ReviewRepository,
 ) -> None:
