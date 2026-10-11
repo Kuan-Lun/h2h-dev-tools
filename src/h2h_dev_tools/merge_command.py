@@ -8,11 +8,7 @@ from pathlib import Path
 
 
 def main() -> int:
-    # The shell copies this exact source closure before switching to primary,
-    # where a newly introduced launcher may not exist yet. Source and generated
-    # snapshot layouts both expose the same package immediately above this file.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from h2h_dev_tools import process
+    from . import process
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cleanup-receipt", required=True, type=Path)
@@ -48,4 +44,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The shell copies the source closure before switching to primary. Give its
+    # directly executed entry the same relative imports as packaged/snapshot use.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "h2h_dev_tools"
     raise SystemExit(main())
