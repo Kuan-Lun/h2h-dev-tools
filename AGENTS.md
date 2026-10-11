@@ -144,7 +144,8 @@
   只產生 pending result，整組成功退出且 candidate／coverage 重驗後才發布 receipt。
   不得建立逃出該 owner 的第二個 Codex session。Reviewer
   非預期死亡仍須清理整組，取得 cleanup receipt 後才可 abort；缺少證據保留
-  candidate。Standalone review 自行管理 CLI version 與 Codex command groups。
+  candidate。Standalone review 自行管理 CLI version 與 Codex command groups；
+  正常退出亦須以 bounded cleanup 證明整組清空，無法證明時不發布 passing receipt。
 - Evidence 存於 Git common metadata 的 `h2h-review`，綁定 exact tree、ordered
   parents、本檔、local reviewer 與 merge review 入口及 shared reviewer、process ownership、
   change-scope 及完整匯出 dependency closure 實作。V2 evidence 另綁 scope 與

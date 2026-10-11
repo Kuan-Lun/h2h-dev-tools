@@ -45,7 +45,7 @@ if mode in {"hold-pass", "hold-failure"}:
         raise SystemExit(7)
 if mode == "nonzero":
     raise SystemExit(7)
-if mode == "timeout":
+if mode in {"timeout", "passing-child"}:
     child_code = """
 import fcntl
 import os
@@ -62,8 +62,9 @@ while True:
     subprocess.Popen([sys.executable, "-c", child_code, str(state)])
     while not (state / "child-pid").exists():
         time.sleep(0.01)
-    time.sleep(120)
-    raise SystemExit(0)
+    if mode == "timeout":
+        time.sleep(120)
+        raise SystemExit(0)
 if mode == "change-tree":
     Path("feature.py").write_text("value = 2\n", encoding="utf-8")
     subprocess.run(["git", "add", "feature.py"], check=True)
@@ -532,6 +533,62 @@ def test_review_timeout_terminates_the_codex_descendant(
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_standalone_success_cleans_a_descendant_before_publishing_evidence(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    try:
+        _assert_passed(repo.review("run", "--index", mode="passing-child"))
+        assert (repo.state / "child-pid").exists()
+        assert _child_released_lock(repo.state)
+        _assert_passed(repo.review("verify", "--index"))
+    finally:
+        pid_path = repo.state / "child-pid"
+        if pid_path.exists() and not _child_released_lock(repo.state):
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    original_popen = subprocess.Popen
+    original_killpg = os.killpg
+    review_processes: list[subprocess.Popen[bytes]] = []
+
+    def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        child = original_popen(*args, **kwargs)
+        if list(args[0][:2]) == ["codex", "exec"]:
+            review_processes.append(child)
+        return child
+
+    def group_signal(group: int, signum: int) -> None:
+        if review_processes and group == review_processes[0].pid:
+            # Model an exited leader whose descendant stays in uninterruptible
+            # I/O: signals succeed, but the OS still reports a nonempty group.
+            return
+        original_killpg(group, signum)
+
+    monkeypatch.setenv("PATH", repo.environment["PATH"])
+    monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    monkeypatch.setattr(os, "killpg", group_signal)
+    started = time.monotonic()
+    with pytest.raises(code_review.ReviewError, match=r"cleanup.*proven"):
+        reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
+    assert time.monotonic() - started < 8
+    assert len(review_processes) == 1
+    assert review_processes[0].poll() == 0
+    assert not reviewer._receipt_path(target).exists()
+    with pytest.raises(code_review.ReviewError, match="No valid code review"):
+        reviewer._verify(target)
 
 
 @pytest.mark.parametrize("implementation_name", code_review.REVIEW_FILES)

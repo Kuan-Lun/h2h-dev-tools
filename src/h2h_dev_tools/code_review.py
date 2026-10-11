@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
@@ -259,15 +260,12 @@ Otherwise use changes_requested. Write summary and findings in Traditional Chine
 
 
 def _stop(process: subprocess.Popen[bytes]) -> None:
-    # Online review admits only POSIX, where the group survives its leader.
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired as error:
-        raise ReviewError("Codex did not exit after termination") from error
+    # Online review admits only POSIX. Its group can outlive a successful leader;
+    # use the shared bounded group oracle before publishing any passing receipt.
+    if not process_control.terminate_owned_tree(
+        process_control.OwnedProcess(process), deadline=time.monotonic() + 5
+    ):
+        raise ReviewError("Codex process-group cleanup could not be proven")
 
 
 def _external_process_owner() -> bool:
