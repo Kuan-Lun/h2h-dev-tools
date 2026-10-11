@@ -166,3 +166,152 @@ def test_git_authority_query_failure_blocks_local_entry(
 
     assert result.returncode == 128
     assert "not a git repository" in result.stderr
+
+
+def _two_checkouts(tmp_path: Path) -> tuple[Path, Path]:
+    sibling = tmp_path / "checkout"
+    intended = tmp_path / "checkout\n\n"
+    for root in (sibling, intended):
+        root.mkdir()
+        subprocess.run(
+            ("git", "init", "-b", "master", str(root)),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Path Test",
+                "-c",
+                "user.email=path@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "test: initialize independent checkout",
+            ),
+            check=True,
+            capture_output=True,
+        )
+        for name in ("rebuild-env.sh", "install-git-hooks.sh", "format.sh"):
+            _copy(root, f"scripts/{name}")
+        for name in (
+            "rebuild-env.sh",
+            "resolve-sources.sh",
+            "environment.py",
+            "install-git-hooks.sh",
+            "primary-branch.sh",
+        ):
+            _copy(root, f"src/h2h_dev_tools/{name}")
+        (root / ".venv").mkdir()
+        (root / ".venv/preserve-me").write_text("original environment\n")
+        (root / "format-target.txt").write_text("original formatting\n")
+        (root / "candidate.whl").write_bytes(b"fixture source location")
+        for relative in (".venv/bin/ruff", "node_modules/.bin/markdownlint-cli2"):
+            executable = root / relative
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text(
+                f"#!{sys.executable}\nfrom pathlib import Path\n"
+                "Path('format-target.txt').write_text('formatted by local tool\\n')\n"
+            )
+            executable.chmod(0o755)
+    return intended, sibling
+
+
+@pytest.mark.parametrize(
+    "entry", ["format.sh", "install-git-hooks.sh", "rebuild-env.sh"]
+)
+def test_mutating_entries_never_target_a_truncated_sibling_checkout(
+    tmp_path: Path, entry: str
+) -> None:
+    intended, sibling = _two_checkouts(tmp_path)
+    sibling_config = (sibling / ".git/config").read_bytes()
+    source_plan = tmp_path / "source-plan.jsonl"
+    binary = tmp_path / "controlled-tools"
+    binary.mkdir()
+    uv = binary / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+        "arguments = sys.argv[1:]\n"
+        f"assert Path.cwd() in (Path({str(intended)!r}), Path({str(sibling)!r}))\n"
+        "if arguments[0] == 'venv':\n"
+        "    destination = Path(arguments[-1])\n"
+        "    if '--clear' in arguments:\n"
+        "        assert destination == Path('.venv')\n"
+        "        (destination / 'preserve-me').unlink()\n"
+        "        (destination / 'rebuilt').touch()\n"
+        "    python = destination / 'bin/python'\n"
+        "    python.parent.mkdir(parents=True, exist_ok=True)\n"
+        f"    python.symlink_to({sys.executable!r})\n"
+        "elif arguments[:2] == ['pip', 'compile']:\n"
+        "    requirements = Path(arguments[arguments.index('--python') + 2])\n"
+        f"    with open({str(source_plan)!r}, 'a') as output:\n"
+        "        output.write(json.dumps({'cwd': str(Path.cwd()), 'plan': requirements.read_text()}) + '\\n')\n"
+        "    Path(arguments[arguments.index('--output-file') + 1]).write_text('')\n"
+        "else:\n"
+        "    assert arguments[:2] == ['pip', 'install']\n",
+    )
+    uv.chmod(0o755)
+    npm = binary / "npm"
+    npm.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\nPath('.npm-ran').touch()\n"
+    )
+    npm.chmod(0o755)
+    nested = intended / "nested"
+    nested.mkdir()
+    arguments = (
+        ("--source", "sample=./candidate.whl") if entry == "rebuild-env.sh" else ()
+    )
+
+    result = subprocess.run(
+        ("bash", str(intended / "scripts" / entry), *arguments),
+        cwd=nested,
+        env=os.environ
+        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The other checkout is a valid, tempting target: check its real state,
+    # rather than merely accepting a failure to find a nonexistent directory.
+    assert (sibling / ".git/config").read_bytes() == sibling_config
+    assert (sibling / ".venv/preserve-me").read_text() == "original environment\n"
+    assert (sibling / "format-target.txt").read_text() == "original formatting\n"
+    assert not (sibling / ".venv/rebuilt").exists()
+    assert not (sibling / ".npm-ran").exists()
+    if entry == "format.sh":
+        assert (
+            intended / "format-target.txt"
+        ).read_text() == "formatted by local tool\n"
+    elif entry == "install-git-hooks.sh":
+        configured = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(intended),
+                "config",
+                "--local",
+                "--get",
+                "core.hooksPath",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert configured.stdout == ".githooks\n"
+    else:
+        assert not (intended / ".venv/preserve-me").exists()
+        assert (intended / ".venv/rebuilt").exists()
+        assert (intended / ".npm-ran").exists()
+        plans = [json.loads(line) for line in source_plan.read_text().splitlines()]
+        assert plans == [
+            {
+                "cwd": str(intended),
+                "plan": f"sample @ {(intended / 'candidate.whl').as_uri()}\n-e .[dev]\n",
+            }
+        ]
