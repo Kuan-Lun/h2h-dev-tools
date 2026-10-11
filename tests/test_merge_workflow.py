@@ -2013,14 +2013,29 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
 @pytest.mark.parametrize("strategy", ["direct", "candidate"])
 @pytest.mark.parametrize("committed", [False, True])
 @pytest.mark.parametrize("handoff_signal", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
 def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
-    tmp_path: Path, strategy: str, committed: bool, handoff_signal: bool
+    tmp_path: Path, strategy: str, committed: bool, handoff_signal: bool, nested: bool
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True)
     state = tmp_path / "state"
     state.mkdir()
     (root / "scripts/blocking-gate.py").write_text(_BLOCKING_GATE)
+    if nested:
+        (root / "scripts/nested-gate.py").write_text(
+            "import os, runpy, sys\nfrom pathlib import Path\n"
+            "root = Path.cwd()\npackage = root / 'src/h2h_dev_tools'\n"
+            "sys.path.insert(0, str(package.parent))\n"
+            "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+            "from h2h_dev_tools import process\n"
+            "state = Path(os.environ['MERGE_INTERRUPTION_STATE'])\n"
+            "(state / 'outer-group').write_text(str(os.getpgrp()))\n"
+            "phase = process.ProcessCommand('nested gate', (sys.executable, 'scripts/blocking-gate.py'), root)\n"
+            "try:\n    result = process.run_command(phase, hard_deadline=None)\n"
+            "except process.RunnerSignalInterrupt as error:\n    result = 128 + error.signal_number\n"
+            "raise SystemExit(result)\n"
+        )
     executable(
         root / ".githooks/pre-merge-commit",
         "#!/bin/sh\nexec scripts/check-full.sh\n",
@@ -2035,7 +2050,7 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
     blocking_entry = (
         "#!/bin/sh\n"
         'if [ -n "${MERGE_INTERRUPTION_STATE:-}" ]; then\n'
-        "    exec .venv/bin/python scripts/blocking-gate.py\n"
+        f"    exec .venv/bin/python scripts/{'nested' if nested else 'blocking'}-gate.py\n"
         "fi\n"
     )
     hook = "post-merge" if strategy == "direct" else "post-commit"
@@ -2109,8 +2124,8 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
         assert git(root, "status", "--porcelain") == ""
     finally:
         groups = {wrapper.pid}
-        if (state / "group").exists():
-            groups.add(int((state / "group").read_text()))
+        for group_path in state.glob("*group"):
+            groups.add(int(group_path.read_text()))
         for group in groups:
             try:
                 os.killpg(group, signal.SIGKILL)

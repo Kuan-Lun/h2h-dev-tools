@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from h2h_dev_tools import bundle, bundle_verify, code_review, merge_command
+from h2h_dev_tools import bundle, bundle_verify, code_review, merge_command, process
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -694,6 +694,13 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     original_popen = subprocess.Popen
     original_killpg = os.killpg
     review_processes: list[subprocess.Popen[bytes]] = []
+    owners: list[process.OwnedProcess] = []
+    original_stop = code_review._stop
+
+    def remember_owner(owner: process.OwnedProcess) -> None:
+        if owner.process in review_processes:
+            owners.append(owner)
+        original_stop(owner)
 
     def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
         child = original_popen(*args, **kwargs)
@@ -712,15 +719,24 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
     monkeypatch.setattr(subprocess, "Popen", launch)
     monkeypatch.setattr(os, "killpg", group_signal)
-    started = time.monotonic()
-    with pytest.raises(code_review.ReviewError, match=r"cleanup.*proven"):
-        reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
-    assert time.monotonic() - started < 8
-    assert len(review_processes) == 1
-    assert review_processes[0].poll() == 0
-    assert not reviewer._receipt_path(target).exists()
-    with pytest.raises(code_review.ReviewError, match="No valid code review"):
-        reviewer._verify(target)
+    monkeypatch.setattr(code_review, "_stop", remember_owner)
+    try:
+        started = time.monotonic()
+        with pytest.raises(code_review.ReviewError, match=r"cleanup.*proven"):
+            reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
+        assert time.monotonic() - started < 8
+        assert len(review_processes) == 1
+        assert review_processes[0].poll() == 0
+        assert not reviewer._receipt_path(target).exists()
+        with pytest.raises(code_review.ReviewError, match="No valid code review"):
+            reviewer._verify(target)
+    finally:
+        # Remove the simulated obstruction, then obtain actual group proof.
+        # Never release a parent obligation using the mocked cleanup result.
+        monkeypatch.setattr(os, "killpg", original_killpg)
+        for owner in owners:
+            assert process.terminate_owned_tree(owner, deadline=time.monotonic() + 5)
+            assert process.close_owner(owner)
 
 
 @pytest.mark.parametrize("implementation_name", code_review.REVIEW_FILES)
@@ -953,14 +969,15 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
             os.kill(os.getpid(), signal_number)
         return child
 
-    def stop_with_repeated_signals(child: subprocess.Popen[bytes]) -> None:
+    def stop_with_repeated_signals(owner: process.OwnedProcess) -> None:
+        child = owner.process
         if child not in owned:
-            original_stop(child)
+            original_stop(owner)
             return
         cleanup_started.append(child.pid)
         os.kill(os.getpid(), signal_number)
         os.kill(os.getpid(), signal_number)
-        original_stop(child)
+        original_stop(owner)
 
     monkeypatch.setenv("PATH", repo.environment["PATH"])
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))

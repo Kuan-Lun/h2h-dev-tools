@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-11T19:26:21+00:00",
+  "checked_at": "2026-10-11T21:26:53+00:00",
   "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.3.2",
+  "project_version": "0.3.3",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -102,7 +102,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.3.2 corrects explicit relative --source paths to use the invoking working directory, independently of the repository installation/callback directory. Source identity is resolved before environment replacement; missing caller artifacts fail without borrowing a repository-local same-name file. No dependency constraints or snapshot schema changed. Four real uv installation counterexamples failed against 0.3.1 (repository decoy installed or missing caller accepted); all four now pass, including installed module bytes, distribution version, direct_url origin, callback cwd and preservation of the old environment on rejection. Complete environment/bootstrap/shell-entry selection: 52 passed. Ruff, formatting, strict mypy and Markdown passed through normal commit hooks. Native Windows is not claimed by local testing; the existing Windows layout regression remains included. Fresh artifact resolution, online code review and the canonical full gate remain separate required evidence. Registry discovery is checked against the previously reviewed 0.3.1 direct dependency releases: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.0 and markdownlint-cli2 0.23.3. Those exact versions are the local validation environment. Previously reviewed primary release notes remain applicable: https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://pytest-xdist.readthedocs.io/en/stable/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . No new pin, relaxed bound or compatibility exception is introduced.",
+    "note": "Release 0.3.3 corrects POSIX nested process ownership: a canonical owner registers its cleanup obligation before starting a new session; outer cleanup closes admission and cannot force-kill the inner owner or claim an empty tree until nested groups are proven empty. Unexpected inner-owner death, unavailable ledger evidence, or an unproven cleanup remain fail-closed. Existing public CLI arguments, snapshot schema and dependency constraints are unchanged. The added private process-scope module is included in the authoritative process component and reviewer dependency closure. Quality-first design uses one shared ownership protocol rather than longer grace periods or a parallel watchdog. Real nested-owner, interrupted Git-hook, standalone-reviewer and exported-snapshot regressions validate the implementation; native Windows Job behavior remains a separate CI responsibility and is not claimed as locally executed. A fresh live registry discovery found exactly the direct dependency candidates already reviewed for 0.3.2: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.0 and markdownlint-cli2 0.23.3. Installed Python versions match these candidates. Previously reviewed primary release notes remain applicable: https://hatch.pypa.io/dev/history/hatchling/ https://packaging.pypa.io/en/stable/changelog.html https://build.pypa.io/en/stable/changelog.html https://mypy.readthedocs.io/en/stable/changelog.html https://docs.pytest.org/en/stable/changelog.html https://pytest-xdist.readthedocs.io/en/latest/changelog.html https://github.com/astral-sh/ruff/releases/tag/0.17.0 https://github.com/DavidAnson/markdownlint-cli2/blob/v0.23.3/CHANGELOG.md . No new pin, relaxed bound, fallback ownership claim or compatibility exception is introduced. Fresh artifact resolution, online review and the canonical full gate remain distinct required evidence.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
