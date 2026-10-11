@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from h2h_dev_tools import documentation
+from h2h_dev_tools.change_scope import ChangeScopeError
+
 ROOT = Path(__file__).resolve().parents[1]
 SCOPE = ROOT / "scripts" / "check_change_scope.py"
 DOCS = ROOT / "scripts" / "check-docs.py"
@@ -412,6 +415,8 @@ def test_base_change_during_lint_blocks_acceptance(
         ("docs/caf\u00e9.md", "docs/cafe\u0301.md"),
         ("docs/Case/first.md", "docs/case/second.md"),
         ("docs/caf\u00e9/first.md", "docs/cafe\u0301/second.md"),
+        ("docs/alias/first.md", "docs/alias./second.md"),
+        ("docs/alias/first.md", "docs/alias /second.md"),
     ),
 )
 def test_document_export_never_overwrites_colliding_git_paths(
@@ -421,6 +426,7 @@ def test_document_export_never_overwrites_colliding_git_paths(
     for variable in ("TMPDIR", "TEMP", "TMP"):
         repository.environment[variable] = str(repository.root)
     repository.git("config", "core.precomposeUnicode", "false")
+    repository.git("config", "core.protectNTFS", "false")
     repository.stage("docs/seed.md", "# First\n")
     first_object = repository.git("rev-parse", ":docs/seed.md")
     repository.stage("docs/seed.md", "# Second\n")
@@ -572,3 +578,79 @@ def test_invalid_readme_metadata_fails_closed(
     assert result.returncode != 0
     assert "project.readme" in result.stderr
     assert "lint must not run" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        r"docs/..\..\outside.md",
+        r"docs/\rooted.md",
+        r"docs/C:outside.md",
+        r"docs/content.md:hidden.md",
+        r"docs/folder\guide.md",
+    ),
+)
+def test_candidate_document_export_rejects_windows_path_semantics(
+    documentation_repository: DocumentationRepository, name: str
+) -> None:
+    repository = documentation_repository
+    object_id = repository.git("rev-parse", "HEAD:README.md")
+
+    def store_tree(content: bytes) -> str:
+        result = subprocess.run(
+            ("git", "hash-object", "-t", "tree", "-w", "--stdin"),
+            cwd=repository.root,
+            env=repository.environment,
+            input=content,
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout.decode("ascii").strip()
+
+    # Populate Git objects directly: a Windows checkout/index may reject these
+    # POSIX-created names before --candidate ever has an opportunity to see them.
+    docs_tree = store_tree(
+        b"100644 "
+        + name.removeprefix("docs/").encode()
+        + b"\0"
+        + bytes.fromhex(object_id)
+    )
+    entries = []
+    for entry in repository.git("ls-tree", "-z", "HEAD").split("\0"):
+        if not entry:
+            continue
+        header, path = entry.split("\t", 1)
+        mode, _kind, oid = header.split()
+        entries.append(
+            mode.lstrip("0").encode()
+            + b" "
+            + path.encode()
+            + b"\0"
+            + bytes.fromhex(docs_tree if path == "docs" else oid)
+        )
+    candidate = store_tree(b"".join(entries))
+    marker = repository.root / "lint-started"
+    repository.lint_stub(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    result = repository.run(
+        sys.executable, str(DOCS), "--candidate", candidate, "--base", "HEAD"
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Unsafe path in documentation tree" in result.stderr
+    assert not marker.exists()
+
+
+def test_document_export_rejects_an_existing_parent_outside_destination(
+    documentation_repository: DocumentationRepository,
+) -> None:
+    repository = documentation_repository
+    destination = repository.root / "snapshot"
+    outside = repository.root / "outside"
+    destination.mkdir()
+    outside.mkdir()
+    try:
+        (destination / "docs").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"This filesystem does not permit directory symlinks: {error}")
+    with pytest.raises(ChangeScopeError, match="Unsafe path in documentation tree"):
+        documentation._export_documents(repository.root, "HEAD", destination)
+    assert not list(outside.iterdir())

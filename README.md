@@ -137,6 +137,14 @@ third-party hook directory. Rebuild validates explicit source overrides before
 replacing the environment. Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Already-integrated tasks use checked cleanup without another merge or gate.
+Cleanup rechecks that the original task tip remains unchanged and is contained in
+primary before removing a linked worktree. Branch deletion uses primary's checked
+out HEAD as its ancestry authority, independent of the task's configured upstream.
+A temporary `reference-transaction` hook rechecks the actual task tip while Git
+holds its deletion lock, forwarding every event and its unchanged input to the
+existing hook. This requires Git 2.28 or newer. A task advanced during review or
+cleanup is retained, and cleanup failure never rolls back an already successful
+merge.
 New merges use repository-local Python to own Git and its hook process tree.
 Starting with 0.3.0, consumers of the `git-flow` component must create their local
 `.venv` before a new merge. Run the repository's `scripts/rebuild-env.sh` once if
@@ -152,6 +160,10 @@ entry point delegates to the shared `review-merge-candidate.sh` with that root.
 Full changes require online review of the staged two-parent candidate before
 commit, then offline verification before and after the existing full gate.
 Documentation-only changes retain their documentation gate without online review.
+Documentation export rejects backslashes and colons in Git path components on
+every platform: those otherwise valid POSIX names have Windows separator, drive
+or alternate-stream semantics. Export also checks resolved destination containment
+and refuses filesystem name collisions instead of overwriting another document.
 Review reads the repository's root `AGENTS.md`; findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
 The merge launcher first owns classification in a dedicated process group and
@@ -167,7 +179,14 @@ parent, group leader and complete owner source closure before sharing ownership.
 It does not create a separate Codex session that could survive
 the reviewer's unexpected death. The launcher proves group cleanup before Git
 aborts; missing cleanup evidence retains the candidate for inspection. Standalone
-review instead owns its CLI-version and Codex command groups directly.
+review instead owns its CLI-version and Codex command groups directly. Even a
+successful leader exit requires bounded proof that its group is empty before
+standalone review evidence can be published.
+
+For long-running review automation, redirect output to a log file and cancel with
+TERM sent to the outer merge wrapper. A terminal executor that forcibly kills the
+owner cannot run cleanup handlers. Retain the candidate and inspect the surviving
+processes; prove their cleanup before manually aborting that candidate.
 
 The first review covers the complete candidate repository, including unchanged
 code, tests and configuration. Only a passing full-repository candidate that
