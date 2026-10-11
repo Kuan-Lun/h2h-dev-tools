@@ -206,6 +206,9 @@ automatic three-way merge are rejected. Hook installation refuses to replace an
 existing third-party hook directory. Rebuild validates explicit source overrides before
 replacing the environment. Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
+Primary worktree discovery queries the exact branch with NUL-delimited fields;
+paths containing line breaks are preserved. Repository-local merge, gate and
+hook entries must likewise preserve path bytes when determining the Git root.
 Both merge strategies use the captured task commit, preserving its branch name
 in the merge message. Version checks use the actual `MERGE_HEAD`; before Git
 creates that file for a direct merge hook, `WORKFLOW_MERGE_TASK_REF` must contain

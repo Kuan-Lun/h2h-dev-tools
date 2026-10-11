@@ -373,6 +373,156 @@ def test_successful_merge_preserves_a_task_advanced_during_the_gate(
             wrapper.wait(timeout=15)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX newline path and shell workflow")
+def test_full_workflow_preserves_task_root_trailing_newlines(tmp_path: Path) -> None:
+    root = tmp_path / "repository\n\n"
+    base = fixture_repository(root, succeeds=True)
+    task = git(root, "rev-parse", "task")
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(root, "branch", "--show-current") == "master"
+    assert git(root, "branch", "--list", "task") == ""
+    assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert (root / ".git/fixture-review-events").read_text() == "run\nverify\nverify\n"
+    assert (root / ".git/fixture-gate").read_text() == "checked\n"
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX worktree paths and shell workflow"
+)
+@pytest.mark.parametrize("cleanup_only", [False, True])
+@pytest.mark.parametrize(
+    "primary_name",
+    [
+        "primary with spaces",
+        "primary\\name",
+        "primary\rname",
+        "primary\nname",
+        "primary-tail\n",
+    ],
+    ids=["space", "backslash", "carriage-return", "newline", "trailing-newline"],
+)
+def test_shared_workflow_preserves_primary_worktree_path_bytes(
+    tmp_path: Path, primary_name: str, cleanup_only: bool
+) -> None:
+    primary = tmp_path / primary_name
+    base = fixture_repository(primary, succeeds=True)
+    # This test isolates shared discovery and owned Git mutations. Local wrapper
+    # path decoding and review/gate policy have their own entrypoint contracts.
+    for name in ("pre-commit", "pre-merge-commit", "commit-msg"):
+        executable(primary / ".githooks" / name, "#!/bin/sh\nexit 0\n")
+    git(primary, "add", ".")
+    git(primary, "commit", "-m", "test: isolate shared worktree path discovery")
+    task_oid = git(primary, "rev-parse", "task")
+    git(primary, "switch", "master")
+    if cleanup_only:
+        git(primary, "merge", "--no-ff", "--no-edit", "task")
+    task = tmp_path / "linked-task"
+    git(primary, "worktree", "add", str(task), "task")
+    local_bin = task / ".venv/bin"
+    local_bin.mkdir(parents=True)
+    (local_bin / "python").symlink_to(sys.executable)
+
+    result = subprocess.run(
+        (
+            "bash",
+            "src/h2h_dev_tools/git-flow-merge.sh",
+            str(task),
+            "direct",
+            "",
+            *(["--cleanup-only"] if cleanup_only else []),
+        ),
+        cwd=task,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not task.exists()
+    assert git(primary, "branch", "--show-current") == "master"
+    assert git(primary, "branch", "--list", "task") == ""
+    assert git(primary, "show", "-s", "--format=%P", "master").split() == [
+        base,
+        task_oid,
+    ]
+    assert git(primary, "status", "--porcelain") == ""
+    assert not (primary / ".git/MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        "git-failed",
+        "truncated-field",
+        "truncated-record",
+        "wrong-ref",
+        "extra-terminator",
+        "duplicate-primary",
+        "empty",
+    ],
+)
+def test_worktree_query_failure_or_malformed_records_preserve_task(
+    tmp_path: Path, listing: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    task = git(root, "rev-parse", "task")
+    binary = tmp_path / "git-query-failure"
+    binary.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    variants = {
+        "truncated-field": b"refs/heads/master",
+        "truncated-record": b"refs/heads/master\0/incomplete\0",
+        "wrong-ref": b"refs/heads/master-extra\0/path\0\n",
+        "extra-terminator": b"refs/heads/master\0/path\0unexpected\n",
+        "duplicate-primary": b"refs/heads/master\0/path\0\n" * 2,
+        "empty": b"",
+    }
+    executable(
+        binary / "git",
+        f"#!{sys.executable}\nimport os, subprocess, sys\n"
+        f"real_git = {real_git!r}\narguments = sys.argv[1:]\n"
+        "if arguments[:1] == ['for-each-ref']:\n"
+        + (
+            "    subprocess.run([real_git, *arguments], check=True)\n"
+            "    raise SystemExit(19)\n"
+            if listing == "git-failed"
+            else f"    sys.stdout.buffer.write({variants[listing]!r})\n"
+            "    raise SystemExit(0)\n"
+        )
+        + "os.execv(real_git, [real_git, *arguments])\n",
+    )
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        env=os.environ
+        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "could not inspect repository worktrees" in result.stderr
+    assert git(root, "rev-parse", "master") == base
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "branch", "--show-current") == "task"
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/MERGE_HEAD").exists()
+
+
 @pytest.mark.parametrize("cleanup_only", [False, True])
 def test_branch_deletion_rechecks_primary_when_task_moves_after_cleanup_checks(
     tmp_path: Path, cleanup_only: bool

@@ -349,25 +349,32 @@ git merge-base "$primary_oid" "$task_oid" >/dev/null \
     || fail "task branch and primary have no common ancestor: $primary"
 assert_reference_transaction_support
 
-primary_worktree=''
-candidate_worktree=''
-candidate_branch=''
-worktree_listing="$(git worktree list --porcelain)" \
-    || fail 'could not inspect repository worktrees'
-while IFS= read -r line || [[ -n "$line" ]]; do
-    case "$line" in
-        'worktree '*)
-            candidate_worktree="${line#worktree }"
-            candidate_branch=''
-            ;;
-        'branch refs/heads/'*)
-            candidate_branch="${line#branch refs/heads/}"
-            if [[ "$candidate_branch" == "$primary" ]]; then
-                primary_worktree="$candidate_worktree"
-            fi
-            ;;
-    esac
-done <<< "$worktree_listing"
+primary_worktree_from_refs() {
+    local ref path terminator selected='' matched=0
+
+    # Git emits ref NUL path NUL LF. Read NUL-delimited fields before Bash
+    # command substitution, which cannot preserve NUL bytes. Only a fully
+    # parsed exact ref is accepted, including its empty not-checked-out path.
+    while IFS= read -r -d '' ref; do
+        IFS= read -r -d '' path || return 1
+        IFS= read -r terminator || return 1
+        [[ -z "$terminator" ]] || return 1
+        if [[ "$ref" == "$primary_ref" ]]; then
+            [[ "$matched" -eq 0 ]] || return 1
+            selected="$path"
+            matched=1
+        fi
+    done
+    [[ -z "$ref" && "$matched" -eq 1 ]] || return 1
+    # A non-newline sentinel preserves a legal trailing LF in the selected path.
+    printf '%s.' "$selected"
+}
+
+primary_worktree="$(
+    git for-each-ref --format='%(refname)%00%(worktreepath)%00' "$primary_ref" \
+        | primary_worktree_from_refs
+)" || fail 'could not inspect repository worktrees'
+primary_worktree="${primary_worktree%.}"
 
 if [[ -n "$primary_worktree" ]]; then
     assert_clean "$primary_worktree"
