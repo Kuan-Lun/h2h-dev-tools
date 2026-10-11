@@ -348,7 +348,16 @@ Its caller must defer signals until it owns the returned process. `run_command`
 provides that lifecycle, reserves cleanup time, rejects surviving descendants and
 verifies the final absolute deadline. Local callers select their budgets and
 signals. POSIX children that deliberately detach and Docker-daemon-owned resources
-are outside the owned-tree guarantee. Windows behavior also runs in the dedicated
+are outside the owned-tree guarantee. Canonical nested commands are registered
+before their separate POSIX sessions start. Closing admission prevents a new
+phase from racing cleanup; an outer owner cannot send SIGKILL to its inner owner
+or claim an empty tree until that owner's recursive cleanup obligations are released.
+Scope locks share the caller's deadline. A killed inner owner, stale capability,
+damaged ledger or exhausted deadline fails closed and retains the scope path for
+inspection; a merge then retains its candidate and task instead of aborting while
+unproven children may remain. The private inherited scope capability is local
+coordination state, not a persistent receipt or protection against malicious
+same-user modification. Windows behavior also runs in the dedicated
 Windows workflow; a POSIX test run does not substitute for it.
 
 The `offline-wheel` component owns temporary build/install directories for
