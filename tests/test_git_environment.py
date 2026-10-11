@@ -285,10 +285,13 @@ def test_full_gate_isolates_pytest_from_a_real_linked_worktree_hook(
     scripts = candidate / "scripts"
     scripts.mkdir()
     shutil.copy2(ROOT / "scripts/check-full.sh", scripts / "check-full.sh")
+    shutil.copy2(ROOT / "scripts/run-pytest.py", scripts / "run-pytest.py")
     source = candidate / "src/h2h_dev_tools"
-    source.mkdir(parents=True)
-    helper = ROOT / "src/h2h_dev_tools/git_environment.py"
-    shutil.copy2(helper, source / helper.name)
+    shutil.copytree(
+        ROOT / "src/h2h_dev_tools",
+        source,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     python = candidate / ".venv/bin/python"
     python.parent.mkdir(parents=True)
     _executable(python, f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')

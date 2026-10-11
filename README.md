@@ -346,6 +346,15 @@ scripts/check-fast.sh
 scripts/check-full.sh
 ```
 
+For focused tests, use `.venv/bin/python scripts/run-pytest.py <pytest arguments>`.
+The full gate and Windows CI use this same source entry. It loads the checkout's
+toolkit source before pytest, plugins or conftest can import the package, so a
+matching timestamp/size `.pyc` cannot replace the candidate implementation.
+Python's direct `-m pytest` entry does not provide this source guarantee; `-B`
+only prevents cache writes. Installed wheel smoke keeps ordinary isolated imports.
+The full gate still removes Git-local authority only from its pytest child;
+the surrounding checks retain the candidate's Git environment.
+
 The expected primary branch is `master`. Create a dedicated task branch before
 changing tracked files, then finish with `scripts/git-flow-merge.sh`. The merge
 flow reviews full candidates before the hook verifies review evidence, version
@@ -358,6 +367,8 @@ in a new environment with normal, offline pip resolution. Only the installed
 no editable project or development-site fallback is used. The smoke verifies
 package and metadata locations, runtime requirements, both CLI entry points, and
 real snapshot export plus standalone verification.
+Console smoke isolates Python environment overrides and compares every exported
+snapshot file with the package bytes installed in the smoke environment.
 This is an offline distribution check, not a registry-backed clean-resolution test.
 
 ## Releases
