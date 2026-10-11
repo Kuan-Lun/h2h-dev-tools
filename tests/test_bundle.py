@@ -5,14 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
+import zipfile
 from importlib import metadata
 from pathlib import Path
 
 import pytest
 
-from h2h_dev_tools import bundle
+from h2h_dev_tools import bundle, bundle_verify
 from h2h_dev_tools.__main__ import main
 from h2h_dev_tools.bundle_verify import (
     BUNDLE_DIRECTORY,
@@ -180,6 +182,244 @@ def test_update_accepts_verified_older_bundle(
     assert (directory / "dependency_manifest.py").read_bytes() == source_payload[
         "dependency_manifest.py"
     ]
+
+
+def _write_previous_wheel(root: Path, files: dict[str, bytes]) -> Path:
+    wheel = root / "h2h_dev_tools-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(f"h2h_dev_tools/{name}", content)
+        archive.writestr(
+            "h2h_dev_tools-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: h2h-dev-tools\nVersion: 0.1.0\n",
+        )
+    return wheel
+
+
+@pytest.fixture
+def previous_wheel(
+    consumer: Path,
+    source_payload: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    wheel = _write_previous_wheel(consumer, source_payload)
+    monkeypatch.setitem(
+        bundle_verify.COMPONENT_FILES,
+        "documentation",
+        bundle_verify.COMPONENT_FILES["documentation"] | {"new_helper.py"},
+    )
+    source_payload["new_helper.py"] = b'"""New dependency."""\n'
+    return wheel
+
+
+def test_closure_upgrade_requires_explicit_previous_source_authority(
+    consumer: Path, previous_wheel: Path
+) -> None:
+    unrelated = consumer / "scripts/private.py"
+    unrelated.write_text("keep private edits\n")
+    before = _snapshot(consumer)
+    for operation in (verify_bundle, bundle.sync_bundle):
+        with pytest.raises(BundleError, match="complete source file set"):
+            operation(consumer)
+        assert _snapshot(consumer) == before
+    assert bundle.sync_bundle(consumer, previous_wheel=previous_wheel)
+    manifest = verify_bundle(consumer)
+    assert "new_helper.py" in manifest["files"]
+    assert unrelated.read_text() == "keep private edits\n"
+    assert not bundle.sync_bundle(consumer)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "changed-source",
+        "self-rehashed-source",
+        "extra-file",
+        "adopted-private-file",
+        "missing-file",
+        "omitted-existing-file",
+        "source-symlink",
+        "manifest-symlink",
+        "wrong-version",
+        "wrong-wheel-source",
+        "missing-base",
+    ],
+)
+def test_previous_wheel_upgrade_refuses_unproven_ownership_without_writing(
+    consumer: Path, previous_wheel: Path, corruption: str
+) -> None:
+    directory = consumer / BUNDLE_DIRECTORY
+    path = directory / MANIFEST_NAME
+    manifest = json.loads(path.read_bytes())
+    target = directory / "dependency_manifest.py"
+    if corruption in {"changed-source", "self-rehashed-source"}:
+        target.write_text("keep private changes\n")
+        if corruption == "self-rehashed-source":
+            manifest["files"][target.name] = hashlib.sha256(
+                target.read_bytes()
+            ).hexdigest()
+    elif corruption in {"extra-file", "adopted-private-file"}:
+        private = directory / "private.py"
+        private.write_text("keep private module\n")
+        if corruption == "adopted-private-file":
+            manifest["files"][private.name] = hashlib.sha256(
+                private.read_bytes()
+            ).hexdigest()
+    elif corruption == "missing-file":
+        target.unlink()
+    elif corruption == "omitted-existing-file":
+        del manifest["files"][target.name]
+    elif corruption == "source-symlink":
+        target.unlink()
+        target.symlink_to(directory / "__init__.py")
+    elif corruption == "manifest-symlink":
+        saved = consumer / "saved-manifest.json"
+        saved.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(saved)
+    elif corruption == "wrong-version":
+        manifest["toolkit_version"] = "0.0.1"
+    elif corruption == "wrong-wheel-source":
+        files = {name: (directory / name).read_bytes() for name in manifest["files"]}
+        files[target.name] = b"source from another build\n"
+        _write_previous_wheel(consumer, files)
+    else:
+        del manifest["files"]["__init__.py"]
+        (directory / "__init__.py").unlink()
+    if corruption != "manifest-symlink":
+        manifest["payload_sha256"] = payload_digest(manifest["files"])
+        path.write_text(json.dumps(manifest))
+    before = _snapshot(consumer)
+    with pytest.raises(BundleError):
+        bundle.sync_bundle(consumer, previous_wheel=previous_wheel)
+    assert _snapshot(consumer) == before
+
+
+def test_explicit_source_upgrade_can_repair_an_omitted_absent_dependency(
+    consumer: Path, previous_wheel: Path
+) -> None:
+    directory = consumer / BUNDLE_DIRECTORY
+    path = directory / MANIFEST_NAME
+    manifest = json.loads(path.read_bytes())
+    del manifest["files"]["dependency_manifest.py"]
+    (directory / "dependency_manifest.py").unlink()
+    manifest["payload_sha256"] = payload_digest(manifest["files"])
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(BundleError, match="complete source file set"):
+        verify_bundle(consumer)
+    assert bundle.sync_bundle(consumer, previous_wheel=previous_wheel)
+    assert "dependency_manifest.py" in verify_bundle(consumer)["files"]
+
+
+def test_previous_wheel_is_data_and_is_never_imported(
+    consumer: Path,
+    previous_wheel: Path,
+    source_payload: dict[str, bytes],
+) -> None:
+    directory = consumer / BUNDLE_DIRECTORY
+    path = directory / MANIFEST_NAME
+    manifest = json.loads(path.read_bytes())
+    bad_python = b"raise RuntimeError('previous code must not run')\n"
+    (directory / "bundle_verify.py").write_bytes(bad_python)
+    manifest["files"]["bundle_verify.py"] = hashlib.sha256(bad_python).hexdigest()
+    manifest["payload_sha256"] = payload_digest(manifest["files"])
+    path.write_text(json.dumps(manifest))
+    old_files = {name: (directory / name).read_bytes() for name in manifest["files"]}
+    _write_previous_wheel(consumer, old_files)
+    assert bundle.sync_bundle(consumer, previous_wheel=previous_wheel)
+    assert (directory / "bundle_verify.py").read_bytes() == source_payload[
+        "bundle_verify.py"
+    ]
+    verify_bundle(consumer)
+
+
+def test_previous_source_is_rechecked_after_staging(
+    consumer: Path, previous_wheel: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_write = Path.write_bytes
+    target = consumer / BUNDLE_DIRECTORY / "dependency_manifest.py"
+
+    def change_source(path: Path, content: bytes) -> int:
+        count = original_write(path, content)
+        if path.name == MANIFEST_NAME:
+            original_write(target, b"concurrent private change\n")
+        return count
+
+    monkeypatch.setattr(Path, "write_bytes", change_source)
+    with pytest.raises(BundleError, match="modified"):
+        bundle.sync_bundle(consumer, previous_wheel=previous_wheel)
+    assert target.read_bytes() == b"concurrent private change\n"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "invalid-archive",
+        "wrong-name",
+        "extra-metadata",
+        "duplicate-entry",
+        "../private.py",
+        "nested/private.py",
+        "C:private.py",
+        "private.py.",
+        "source-symlink",
+    ],
+)
+def test_previous_wheel_archive_must_have_unambiguous_safe_sources(
+    consumer: Path, previous_wheel: Path, damage: str
+) -> None:
+    if damage == "invalid-archive":
+        previous_wheel.write_bytes(b"not a wheel archive")
+    elif damage == "wrong-name":
+        replacement = consumer / "other-0.1.0-py3-none-any.whl"
+        previous_wheel.rename(replacement)
+        previous_wheel = replacement
+    else:
+        with zipfile.ZipFile(previous_wheel, "a") as archive:
+            if damage == "extra-metadata":
+                archive.writestr("other-0.1.0.dist-info/METADATA", "Name: other\n")
+            elif damage == "duplicate-entry":
+                with pytest.warns(UserWarning, match="Duplicate name"):
+                    archive.writestr("h2h_dev_tools/__init__.py", "duplicate\n")
+            elif damage == "source-symlink":
+                entry = zipfile.ZipInfo("h2h_dev_tools/symlink.py")
+                entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(entry, "../private.py")
+            else:
+                archive.writestr(f"h2h_dev_tools/{damage}", "unsafe path\n")
+    before = _snapshot(consumer)
+    with pytest.raises(BundleError):
+        bundle.sync_bundle(consumer, previous_wheel=previous_wheel)
+    assert _snapshot(consumer) == before
+
+
+def test_cli_accepts_previous_wheel_only_for_explicit_sync(
+    consumer: Path, previous_wheel: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(
+            [
+                "sync",
+                "--repository",
+                str(consumer),
+                "--previous-wheel",
+                str(previous_wheel),
+            ]
+        )
+        == 0
+    )
+    assert "synchronized" in capsys.readouterr().out
+    assert main(["verify", "--repository", str(consumer)]) == 0
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "verify",
+                "--repository",
+                str(consumer),
+                "--previous-wheel",
+                str(previous_wheel),
+            ]
+        )
 
 
 @pytest.mark.parametrize("operation", [bundle.sync_bundle, verify_bundle])

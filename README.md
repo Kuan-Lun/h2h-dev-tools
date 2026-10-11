@@ -37,6 +37,26 @@ dependency closure and removes previously verified files that are no longer
 selected. Verification rejects stale selection, modified files and unknown files.
 Python modules and shell resources share the same hash-bound manifest.
 
+When upgrading across releases that change a component's dependency closure,
+supply the wheel that produced the existing snapshot explicitly:
+
+```bash
+h2h-dev-tools sync --repository /absolute/path/to/consumer \
+  --previous-wheel /absolute/path/to/h2h_dev_tools-0.2.2-py3-none-any.whl
+```
+
+Use a trusted wheel from the exact previous build; matching version strings alone
+are insufficient. The updater reads its distribution metadata and source bytes
+without executing its code. Every declared existing file must match that wheel
+and its manifest hash. Unknown files, local modifications, symlinks and missing
+declared files block replacement. The tool rechecks ownership before writing.
+The supplied wheel proves which existing files may be replaced or removed; it
+does not certify that the old component graph is complete or passed a gate.
+An absent file also omitted from the old manifest may be restored by this explicit
+repair. The new snapshot must always pass the current complete closure verifier.
+Normal `verify`, hooks and `sync` without `--previous-wheel` retain their strict
+current-closure checks; none executes a compatibility fallback or downloads a wheel.
+
 | Component | Responsibility |
 | --- | --- |
 | `atomic-files` | Atomic byte publication with explicit replace or no-replace semantics; callers own JSON and directory policy |

@@ -18,11 +18,20 @@ def main(arguments: list[str] | None = None) -> int:
     for name in ("sync", "verify", "migrate-v1"):
         command = commands.add_parser(name)
         command.add_argument("--repository", required=True, type=Path)
+        if name == "sync":
+            command.add_argument(
+                "--previous-wheel",
+                type=Path,
+                help="explicit old source wheel for dependency-closure upgrades",
+            )
     options = parser.parse_args(arguments)
     try:
         if options.command in {"sync", "migrate-v1"}:
-            operation = sync_bundle if options.command == "sync" else migrate_v1
-            changed = operation(options.repository)
+            changed = (
+                sync_bundle(options.repository, previous_wheel=options.previous_wheel)
+                if options.command == "sync"
+                else migrate_v1(options.repository)
+            )
             print(
                 "Source bundle synchronized."
                 if changed
