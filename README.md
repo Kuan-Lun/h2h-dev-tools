@@ -106,8 +106,9 @@ the vacant destination. The tool never treats unknown files as disposable.
 
 Thin repository entry points supply their own root and policies. Core schema
 checks, adapter tests, pytest selectors, timeout budgets, formal targets and
-deployment acceptance remain owned by their original repositories. Shell bootstrap
-resources run before a `.venv` exists; they do not import the Python package.
+deployment acceptance remain owned by their original repositories. Primary-branch
+detection, hook installation and environment rebuild run before a `.venv` exists;
+they do not import the Python package.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
 from the project manifests. Shared version evaluation considers only commits that
@@ -116,6 +117,14 @@ third-party hook directory. Rebuild validates explicit source overrides before
 replacing the environment. Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Already-integrated tasks use checked cleanup without another merge or gate.
+New merges use repository-local Python to own Git and its hook process tree.
+Starting with 0.3.0, consumers of the `git-flow` component must create their local
+`.venv` before a new merge. Run the repository's `scripts/rebuild-env.sh` once if
+it does not exist; branch detection, bootstrap and already-merged task cleanup
+still work without it. Existing application data does not need conversion.
+An interruption waits for that cleanup before aborting a pending candidate; a
+commit already completed is retained. Unproven process cleanup retains the
+candidate and task for inspection instead of letting a surviving hook race an abort.
 
 The `code-review` component owns the reviewer implementation; each repository's
 `scripts/review-code.py` calls `code_review.main(repository_root)`, and its merge
@@ -126,11 +135,23 @@ Documentation-only changes retain their documentation gate without online review
 Review reads the repository's root `AGENTS.md`; findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
 
+The first review covers the complete candidate repository, including unchanged
+code, tests and configuration. Only a passing full-repository candidate that
+actually becomes a commit on the primary's first-parent history establishes a
+baseline. Later reviews use the primary-to-candidate diff only while that baseline
+and the intervening review chain remain valid. Documentation transitions are
+checked by the exact-tree classifier. Missing evidence, unreviewed code in that
+history, or changed review policy/implementation requires a new repository review.
+Aborted candidates and old difference-only receipts cannot establish a baseline.
+
 Review evidence in Git common metadata `h2h-review` binds the exact tree, ordered
-parents, root policy, local entry point and shared reviewer source. It is separate
+parents, scope, baseline, root policy, local review entry points and shared reviewer,
+process and classification sources. It is separate
 from test evidence. Run needs an authenticated `codex` CLI and POSIX process-group
 support; offline verify also works on Windows. The default timeout is 900 seconds
-(`--timeout-seconds` accepts 1..3600). Old Core `h2hdb-review` receipts are not
+(`--timeout-seconds` accepts 1..3600). Set `H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600`
+when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
+review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not
 converted: run the new review to establish evidence for the current implementation.
 
 The low-level process launch API is silent and accepts file-backed stdout/stderr.

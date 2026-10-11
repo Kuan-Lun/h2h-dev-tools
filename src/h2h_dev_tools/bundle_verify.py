@@ -18,7 +18,9 @@ BASE_FILES = frozenset({"__init__.py", "bundle_verify.py"})
 COMPONENT_FILES: dict[str, frozenset[str]] = {
     "atomic-files": frozenset({"atomic_files.py"}),
     "change-scope": frozenset({"change_scope.py"}),
-    "code-review": frozenset({"code_review.py", "review-merge-candidate.sh"}),
+    "code-review": frozenset(
+        {"code_review.py", "process.py", "change_scope.py", "review-merge-candidate.sh"}
+    ),
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),
@@ -29,7 +31,9 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "offline-wheel": frozenset({"offline_wheel.py"}),
     "formal": frozenset({"formal.py"}),
     "primary-branch": frozenset({"primary-branch.sh"}),
-    "git-flow": frozenset({"primary-branch.sh", "git-flow-merge.sh"}),
+    "git-flow": frozenset(
+        {"primary-branch.sh", "git-flow-merge.sh", "merge_command.py", "process.py"}
+    ),
     "hooks": frozenset({"primary-branch.sh", "install-git-hooks.sh"}),
     "environment": frozenset({"rebuild-env.sh"}),
 }

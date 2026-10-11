@@ -10,12 +10,13 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from h2h_dev_tools import code_review
+from h2h_dev_tools import bundle_verify, code_review
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -177,9 +178,13 @@ def _make_review_repository(tmp_path: Path, layout: str = "source") -> ReviewRep
     repo.git("config", "workflow.primaryBranch", "main")
     package = local / package_parent / "h2h_dev_tools"
     package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    shutil.copy2(ROOT / "src/h2h_dev_tools/code_review.py", package / "code_review.py")
+    for name in code_review.REVIEW_FILES:
+        shutil.copy2(ROOT / "src/h2h_dev_tools" / name, package / name)
     (local / "scripts").mkdir(exist_ok=True)
+    shutil.copy2(
+        ROOT / "scripts/review-merge-candidate.sh",
+        local / "scripts/review-merge-candidate.sh",
+    )
     (local / "scripts/review-code.py").write_text(
         "import sys\n"
         "from pathlib import Path\n"
@@ -315,14 +320,30 @@ def test_review_rejects_dirty_worktrees_before_invoking_codex(
 
 @pytest.mark.parametrize(
     "name",
-    ["feature.py", "AGENTS.md", "scripts/review-code.py", "shared-implementation"],
+    [
+        "feature.py",
+        "AGENTS.md",
+        "scripts/review-code.py",
+        "shared-implementation",
+        "process-implementation",
+        "classifier-implementation",
+        "shared-shell",
+        "scripts/review-merge-candidate.sh",
+    ],
 )
 def test_review_receipt_does_not_cover_changed_code_policy_or_runner(
     review_repository: ReviewRepository, name: str
 ) -> None:
     repo = review_repository
     _assert_passed(repo.review("run", "--index"))
-    name = repo.implementation if name == "shared-implementation" else name
+    if name == "shared-implementation":
+        name = repo.implementation
+    elif name == "process-implementation":
+        name = str(Path(repo.implementation).with_name("process.py"))
+    elif name == "classifier-implementation":
+        name = str(Path(repo.implementation).with_name("change_scope.py"))
+    elif name == "shared-shell":
+        name = str(Path(repo.implementation).with_name("review-merge-candidate.sh"))
     path = repo.path / name
     with path.open("a", encoding="utf-8") as stream:
         stream.write("\n# Candidate changed after review.\n")
@@ -513,18 +534,61 @@ def test_review_timeout_terminates_the_codex_descendant(
                 pass
 
 
+@pytest.mark.parametrize("implementation_name", code_review.REVIEW_FILES)
 def test_review_receipt_binds_executed_shared_bytes_even_for_unchanged_revision(
-    review_repository: ReviewRepository,
+    review_repository: ReviewRepository, implementation_name: str
 ) -> None:
     repo = review_repository
     _assert_passed(repo.review("run", "--index"))
     repo.git("commit", "-m", "Merge task/example")
     revision = repo.git("rev-parse", "HEAD")
-    implementation = repo.path / repo.implementation
+    implementation = (repo.path / repo.implementation).with_name(implementation_name)
     with implementation.open("a", encoding="utf-8") as stream:
         stream.write("\n# Executed implementation changed without staging.\n")
     _assert_blocked(repo.review("verify", "--revision", revision))
     assert len(repo.calls()) == 1
+
+
+def test_review_closure_changes_follow_the_exported_component_contract(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    package = (repo.path / repo.implementation).parent
+    verifier = package / "bundle_verify.py"
+    original = verifier.read_text(encoding="utf-8")
+    extended = original.replace(
+        '"code_review.py",', '"review_extra.py", "code_review.py",', 1
+    )
+    assert extended != original
+    verifier.write_text(extended, encoding="utf-8")
+    dependency = package / "review_extra.py"
+    dependency.write_text("value = 1\n", encoding="utf-8")
+    repo.git("add", str(package.relative_to(repo.path)))
+    _assert_passed(repo.review("run", "--index"))
+    _assert_passed(repo.review("verify", "--index"))
+    repo.git("commit", "-m", "Merge component closure fixture")
+    _assert_passed(repo.review("verify"))
+    # Verify the reviewed candidate without the index workspace guard: the
+    # dependency fingerprint itself must reject changed executed source bytes.
+    dependency.write_text("value = 2\n", encoding="utf-8")
+    _assert_blocked(repo.review("verify"))
+    assert len(repo.calls()) == 1
+
+
+def test_review_fingerprints_the_loaded_bundle_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_review_repository(tmp_path)
+    reviewer = code_review.Reviewer(repo.path)
+    tree = repo.git("write-tree")
+    original = reviewer._policy_digest(tree)
+    loaded = tmp_path / "loaded_bundle_verify.py"
+    loaded.write_bytes(Path(bundle_verify.__file__).read_bytes())
+    monkeypatch.setattr(bundle_verify, "__file__", str(loaded))
+    assert reviewer._policy_digest(tree) == original
+    with loaded.open("a", encoding="utf-8") as stream:
+        stream.write("\n# Loaded dependency differs from the adjacent source file.\n")
+    assert reviewer._policy_digest(tree) != original
 
 
 def test_reviewer_instances_keep_roots_and_evidence_separate(tmp_path: Path) -> None:
@@ -600,9 +664,11 @@ def test_merge_review_routes_only_a_valid_exact_candidate_profile(
         encoding="utf-8",
     )
     (scripts / "review-code.py").write_text(
+        "import os\n"
         "import sys\n"
         "from pathlib import Path\n"
-        "assert sys.argv[1:] == ['run', '--index']\n"
+        "expected = os.environ.get('H2H_CODE_REVIEW_TIMEOUT_SECONDS', '900')\n"
+        "assert sys.argv[1:] == ['run', '--index', '--timeout-seconds', expected]\n"
         "Path('review-called').touch()\n"
         f"raise SystemExit({review_status})\n",
         encoding="utf-8",
@@ -621,3 +687,421 @@ def test_merge_review_routes_only_a_valid_exact_candidate_profile(
     )
     assert (result.returncode == 0) == expected_success, result.stderr
     assert (repository / "review-called").exists() == reviewed
+
+
+REVIEW_PROCESS_TREE = r"""
+import fcntl
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+state = Path(sys.argv[1])
+leader_lock = (state / 'leader-lock').open('a')
+fcntl.flock(leader_lock, fcntl.LOCK_EX)
+child_code = '''
+import fcntl
+import os
+import sys
+import time
+from pathlib import Path
+state = Path(sys.argv[1])
+lock = (state / 'child-lock').open('a')
+fcntl.flock(lock, fcntl.LOCK_EX)
+(state / 'child-pid').write_text(str(os.getpid()))
+while True:
+    time.sleep(0.1)
+'''
+subprocess.Popen([sys.executable, '-c', child_code, str(state)])
+while not (state / 'child-pid').exists():
+    time.sleep(0.01)
+(state / 'tree-ready').touch()
+while True:
+    time.sleep(0.1)
+"""
+
+
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM", "SIGHUP"])
+@pytest.mark.parametrize("interrupt_handoff", [True, False])
+def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_name: str,
+    interrupt_handoff: bool,
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    signal_number = int(getattr(signal, signal_name))
+    previous_handler = signal.getsignal(signal_number)
+    original_popen = subprocess.Popen
+    original_stop = code_review._stop
+    owned: list[subprocess.Popen[bytes]] = []
+    cleanup_started: list[int] = []
+
+    def unprotected_signal(_signal: int, _frame: object) -> None:
+        raise AssertionError("Reviewer did not install its signal controller")
+
+    def launch_then_signal(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        command = args[0]
+        if list(command[:2]) != ["codex", "exec"]:
+            return original_popen(*args, **kwargs)
+        child = original_popen(
+            (sys.executable, "-c", REVIEW_PROCESS_TREE, str(repo.state)), **kwargs
+        )
+        owned.append(child)
+        deadline = time.monotonic() + 5
+        while not (repo.state / "tree-ready").exists():
+            assert child.poll() is None, "The process-tree fixture exited too early"
+            assert time.monotonic() < deadline, "The descendant never became ready"
+            time.sleep(0.01)
+        if interrupt_handoff:
+            # The child exists but Reviewer has not received its Popen handle yet.
+            os.kill(os.getpid(), signal_number)
+        return child
+
+    def stop_with_repeated_signals(child: subprocess.Popen[bytes]) -> None:
+        cleanup_started.append(child.pid)
+        os.kill(os.getpid(), signal_number)
+        os.kill(os.getpid(), signal_number)
+        original_stop(child)
+
+    monkeypatch.setenv("PATH", repo.environment["PATH"])
+    monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
+    monkeypatch.setattr(subprocess, "Popen", launch_then_signal)
+    monkeypatch.setattr(code_review, "_stop", stop_with_repeated_signals)
+    signal.signal(signal_number, unprotected_signal)
+    try:
+        with pytest.raises(code_review.ReviewError, match="interrupted by signal"):
+            reviewer._run(target, index=True, revision="HEAD", timeout=1, model=None)
+        assert len(owned) == 1
+        child = owned[0]
+        assert cleanup_started == [child.pid]
+        assert child.poll() is not None, "The reviewer process survived interruption"
+        deadline = time.monotonic() + 2
+        while not _child_released_lock(repo.state) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _child_released_lock(repo.state), "The descendant survived interruption"
+        assert not reviewer._receipt_path(target).exists()
+        assert signal.getsignal(signal_number) is unprotected_signal
+    finally:
+        signal.signal(signal_number, previous_handler)
+        for child in owned:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
+            if child.stdin is not None:
+                child.stdin.close()
+
+
+def _candidate_receipt(repo: ReviewRepository) -> tuple[Path, dict[str, Any]]:
+    reviewer = code_review.Reviewer(repo.path)
+    path = reviewer._receipt_path(reviewer._target(index=True))
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def _merge_full_baseline(repo: ReviewRepository) -> tuple[str, Path]:
+    _assert_passed(repo.review("run", "--index"))
+    path, document = _candidate_receipt(repo)
+    assert document["scope"] == "repository"
+    repo.git("commit", "-m", "Merge initial full repository review")
+    return repo.git("rev-parse", "HEAD"), path
+
+
+def _next_candidate(repo: ReviewRepository, name: str = "next") -> None:
+    repo.git("switch", "-c", f"task/{name}")
+    repo.commit_file(f"{name}.py", "value = 2\n")
+    repo.git("switch", "main")
+    repo.git("merge", "--no-ff", "--no-commit", f"task/{name}")
+
+
+def test_first_review_covers_existing_repository_and_verifies_before_merge(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _assert_passed(repo.review("run", "--index"))
+    prompt = str(repo.calls()[-1]["prompt"])
+    assert "Review scope: full repository." in prompt
+    assert "including ALL tracked source" in prompt
+    assert "even when they predate this task" in prompt
+    assert "defects introduced by this complete change" not in prompt
+    _, receipt = _candidate_receipt(repo)
+    assert receipt["schema_version"] == 2
+    assert receipt["target"]["profile"] == "h2h-code-review-v2"
+    assert receipt["scope"] == "repository"
+    assert receipt["baseline"] is None
+    _assert_passed(repo.review("verify", "--index", mode="nonzero"))
+    assert len(repo.calls()) == 1
+
+
+def test_merged_repository_review_supports_a_continuous_incremental_chain(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    baseline_commit, baseline_path = _merge_full_baseline(repo)
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    _, receipt = _candidate_receipt(repo)
+    assert receipt["scope"] == "incremental"
+    reference = receipt["baseline"]
+    assert reference["commit"] == baseline_commit
+    assert reference["receipt_key"] == baseline_path.stem
+    assert "Review scope: incremental." in str(repo.calls()[-1]["prompt"])
+    _assert_passed(repo.review("verify", "--index"))
+    repo.git("commit", "-m", "Merge incremental review")
+    _next_candidate(repo, "third")
+    _assert_passed(repo.review("run", "--index"))
+    _, next_receipt = _candidate_receipt(repo)
+    assert next_receipt["scope"] == "incremental"
+    assert next_receipt["baseline"] == reference
+    _assert_passed(repo.review("verify", "--index"))
+
+
+def test_aborted_full_candidate_cannot_establish_a_baseline(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _assert_passed(repo.review("run", "--index"))
+    old_path, _ = _candidate_receipt(repo)
+    repo.git("merge", "--abort")
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    assert old_path.exists(), "Unused evidence may remain but cannot cover primary"
+    assert _candidate_receipt(repo)[1]["scope"] == "repository"
+
+
+def test_full_receipt_on_second_parent_cannot_cover_primary(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    original_primary = repo.git("rev-parse", "HEAD")
+    baseline_commit, _ = _merge_full_baseline(repo)
+    repo.git("switch", "-c", "unreviewed-primary", original_primary)
+    repo.commit_file("other-primary.py", "value = 3\n")
+    repo.git("merge", "--no-ff", "--no-commit", baseline_commit)
+    _assert_passed(repo.review("run", "--index"))
+    assert _candidate_receipt(repo)[1]["scope"] == "repository"
+
+
+@pytest.mark.parametrize("damage", ["missing", "v1", "malformed"])
+def test_missing_obsolete_or_invalid_baseline_requires_repository_review(
+    review_repository: ReviewRepository, damage: str
+) -> None:
+    repo = review_repository
+    _, baseline_path = _merge_full_baseline(repo)
+    if damage == "missing":
+        baseline_path.unlink()
+    elif damage == "v1":
+        document = json.loads(baseline_path.read_text(encoding="utf-8"))
+        document["schema_version"] = 1
+        document["target"]["profile"] = "h2h-code-review-v1"
+        document.pop("scope")
+        document.pop("baseline")
+        baseline_path.write_text(json.dumps(document), encoding="utf-8")
+    else:
+        baseline_path.write_text("not JSON", encoding="utf-8")
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    assert _candidate_receipt(repo)[1]["scope"] == "repository"
+
+
+@pytest.mark.parametrize("document_only", [False, True])
+def test_only_proven_documentation_can_bridge_unreviewed_primary_commits(
+    review_repository: ReviewRepository, document_only: bool
+) -> None:
+    repo = review_repository
+    baseline_commit, _ = _merge_full_baseline(repo)
+    if document_only:
+        repo.commit_file("README.md", "# Documented development behavior\n")
+    else:
+        repo.commit_file("unreviewed.py", "unreviewed_value = 9\n")
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    _, receipt = _candidate_receipt(repo)
+    assert receipt["scope"] == ("incremental" if document_only else "repository")
+    if document_only:
+        assert receipt["baseline"]["commit"] == baseline_commit
+    _assert_passed(repo.review("verify", "--index"))
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "AGENTS.md",
+        "scripts/review-code.py",
+        "scripts/review-merge-candidate.sh",
+        *code_review.REVIEW_FILES,
+    ],
+)
+def test_changed_policy_or_shared_implementation_requires_repository_review(
+    review_repository: ReviewRepository, changed: str
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    _next_candidate(repo)
+    path = (
+        repo.path / changed
+        if changed in code_review.POLICY_PATHS
+        else (repo.path / repo.implementation).with_name(changed)
+    )
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("\n# Review contract changed.\n")
+    repo.git("add", str(path.relative_to(repo.path)))
+    _assert_passed(repo.review("run", "--index"))
+    # Use the receipt reported by this subprocess: its changed implementation
+    # intentionally has a different executed-bytes digest from this test process.
+    receipts = [
+        json.loads(item.read_text())
+        for item in (repo.path / ".git/h2h-review/receipts").glob("*.json")
+    ]
+    matching = [
+        item for item in receipts if item["target"]["tree"] == repo.git("write-tree")
+    ]
+    assert len(matching) == 1
+    assert matching[0]["scope"] == "repository"
+    _assert_passed(repo.review("verify", "--index"))
+
+
+@pytest.mark.parametrize("damage", ["delete", "rewrite", "scope"])
+def test_incremental_verification_rechecks_full_baseline_authority(
+    review_repository: ReviewRepository, damage: str
+) -> None:
+    repo = review_repository
+    _, baseline_path = _merge_full_baseline(repo)
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    _assert_passed(repo.review("verify", "--index"))
+    if damage == "delete":
+        baseline_path.unlink()
+    else:
+        document = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if damage == "rewrite":
+            document["reviewed_at"] = "A later review run replaced the authority"
+        else:
+            document["scope"] = "incremental"
+        baseline_path.write_text(json.dumps(document), encoding="utf-8")
+    calls = repo.calls()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
+    _assert_passed(repo.review("run", "--index"))
+    expected = "incremental" if damage == "rewrite" else "repository"
+    assert _candidate_receipt(repo)[1]["scope"] == expected
+
+
+def test_scope_cannot_be_changed_without_invalidating_result_integrity(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    path, receipt = _candidate_receipt(repo)
+    assert receipt["scope"] == "incremental"
+    receipt["scope"] = "repository"
+    receipt["baseline"] = None
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    _assert_blocked(repo.review("verify", "--index"))
+
+
+def test_baseline_deleted_during_review_cannot_receive_incremental_receipt(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _, baseline_path = _merge_full_baseline(repo)
+    _next_candidate(repo)
+    with _held_review(repo, "hold-pass") as owner:
+        baseline_path.unlink()
+        (repo.state / "release").touch()
+        stdout, stderr = owner.communicate(timeout=10)
+        assert owner.returncode != 0, stdout + stderr
+    _assert_blocked(repo.review("verify", "--index"))
+
+
+def test_incremental_review_holds_baseline_shared_lock_until_receipt_is_written(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    baseline_commit, baseline_path = _merge_full_baseline(repo)
+    original_receipt = baseline_path.read_bytes()
+    _next_candidate(repo)
+    with _held_review(repo, "hold-pass") as owner:
+        competing = repo.review("run", "--revision", baseline_commit)
+        _assert_blocked(competing)
+        assert "already running" in competing.stderr
+        assert baseline_path.read_bytes() == original_receipt
+        (repo.state / "release").touch()
+        stdout, stderr = owner.communicate(timeout=10)
+        assert owner.returncode == 0, stdout + stderr
+    _assert_passed(repo.review("verify", "--index"))
+
+
+def test_explicit_repository_scope_reestablishes_a_full_baseline(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index", "--scope", "repository"))
+    _, receipt = _candidate_receipt(repo)
+    assert receipt["scope"] == "repository"
+    assert receipt["baseline"] is None
+    _assert_passed(repo.review("verify", "--index"))
+
+
+@pytest.mark.parametrize("damage", ["delete", "malformed"])
+def test_incremental_verification_rechecks_every_intervening_review(
+    review_repository: ReviewRepository, damage: str
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    _next_candidate(repo)
+    _assert_passed(repo.review("run", "--index"))
+    intermediate_path, _ = _candidate_receipt(repo)
+    repo.git("commit", "-m", "Merge reviewed intermediate change")
+    _next_candidate(repo, "third")
+    _assert_passed(repo.review("run", "--index"))
+    assert _candidate_receipt(repo)[1]["scope"] == "incremental"
+    if damage == "delete":
+        intermediate_path.unlink()
+    else:
+        intermediate_path.write_text("malformed receipt", encoding="utf-8")
+    calls = repo.calls()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
+    _assert_passed(repo.review("run", "--index"))
+    assert _candidate_receipt(repo)[1]["scope"] == "repository"
+
+
+def test_initial_primary_root_without_a_baseline_can_receive_full_review(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    repo.git("merge", "--abort")
+    root = repo.git("rev-list", "--max-parents=0", "HEAD")
+    repo.git("switch", "-c", "root-primary", root)
+    repo.git("merge", "--no-ff", "--no-commit", "task/example")
+    _assert_passed(repo.review("run", "--index"))
+    assert _candidate_receipt(repo)[1]["scope"] == "repository"
+    _assert_passed(repo.review("verify", "--index"))
+
+
+def test_review_policy_uses_git_paths_even_with_windows_filesystem_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_review_repository(tmp_path)
+    reviewer = code_review.Reviewer(repo.path)
+    tree = repo.git("write-tree")
+    expected = reviewer._policy_digest(tree)
+
+    def windows_relative_path(value: str | Path) -> Path | PureWindowsPath:
+        if str(value) in code_review.IMPLEMENTATION_PATHS:
+            return PureWindowsPath(value)
+        return Path(value)
+
+    # Before the fix, using filesystem Path for Git object paths produced native
+    # backslashes and rev-parse rejected the candidate implementation blobs.
+    monkeypatch.setattr(code_review, "Path", windows_relative_path)
+    assert reviewer._policy_digest(tree) == expected
