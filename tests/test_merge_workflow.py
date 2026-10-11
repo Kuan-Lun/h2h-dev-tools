@@ -178,7 +178,7 @@ def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
     base = fixture_repository(root, succeeds=True, profile=profile)
     (root / "pyproject.toml").write_text(
         "[project]\nname = 'snapshot-fixture'\nversion = '0.1.0'\n"
-        "[tool.h2h-dev-tools]\ncomponents = ['git-flow', 'code-review']\n"
+        "[tool.h2h-dev-tools]\ncomponents = ['git-flow', 'code-review', 'hooks']\n"
     )
     bundle.sync_bundle(root)
     shutil.rmtree(root / "src")
@@ -193,6 +193,12 @@ def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
                 "/src/h2h_dev_tools/", "/scripts/_shared/h2h_dev_tools/"
             )
         )
+    commit_hook = root / ".githooks/commit-msg"
+    commit_hook.write_text(
+        commit_hook.read_text().replace(
+            "/src/h2h_dev_tools/", "/scripts/_shared/h2h_dev_tools/"
+        )
+    )
     (root / "scripts/review-code.py").write_text(
         _REVIEWER.replace(
             'root / "src/h2h_dev_tools"', 'root / "scripts/_shared/h2h_dev_tools"'

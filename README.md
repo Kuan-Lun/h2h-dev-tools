@@ -63,7 +63,7 @@ current-closure checks; none executes a compatibility fallback or downloads a wh
 | `change-scope`, `documentation` | Exact Git candidate classification and documentation checks |
 | `dependencies`, `dependency-audit` | Declared dependencies, registry candidates and reviewed audit receipts |
 | `version-policy` | Task-level release impact, version and audit validation |
-| `primary-branch`, `git-flow`, `hooks`, `environment` | Local branch selection, safe merge lifecycle, hook installation and environment rebuild |
+| `primary-branch`, `git-flow`, `hooks`, `environment` | Local branch selection, safe merge lifecycle, hook installation, commit-message validation and environment rebuild |
 | `publish-version` | Version transition across a complete push |
 | `distribution-check` | Installed requirements, RECORD and import-origin validation |
 | `offline-wheel` | Temporary candidate-wheel environment with development dependencies and a local smoke callback |
@@ -158,6 +158,14 @@ checks, adapter tests, pytest selectors, timeout budgets, formal targets and
 deployment acceptance remain owned by their original repositories. Primary-branch
 detection, hook installation and environment rebuild run before a `.venv` exists;
 they do not import the Python package.
+
+Commit-message hooks select the `hooks` component and invoke
+`bash scripts/_shared/h2h_dev_tools/commit-message.sh ROOT MESSAGE_FILE PATTERN`.
+Each repository declares its own Bash regular expression. The shared helper reads
+the first line and rejects unreadable messages and invalid or empty patterns.
+A subject starting with `Merge` followed by a space is exempt only while Git
+verifies `MERGE_HEAD`. Relative message paths resolve against the caller's working
+directory; the helper does not change it.
 
 Test launchers select the `git-environment` component and call
 `without_local_git_environment(environment, repository=repository_root)` when
