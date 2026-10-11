@@ -71,7 +71,16 @@ def test_snapshot_bootstrap_ignores_stale_equal_size_timestamp_cache(
     current = b"\n#" + b" " * (len(stale) - 3) + b"\n"
     assert len(stale) == len(current)
     path.write_bytes(source + stale)
-    py_compile.compile(str(path), doraise=True)
+    py_compile.compile(
+        str(path),
+        cfile=str(
+            path.parent
+            / "__pycache__"
+            / f"{path.stem}.{sys.implementation.cache_tag}.pyc"
+        ),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
     timestamp = path.stat().st_mtime_ns
     path.write_bytes(source + current)
     os.utime(path, ns=(timestamp, timestamp))

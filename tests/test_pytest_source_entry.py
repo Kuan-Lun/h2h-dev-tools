@@ -65,6 +65,11 @@ def _checkout(tmp_path: Path, module: str) -> tuple[Path, dict[str, str]]:
     path.write_bytes(original + stale)
     py_compile.compile(
         str(path),
+        cfile=str(
+            path.parent
+            / "__pycache__"
+            / f"{path.stem}.{sys.implementation.cache_tag}.pyc"
+        ),
         doraise=True,
         invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
     )

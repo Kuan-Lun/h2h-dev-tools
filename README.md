@@ -9,13 +9,13 @@ run offline against the code present in that repository's Git tree.
 Use Python 3.14 or newer. Install the package in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.3.0
+python -m pip install h2h-dev-tools==0.3.1
 ```
 
 For an unpublished candidate, install an explicitly supplied wheel instead:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.3.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.3.1-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -69,6 +69,7 @@ current-closure checks; none executes a compatibility fallback or downloads a wh
 | `offline-wheel` | Temporary candidate-wheel environment with development dependencies and a local smoke callback |
 | `process` | Owned process trees, deadlines, signal deferral and Windows Job start gates |
 | `git-environment` | Isolate test children from inherited Git hook repository authority |
+| `pytest` | Fresh source and assertion caches with explicit import roots for pytest and local xdist workers |
 | `formal` | Pinned TLC download and offline host/Docker execution |
 | `code-review` | Exact-candidate Codex review and offline evidence verification |
 
@@ -177,6 +178,18 @@ with the test command; on Windows it waits for the child and returns its exit co
 inside the existing Job. Neither path creates another process owner.
 Apply this only to test children:
 gate checks before and after pytest must retain the real candidate's Git environment.
+
+Pytest entry points select the `pytest` component, source-bootstrap their package
+as above, then call its `pytest_source.main()` before importing pytest or plugins.
+The helper preserves pytest arguments and uses a unique empty bytecode-cache
+prefix with cache writes disabled. It prepends the verified package's import
+root to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix,
+so local xdist workers use that checkout rather than another editable source.
+The settings are restored and the temporary directory removed when pytest exits.
+This covers local Python workers inheriting the invocation environment; remote
+workers need their own explicit source distribution and are not supported by this
+entry's source guarantee. Each repository still owns selectors, dependencies,
+process ownership and deadlines; the toolkit has no runtime pytest dependency.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
 from the project manifests. Adding, changing or removing only the `dev` optional
@@ -352,6 +365,8 @@ For focused tests, use `.venv/bin/python scripts/run-pytest.py <pytest arguments
 The full gate and Windows CI use this same source entry. It loads the checkout's
 toolkit source before pytest, plugins or conftest can import the package, so a
 matching timestamp/size `.pyc` cannot replace the candidate implementation.
+The shared `pytest` component also isolates pytest assertion caches and local
+xdist worker imports for the full invocation.
 Python's direct `-m pytest` entry does not provide this source guarantee; `-B`
 only prevents cache writes. Installed wheel smoke keeps ordinary isolated imports.
 The full gate still removes Git-local authority only from its pytest child;
