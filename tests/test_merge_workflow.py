@@ -1589,6 +1589,63 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
             wrapper.wait(timeout=10)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
+@pytest.mark.parametrize("missing", ["python", "launcher"])
+def test_recovery_owner_startup_failure_does_not_wait_for_diagnostic_reader(
+    tmp_path: Path, missing: str
+) -> None:
+    source = (_ROOT / "src/h2h_dev_tools/git-flow-merge.sh").read_text()
+    functions = source.split("repository_root=${1:", 1)[0]
+    script = tmp_path / "launch.sh"
+    script.write_text(
+        functions + "\nrecovering=1\ncommand_number=0\nowner_cleanup_failed=0\n"
+        "starting_child=0\npending_signal=0\n"
+        "merge_python=$1\nmerge_launcher=$2\nexecution_directory=$3\n"
+        'if run_tracked process "$execution_directory" git status; then\n'
+        "    status=0\nelse\n    status=$?\nfi\n"
+        'printf "%s" "$owner_cleanup_failed" > "$execution_directory/failed"\n'
+        'exit "$status"\n'
+    )
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        os.set_blocking(write_descriptor, False)
+        try:
+            while True:
+                os.write(write_descriptor, b"x" * 8192)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_descriptor, True)
+        launcher = _ROOT / "src/h2h_dev_tools/merge_command.py"
+        wrapper = subprocess.Popen(
+            (
+                "bash",
+                str(script),
+                str(tmp_path / "missing-python")
+                if missing == "python"
+                else sys.executable,
+                str(tmp_path / "missing-launcher")
+                if missing == "launcher"
+                else str(launcher),
+                str(tmp_path),
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=write_descriptor,
+            start_new_session=True,
+        )
+        try:
+            assert wrapper.wait(timeout=5) == 125
+            assert (tmp_path / "failed").read_text() == "1"
+            assert not (tmp_path / "cleanup-1").exists()
+            assert os.get_blocking(write_descriptor)
+        finally:
+            if wrapper.poll() is None:
+                os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait(timeout=5)
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX process signals")
 @pytest.mark.parametrize(
     ("stage", "interruption"),
@@ -1598,6 +1655,9 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
         ("execute", "cancel"),
         ("execute", "closed-pipe"),
         ("execute", "closed-pipe-crash"),
+        ("execute", "backpressure"),
+        ("execute", "backpressure-failure"),
+        ("execute", "backpressure-helper-missing"),
         ("execute", "crash"),
         ("execute", "timeout"),
     ],
@@ -1619,12 +1679,21 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
         "print('full')\n"
     )
     (root / "scripts/blocking-review.py").write_text(_BLOCKING_GATE)
-    if interruption.startswith("closed-pipe"):
+    piped_output = interruption.startswith(("closed-pipe", "backpressure"))
+    if piped_output:
         executable(
             root / ".githooks/post-checkout",
             f"#!{sys.executable}\nimport os\nfrom pathlib import Path\n"
             "state = os.environ.get('MERGE_INTERRUPTION_STATE')\n"
-            "if state:\n    Path(state, 'restore-hook-ran').touch()\n",
+            "if state and Path(state, 'ready').exists():\n"
+            "    print('recovery diagnostic' * (16 * 1024), flush=True)\n"
+            "    Path(state, 'restore-hook-ran').touch()\n"
+            + (
+                "    Path('.venv/bin/python').unlink()\n"
+                if interruption == "backpressure-helper-missing"
+                else ""
+            )
+            + f"    raise SystemExit({7 if interruption.startswith('backpressure-') else 0})\n",
         )
     binary = tmp_path / "bin"
     binary.mkdir()
@@ -1657,9 +1726,7 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 if interruption == "timeout"
                 else "900",
             },
-            stdout=subprocess.PIPE
-            if interruption.startswith("closed-pipe")
-            else output,
+            stdout=subprocess.PIPE if piped_output else output,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -1676,11 +1743,15 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 wrapper.stdout.close()
             if interruption in {"crash", "closed-pipe-crash"}:
                 os.kill(int((state / "reviewer-pid").read_text()), signal.SIGKILL)
-            elif interruption in {"cancel", "closed-pipe"}:
+            elif interruption in {"cancel", "closed-pipe"} or interruption.startswith(
+                "backpressure"
+            ):
                 wrapper.send_signal(signal.SIGTERM)
             wrapper.wait(timeout=15)
             assert wrapper.returncode != 0, (state / "output").read_text()
-            if interruption in {"cancel", "closed-pipe"}:
+            if interruption in {"cancel", "closed-pipe"} or interruption.startswith(
+                "backpressure"
+            ):
                 assert wrapper.returncode == 143
             _assert_gate_lock_released(state / "leader-lock")
             _assert_gate_lock_released(state / "child-lock")
@@ -1688,7 +1759,7 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
             assert git(root, "rev-parse", "master") == base
             assert git(root, "rev-parse", "task") == task
             assert git(root, "branch", "--show-current") == "task"
-            if interruption.startswith("closed-pipe"):
+            if piped_output:
                 assert (state / "restore-hook-ran").exists()
             assert git(root, "status", "--porcelain") == ""
         finally:

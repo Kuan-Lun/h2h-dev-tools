@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -879,6 +881,110 @@ def test_diagnostic_failure_cannot_skip_teardown_or_job_close(
 
     terminate.assert_called_once_with(owner, deadline=106.0 if interrupted else 110.0)
     job.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("standard_output", [False, True])
+@pytest.mark.parametrize("binary_capture", [False, True])
+def test_diagnostics_preserve_memory_only_capture(
+    monkeypatch: pytest.MonkeyPatch, standard_output: bool, binary_capture: bool
+) -> None:
+    binary = io.BytesIO()
+    stream = (
+        io.TextIOWrapper(binary, encoding="utf-8") if binary_capture else io.StringIO()
+    )
+    with monkeypatch.context() as capture:
+        capture.setattr(runner.sys, "stdout" if standard_output else "stderr", stream)
+        runner.report_diagnostic("清理已完成 ✓", standard_output=standard_output)
+    if binary_capture:
+        assert binary.getvalue().decode("utf-8") == "清理已完成 ✓\n"
+    else:
+        assert isinstance(stream, io.StringIO)
+        assert stream.getvalue() == "清理已完成 ✓\n"
+    stream.close()
+
+
+@pytest.mark.parametrize("fileno_error", [None, io.UnsupportedOperation, ValueError])
+def test_diagnostics_never_write_to_an_unknown_no_descriptor_sink(
+    monkeypatch: pytest.MonkeyPatch, fileno_error: type[Exception] | None
+) -> None:
+    sink = SimpleNamespace(write=Mock(), flush=Mock())
+    if fileno_error is not None:
+        sink.fileno = Mock(side_effect=fileno_error("no descriptor"))
+    monkeypatch.setattr(runner.sys, "stderr", sink)
+
+    runner.report_diagnostic("Must not block on an unknown stream")
+
+    sink.write.assert_not_called()
+    sink.flush.assert_not_called()
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+@pytest.mark.parametrize("pipe_full", [False, True])
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le"])
+def test_windows_pipe_diagnostics_restore_flags_without_buffered_fallback(
+    monkeypatch: pytest.MonkeyPatch, blocking: bool, pipe_full: bool, encoding: str
+) -> None:
+    sink = Mock(encoding=encoding, errors="strict")
+    sink.fileno.return_value = 42
+    payload = "清理已完成 ✓\n".encode(encoding)
+    written: list[bytes] = []
+
+    def write(descriptor: int, value: bytes | memoryview) -> int:
+        assert descriptor == 42
+        if pipe_full:
+            raise BlockingIOError("pipe reader is not consuming")
+        # A short write must preserve the remaining Unicode bytes exactly.
+        chunk = bytes(value[:3])
+        written.append(chunk)
+        return len(chunk)
+
+    native = SimpleNamespace(
+        name="nt",
+        fstat=Mock(return_value=SimpleNamespace(st_mode=stat.S_IFIFO)),
+        get_blocking=Mock(return_value=blocking),
+        set_blocking=Mock(),
+        write=Mock(side_effect=write),
+    )
+    monkeypatch.setattr(runner, "os", native)
+    monkeypatch.setattr(runner.sys, "stderr", sink)
+
+    runner.report_diagnostic("清理已完成 ✓")
+
+    assert native.set_blocking.call_args_list == [call(42, False), call(42, blocking)]
+    assert b"".join(written) == (b"" if pipe_full else payload)
+    native.write.assert_called()
+    sink.write.assert_not_called()
+    sink.flush.assert_not_called()
+
+
+class _NativeDiagnosticCapture(io.TextIOWrapper):
+    def fileno(self) -> int:
+        return 42
+
+
+@pytest.mark.parametrize("mode", [stat.S_IFREG, stat.S_IFCHR])
+def test_windows_regular_and_console_diagnostics_keep_native_text_encoding(
+    monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    buffer = io.BytesIO()
+    sink = _NativeDiagnosticCapture(buffer, encoding="utf-16-le")
+    native = SimpleNamespace(
+        name="nt",
+        fstat=Mock(return_value=SimpleNamespace(st_mode=mode)),
+        get_blocking=Mock(),
+        set_blocking=Mock(),
+        write=Mock(),
+    )
+    monkeypatch.setattr(runner, "os", native)
+    with monkeypatch.context() as capture:
+        capture.setattr(runner.sys, "stderr", sink)
+        runner.report_diagnostic("清理已完成 ✓")
+
+    assert buffer.getvalue().decode("utf-16-le") == "清理已完成 ✓\n"
+    native.get_blocking.assert_not_called()
+    native.set_blocking.assert_not_called()
+    native.write.assert_not_called()
+    sink.close()
 
 
 @pytest.mark.parametrize("taskkill_status", [0, 1])

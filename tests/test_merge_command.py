@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,66 @@ from pathlib import Path
 import pytest
 
 from h2h_dev_tools import bundle, merge_command
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+@pytest.mark.parametrize("prefilled", [False, True])
+@pytest.mark.parametrize("original_blocking", [False, True])
+def test_recovery_never_waits_for_an_open_undrained_diagnostic_pipe(
+    tmp_path: Path, stream_name: str, prefilled: bool, original_blocking: bool
+) -> None:
+    receipt = tmp_path / "cleanup"
+    marker = tmp_path / "completed"
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        if prefilled:
+            os.set_blocking(write_descriptor, False)
+            try:
+                while True:
+                    os.write(write_descriptor, b"x" * 8192)
+            except BlockingIOError:
+                pass
+        os.set_blocking(write_descriptor, original_blocking)
+        child = (
+            "import sys\nfrom pathlib import Path\n"
+            "sys.stderr.write('x' * (192 * 1024)); sys.stderr.flush()\n"
+            f"Path({str(marker)!r}).touch()\nraise SystemExit(7)\n"
+        )
+        owner = subprocess.Popen(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                merge_command.__file__,
+                "--cleanup-receipt",
+                str(receipt),
+                "--recovery",
+                str(tmp_path),
+                "--",
+                sys.executable,
+                "-c",
+                child,
+            ),
+            stdout=write_descriptor if stream_name == "stdout" else subprocess.DEVNULL,
+            stderr=write_descriptor if stream_name == "stderr" else subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            # The reader deliberately stays open without consuming any bytes.
+            # A full diagnostic pipe must not participate in the recovery wait.
+            assert owner.wait(timeout=5) == 7
+            assert marker.exists()
+            assert receipt.read_text() == "owned_tree_empty\n"
+            # dup/inheritance shares the open-file description with our writer.
+            assert os.get_blocking(write_descriptor) == original_blocking
+        finally:
+            if owner.poll() is None:
+                os.killpg(owner.pid, signal.SIGKILL)
+                owner.wait(timeout=5)
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
 
 
 @pytest.mark.parametrize("failed_operation", ["seek", "read", "close"])
@@ -81,30 +142,34 @@ def test_recovery_finishes_before_replaying_bounded_unterminated_output(
         "sys.stderr.write('e' * (96 * 1024))\nsys.stderr.flush()\n"
         f"Path({str(marker)!r}).touch()\n"
     )
-    result = subprocess.run(
-        (
-            sys.executable,
-            "-I",
-            "-B",
-            merge_command.__file__,
-            "--cleanup-receipt",
-            str(receipt),
-            "--recovery",
-            str(tmp_path),
-            "--",
-            sys.executable,
-            "-c",
-            child,
-        ),
-        capture_output=True,
-        check=False,
-        timeout=15,
-    )
-    assert result.returncode == 0, result.stderr
+    diagnostics = tmp_path / "diagnostics"
+    with diagnostics.open("wb") as diagnostic_output:
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                merge_command.__file__,
+                "--cleanup-receipt",
+                str(receipt),
+                "--recovery",
+                str(tmp_path),
+                "--",
+                sys.executable,
+                "-c",
+                child,
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=diagnostic_output,
+            check=False,
+            timeout=15,
+        )
+    diagnostic_bytes = diagnostics.read_bytes()
+    assert result.returncode == 0, diagnostic_bytes
     assert marker.exists()
     assert receipt.read_text() == "owned_tree_empty\n"
-    assert len(result.stderr) < 70_000
-    assert b"recovery diagnostics truncated after 64 KiB" in result.stderr
+    assert len(diagnostic_bytes) < 70_000
+    assert b"recovery diagnostics truncated after 64 KiB" in diagnostic_bytes
 
 
 def test_exported_git_owner_passes_strict_typing_without_installed_toolkit(

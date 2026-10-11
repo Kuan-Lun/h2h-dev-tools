@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
@@ -206,6 +206,45 @@ def _review(
         return status
 
 
+def _execute(
+    repository: Path,
+    command: tuple[str, ...],
+    *,
+    review: bool,
+    recovery: bool,
+    receipt: Path,
+) -> int:
+    from . import process
+
+    environment = without_review_owner(os.environ)
+    try:
+        if review:
+            status = _review(repository, command, environment)
+        else:
+            status = _run_git(
+                process.ProcessCommand(
+                    "Git workflow and hooks",
+                    command,
+                    repository,
+                    environment=environment,
+                ),
+                recovery=recovery,
+            )
+    except process.ProcessOwnershipError as error:
+        process.report_diagnostic(
+            f"merge-command: cleanup could not be proven: {error}"
+        )
+        return process.TERMINATION_FAILED_EXIT_CODE
+    # An exit status alone cannot distinguish a cleaned interrupt from an owner
+    # killed before/during teardown. Every started phase must complete cleanup
+    # before publishing proof, including classification-only documentation merges.
+    temporary_receipt = receipt.with_suffix(".pending")
+    temporary_receipt.write_text("owned_tree_empty\n", encoding="ascii")
+    temporary_receipt.replace(receipt)
+    # Reserve 125 for an unproven owner cleanup, never for a hook's own exit code.
+    return 1 if status == process.TERMINATION_FAILED_EXIT_CODE else status
+
+
 def main() -> int:
     from . import process
 
@@ -217,6 +256,9 @@ def main() -> int:
         action="store_true",
         help="bound this failure-recovery command and its cleanup to 10 seconds",
     )
+    parser.add_argument(
+        "--recovery-output-fds", nargs=2, type=int, help=argparse.SUPPRESS
+    )
     parser.add_argument("repository", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
@@ -227,34 +269,36 @@ def main() -> int:
         parser.error("a Git workflow command is required")
     if arguments.review and arguments.recovery:
         parser.error("review cannot run as failure recovery")
-    environment = without_review_owner(os.environ)
-    try:
-        if arguments.review:
-            status = _review(arguments.repository, tuple(command), environment)
-        else:
-            status = _run_git(
-                process.ProcessCommand(
-                    "Git workflow and hooks",
-                    tuple(command),
-                    arguments.repository,
-                    environment=environment,
-                ),
+    if arguments.recovery_output_fds and not arguments.recovery:
+        parser.error("recovery output descriptors require --recovery")
+    with ExitStack() as diagnostics:
+        if arguments.recovery_output_fds:
+            # Startup errors go to /dev/null. Only the common diagnostic writer
+            # receives the original destinations, through ordinary text streams.
+            for descriptor, redirect in zip(
+                arguments.recovery_output_fds,
+                (redirect_stdout, redirect_stderr),
+                strict=True,
+            ):
+                stream = diagnostics.enter_context(
+                    os.fdopen(descriptor, "w", encoding="utf-8", closefd=False)
+                )
+                diagnostics.enter_context(redirect(stream))
+        try:
+            return _execute(
+                arguments.repository,
+                tuple(command),
+                review=arguments.review,
                 recovery=arguments.recovery,
+                receipt=arguments.cleanup_receipt,
             )
-    except process.ProcessOwnershipError as error:
-        process.report_diagnostic(
-            f"merge-command: cleanup could not be proven: {error}"
-        )
-        return process.TERMINATION_FAILED_EXIT_CODE
-    # An exit status alone cannot distinguish a cleaned interrupt from an owner
-    # killed before/during teardown. Every started phase must complete cleanup
-    # before publishing proof, including classification-only documentation merges.
-    receipt: Path = arguments.cleanup_receipt
-    temporary_receipt = receipt.with_suffix(".pending")
-    temporary_receipt.write_text("owned_tree_empty\n", encoding="ascii")
-    temporary_receipt.replace(receipt)
-    # Reserve 125 for an unproven owner cleanup, never for a hook's own exit code.
-    return 1 if status == process.TERMINATION_FAILED_EXIT_CODE else status
+        except OSError as error:
+            if not arguments.recovery:
+                raise
+            # A failed receipt write is still a failure and publishes no proof;
+            # reporting it must not block recovery on the caller's pipe.
+            process.report_diagnostic(f"merge-command: {error}")
+            return 1
 
 
 if __name__ == "__main__":
@@ -264,5 +308,16 @@ if __name__ == "__main__":
     __package__ = "h2h_dev_tools"
     if sys.argv[1:] == ["--print-source-files"]:
         print("\n".join(owner_source_files()))
+        raise SystemExit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--recovery-diagnostic":
+        # The shell gives only this diagnostic FD to us; startup errors use
+        # /dev/null and must never fall back to its potentially blocked stderr.
+        from .process import report_diagnostic
+
+        with (
+            os.fdopen(3, "w", encoding="utf-8", closefd=False) as diagnostic,
+            redirect_stderr(diagnostic),
+        ):
+            report_diagnostic(f"git-flow-merge: {sys.argv[2]}")
         raise SystemExit(0)
     raise SystemExit(main())

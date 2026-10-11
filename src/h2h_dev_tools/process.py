@@ -8,11 +8,13 @@ Detached POSIX sessions and daemon-owned resources are outside this contract.
 from __future__ import annotations
 
 import ctypes
+import io
 import math
 import ntpath
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -21,7 +23,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Any, BinaryIO, Final, cast
+from typing import Any, BinaryIO, Final, TextIO, cast
 
 TERMINATION_GRACE_SECONDS = 2.0
 TERMINATION_POLL_SECONDS = 0.05
@@ -619,20 +621,20 @@ def wait_for_owned_tree_exit(
     )
 
 
-def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
-    """Keep a failed diagnostic stream from interrupting ownership cleanup."""
+def _diagnostic_supports_nonblocking(descriptor: int) -> bool:
+    # Python's Windows get/set_blocking only support pipes. Preserve native
+    # console encoding and regular-file output instead of silently dropping it.
+    return os.name != "nt" or stat.S_ISFIFO(os.fstat(descriptor).st_mode)
 
-    stream = sys.stdout if standard_output else sys.stderr
+
+def _print_memory_or_native_diagnostic(message: str, stream: TextIO) -> None:
     try:
         print(message, file=stream, flush=True)
     except Exception:
-        # Diagnostics are secondary to process ownership. Even an unusual stream
-        # implementation must not prevent termination, fallback or Job closing.
+        # A failed native TextIOWrapper flush can retain buffered bytes and
+        # overwrite the real exit status during finalization. Retire only its
+        # failed descriptor; in-memory/unknown descriptors simply have no sink.
         try:
-            # A failed TextIOWrapper flush can retain buffered bytes. Merely
-            # catching the error makes interpreter finalization retry it and
-            # replace the real exit status with 120. Retire only the failed
-            # diagnostic descriptor, then drain that buffer into the sink.
             descriptor = stream.fileno()
             sink = os.open(os.devnull, os.O_WRONLY)
             if sink != descriptor:
@@ -640,13 +642,52 @@ def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
                     os.dup2(sink, descriptor)
                 finally:
                     os.close(sink)
-            # If the descriptor was closed, open may have reused that number.
-            # It now belongs to the original stream and must remain open.
             stream.flush()
         except Exception:
-            # Custom streams may have no descriptor, or even a working flush.
-            # Their diagnostics must still never interrupt process cleanup.
             pass
+
+
+def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
+    """Best-effort human output: pipe backpressure cannot delay owned cleanup."""
+
+    stream = sys.stdout if standard_output else sys.stderr
+    try:
+        descriptor = stream.fileno()
+    except Exception:
+        # Support known memory-only capture, never call a custom no-FD writer
+        # whose blocking behavior cannot be controlled by the process owner.
+        if isinstance(stream, io.StringIO) or (
+            isinstance(stream, io.TextIOWrapper)
+            and isinstance(stream.buffer, io.BytesIO)
+        ):
+            _print_memory_or_native_diagnostic(message, stream)
+        return
+    try:
+        if not _diagnostic_supports_nonblocking(descriptor):
+            _print_memory_or_native_diagnostic(message, stream)
+            return
+        blocking = os.get_blocking(descriptor)
+        try:
+            # dup/inheritance shares these flags with the caller: always restore
+            # the original setting, including after short output or EAGAIN.
+            os.set_blocking(descriptor, False)
+            remaining = memoryview(
+                (message + "\n").encode(
+                    stream.encoding or "utf-8",
+                    errors=stream.errors or "backslashreplace",
+                )
+            )
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    break
+                remaining = remaining[written:]
+        finally:
+            os.set_blocking(descriptor, blocking)
+    except Exception:
+        # Closed/full pipes discard diagnostics without creating a buffered
+        # retry at interpreter exit. Never redirect or flush the caller's data.
+        pass
 
 
 def _taskkill_windows_tree(

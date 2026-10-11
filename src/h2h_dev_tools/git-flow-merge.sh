@@ -3,6 +3,14 @@
 set -euo pipefail
 
 diagnose() {
+    if [[ "${recovering:-0}" -eq 1 ]]; then
+        # The recovery trap ignores cancellation: even its own diagnostics must
+        # not wait on a pipe reader. Startup failures are silent, never a printf
+        # fallback. FD 3 preserves the destination while startup stderr is null.
+        "${merge_python-}" -I -B "${merge_launcher-}" --recovery-diagnostic "$1" \
+            3>&2 >/dev/null 2>&1 || true
+        return
+    fi
     # Bash can retry buffered text from a failed builtin write in a later command
     # substitution. Isolate diagnostics so a closed pipe cannot corrupt Git data.
     (printf 'git-flow-merge: %s\n' "$1" >&2) || true
@@ -271,14 +279,21 @@ run_tracked() {
         set -- --review "$@"
     fi
     if [[ "$recovering" -eq 1 ]]; then
-        set -- --recovery "$@"
+        set -- --recovery --recovery-output-fds 3 4 "$@"
     fi
     set -- "$merge_python" -I -B "$merge_launcher" \
         --cleanup-receipt "$active_cleanup_receipt" "$@"
     # Do not leave a forked supervisor unregistered if a signal arrives between
     # the background launch and assignment of its PID.
     starting_child=1
-    (cd "$working_directory" && exec "$@") &
+    if [[ "$recovering" -eq 1 ]]; then
+        # Preserve destinations for the nonblocking diagnostic writer only.
+        # Startup errors (missing cwd/interpreter/launcher) must not block before
+        # the owner can install that writer or establish its hard deadline.
+        (cd "$working_directory" && exec "$@") 3>&1 4>&2 >/dev/null 2>&1 &
+    else
+        (cd "$working_directory" && exec "$@") &
+    fi
     active_pid=$!
     starting_child=0
     if [[ "$pending_signal" -ne 0 && "$recovering" -eq 0 ]]; then

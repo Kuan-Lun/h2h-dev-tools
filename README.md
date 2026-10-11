@@ -176,9 +176,11 @@ Normal workflow commands have no automatic timeout and can be interrupted throug
 the outer wrapper. During failure recovery, each abort or checkout command has
 a separate 10-second hard budget including the existing 6-second teardown reserve.
 Recovery Git output is captured and replayed after its owner finishes, up to
-64 KiB with an explicit truncation notice. A disconnected log reader therefore
-cannot stop recovery hooks through a broken pipe. Review and machine output
-retain their normal streams.
+64 KiB with a truncation notice when the destination accepts it. Recovery owner
+startup errors are suppressed; a failed startup has no cleanup receipt and blocks
+further mutation. Owner progress, replay and shell failure messages use the shared
+best-effort diagnostic writer described below, so a closed or stalled pipe cannot
+delay recovery cleanup or receipt publication.
 A failed abort prevents the recovery checkout; recovery never rolls back an
 already completed merge.
 
@@ -234,6 +236,17 @@ support; offline verify also works on Windows. The default timeout is 900 second
 when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
 review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not
 converted: run the new review to establish evidence for the current implementation.
+
+Process-owner human diagnostics use nonblocking writes on POSIX descriptors and
+Windows pipes. A closed or full pipe can discard diagnostic text; it cannot delay
+cancellation, timeout cleanup or completion. Each write restores the original
+blocking flags, but inherited descriptors share those flags while the write runs;
+this is not isolation from concurrent writers during failure teardown. Child data
+streams are not converted into diagnostic output. Standard memory-only text
+capture is supported; unknown sinks without a descriptor are skipped. Windows
+regular files and consoles retain native text output. This does not promise
+nonblocking console or filesystem I/O. Native Windows validation belongs to its
+platform CI; mocked branch tests do not substitute for that evidence.
 
 The low-level process launch API is silent and accepts file-backed stdout/stderr.
 Its caller must defer signals until it owns the returned process. `run_command`
