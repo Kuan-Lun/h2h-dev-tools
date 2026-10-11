@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from h2h_dev_tools import bundle_verify, merge_command, process
+from h2h_dev_tools import bundle, bundle_verify, merge_command, process
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REVIEWER = """import runpy
@@ -168,6 +168,67 @@ def test_selected_merge_component_exports_the_complete_owner(
     )
     for name in result.stdout.splitlines():
         assert (package / name).is_file(), f"Missing exported owner dependency: {name}"
+
+
+@pytest.mark.parametrize("profile", ["full", "documentation"])
+def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
+    tmp_path: Path, profile: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True, profile=profile)
+    (root / "pyproject.toml").write_text(
+        "[project]\nname = 'snapshot-fixture'\nversion = '0.1.0'\n"
+        "[tool.h2h-dev-tools]\ncomponents = ['git-flow', 'code-review']\n"
+    )
+    bundle.sync_bundle(root)
+    shutil.rmtree(root / "src")
+    for name in (
+        "detect-primary-branch.sh",
+        "git-flow-merge.sh",
+        "review-merge-candidate.sh",
+    ):
+        entry = root / "scripts" / name
+        entry.write_text(
+            entry.read_text().replace(
+                "/src/h2h_dev_tools/", "/scripts/_shared/h2h_dev_tools/"
+            )
+        )
+    (root / "scripts/review-code.py").write_text(
+        _REVIEWER.replace(
+            'root / "src/h2h_dev_tools"', 'root / "scripts/_shared/h2h_dev_tools"'
+        )
+        .replace('package, "h2h_dev_tools"', 'package, "_shared.h2h_dev_tools"')
+        .replace(
+            "from h2h_dev_tools.code_review", "from _shared.h2h_dev_tools.code_review"
+        )
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: use a real consumer source snapshot")
+    task = git(root, "rev-parse", "task")
+
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (root / "src").exists()
+    assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
+    assert git(root, "branch", "--show-current") == "master"
+    assert git(root, "branch", "--list", "task") == ""
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/MERGE_HEAD").exists()
+    events = root / ".git/fixture-review-events"
+    if profile == "full":
+        assert events.read_text() == "run\nverify\nverify\n"
+        assert (root / ".git/fixture-gate").read_text() == "checked\n"
+    else:
+        assert not events.exists()
+        assert not (root / ".git/fixture-gate").exists()
 
 
 @pytest.mark.parametrize("strategy", ["direct", "candidate"])

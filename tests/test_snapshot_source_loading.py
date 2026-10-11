@@ -96,9 +96,11 @@ def test_snapshot_bootstrap_ignores_stale_equal_size_timestamp_cache(
 
 
 @pytest.mark.parametrize("corruption", ["selection", "source", "missing-manifest"])
+@pytest.mark.parametrize("namespace", ["_shared.h2h_dev_tools", "h2h_dev_tools"])
 def test_snapshot_bootstrap_rejects_unverified_source(
     tmp_path: Path,
     corruption: str,
+    namespace: str,
 ) -> None:
     directory = _snapshot(tmp_path)
     if corruption == "selection":
@@ -111,7 +113,7 @@ def test_snapshot_bootstrap_rejects_unverified_source(
         )
     else:
         (directory / "manifest.json").unlink()
-    result = _run(tmp_path, _BOOTSTRAP)
+    result = _run(tmp_path, _BOOTSTRAP.replace("_shared.h2h_dev_tools", namespace))
     assert result.returncode != 0
     assert "must not execute" not in result.stderr
 

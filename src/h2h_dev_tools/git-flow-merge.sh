@@ -468,7 +468,13 @@ else
     [[ "$source_relative" != "$source_directory" ]] \
         || fail 'process owner source is outside the task repository'
     candidate_tree="$(git -C "$merge_worktree" write-tree)"
-    git -C "$merge_worktree" archive "$candidate_tree" "$source_relative" \
+    archive_paths=("$source_relative")
+    if [[ "$source_relative" == scripts/_shared/h2h_dev_tools ]]; then
+        # Snapshot source bootstrap also verifies the repository's explicit
+        # component selection. Export that authority from this exact tree.
+        archive_paths+=(pyproject.toml)
+    fi
+    git -C "$merge_worktree" archive "$candidate_tree" "${archive_paths[@]}" \
         | tar -x -C "$candidate_directory"
     prepare_owner "$candidate_directory/$source_relative" "$execution_directory/review"
     if [[ -n "$review_command" ]]; then

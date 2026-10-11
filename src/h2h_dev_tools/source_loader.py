@@ -33,7 +33,11 @@ def _bytes(path: Path) -> bytes:
 
 def _sources(directory: Path, namespace: str) -> dict[str, str]:
     manifest = directory / "manifest.json"
-    if manifest.exists() or namespace == "_shared.h2h_dev_tools":
+    if (
+        manifest.exists()
+        or namespace == "_shared.h2h_dev_tools"
+        or directory.parts[-3:] == ("scripts", "_shared", "h2h_dev_tools")
+    ):
         # This verifier is intentionally executed from source too. Its complete
         # graph checks the loader, verifier, and every module before any import.
         verifier = runpy.run_path(str(directory / "bundle_verify.py"))
