@@ -16,13 +16,95 @@ from h2h_dev_tools import bundle
 from h2h_dev_tools.__main__ import main
 from h2h_dev_tools.bundle_verify import (
     BUNDLE_DIRECTORY,
-    BUNDLE_FILES,
     MANIFEST_NAME,
     BundleError,
     BundleManifest,
+    component_files,
     payload_digest,
     verify_bundle,
 )
+
+COMPONENTS = ["change-scope", "dependencies", "documentation", "publish-version"]
+BUNDLE_FILES = component_files(COMPONENTS)
+
+
+def configure(root: Path, components: list[str] = COMPONENTS) -> None:
+    (root / "pyproject.toml").write_text(
+        "[tool.h2h-dev-tools]\ncomponents = " + json.dumps(components) + "\n"
+    )
+
+
+def test_component_selection_removes_only_verified_generated_files(
+    consumer: Path,
+) -> None:
+    configure(consumer, ["documentation"])
+    with pytest.raises(BundleError, match="selection is stale"):
+        verify_bundle(consumer)
+    assert bundle.sync_bundle(consumer)
+    manifest = verify_bundle(consumer)
+    assert set(manifest["files"]) == {
+        "__init__.py",
+        "bundle_verify.py",
+        "documentation.py",
+        "change_scope.py",
+    }
+    assert not (consumer / BUNDLE_DIRECTORY / "publish_version.py").exists()
+
+
+@pytest.mark.parametrize(
+    "components", [["unknown"], ["documentation", "documentation"]]
+)
+def test_invalid_component_selection_never_rewrites_existing_bundle(
+    consumer: Path, components: list[str]
+) -> None:
+    configure(consumer, components)
+    before = _snapshot(consumer)
+    with pytest.raises(BundleError):
+        bundle.sync_bundle(consumer)
+    assert _snapshot(consumer) == before
+
+
+def test_missing_explicit_selection_fails_before_initial_write(tmp_path: Path) -> None:
+    with pytest.raises(BundleError):
+        bundle.sync_bundle(tmp_path)
+    assert not any(tmp_path.iterdir())
+
+
+def test_v1_conversion_is_explicit_and_preserves_unmanaged_content(
+    consumer: Path,
+) -> None:
+    from h2h_dev_tools.migrate_v1 import migrate_v1
+
+    path = consumer / BUNDLE_DIRECTORY / MANIFEST_NAME
+    legacy = json.loads(path.read_bytes())
+    legacy["schema_version"] = 1
+    del legacy["components"]
+    path.write_text(json.dumps(legacy))
+    local = consumer / "scripts/private.py"
+    local.write_text("keep this unrelated tool\n")
+    configure(consumer, ["documentation"])
+    with pytest.raises(BundleError, match="schema"):
+        bundle.sync_bundle(consumer)
+    assert migrate_v1(consumer)
+    assert verify_bundle(consumer)["components"] == ["documentation"]
+    assert local.read_text() == "keep this unrelated tool\n"
+    with pytest.raises(BundleError, match="schema-1"):
+        migrate_v1(consumer)
+
+
+def test_v1_conversion_rejects_modified_source_without_writing(consumer: Path) -> None:
+    from h2h_dev_tools.migrate_v1 import migrate_v1
+
+    path = consumer / BUNDLE_DIRECTORY / MANIFEST_NAME
+    legacy = json.loads(path.read_bytes())
+    legacy["schema_version"] = 1
+    del legacy["components"]
+    path.write_text(json.dumps(legacy))
+    (path.parent / "dependency_manifest.py").write_text("private edits\n")
+    before = _snapshot(consumer)
+    with pytest.raises(BundleError, match="modified"):
+        migrate_v1(consumer)
+    assert _snapshot(consumer) == before
 
 
 @pytest.fixture
@@ -31,19 +113,21 @@ def source_payload(monkeypatch: pytest.MonkeyPatch) -> dict[str, bytes]:
     payload = dict.fromkeys(BUNDLE_FILES, b'"""Generated fixture module."""\n')
     payload["bundle_verify.py"] = (source / "bundle_verify.py").read_bytes()
 
-    def load() -> tuple[dict[str, bytes], BundleManifest]:
+    def load(components: list[str]) -> tuple[dict[str, bytes], BundleManifest]:
+        selected = {name: payload[name] for name in component_files(components)}
         files = {
             name: hashlib.sha256(content).hexdigest()
-            for name, content in payload.items()
+            for name, content in selected.items()
         }
         manifest: BundleManifest = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "components": components,
             "toolkit_name": "h2h-dev-tools",
             "toolkit_version": "0.1.0",
             "payload_sha256": payload_digest(files),
             "files": files,
         }
-        return dict(payload), manifest
+        return selected, manifest
 
     monkeypatch.setattr(bundle, "_source_payload", load)
     return payload
@@ -52,6 +136,7 @@ def source_payload(monkeypatch: pytest.MonkeyPatch) -> dict[str, bytes]:
 @pytest.fixture
 def consumer(tmp_path: Path, source_payload: dict[str, bytes]) -> Path:
     del source_payload
+    configure(tmp_path)
     assert bundle.sync_bundle(tmp_path)
     return tmp_path
 
@@ -185,7 +270,7 @@ def test_manifest_path_escape_is_rejected(consumer: Path, filename: str) -> None
     ("field", "value"),
     [
         ("schema_version", True),
-        ("schema_version", 2),
+        ("schema_version", 3),
         ("toolkit_name", "other"),
         ("toolkit_version", "0.1.0.dev1"),
         ("payload_sha256", "0" * 64),
@@ -207,7 +292,7 @@ def test_duplicate_manifest_keys_are_rejected(consumer: Path) -> None:
     path = consumer / BUNDLE_DIRECTORY / MANIFEST_NAME
     path.write_text(
         path.read_text().replace(
-            '"schema_version": 1', '"schema_version": 1, "schema_version": 1'
+            '"schema_version": 2', '"schema_version": 2, "schema_version": 2'
         )
     )
     with pytest.raises(BundleError, match="Duplicate"):
@@ -247,6 +332,7 @@ def test_initial_empty_directory_is_accepted(
 ) -> None:
     del source_payload
     (tmp_path / BUNDLE_DIRECTORY).mkdir(parents=True)
+    configure(tmp_path)
     assert bundle.sync_bundle(tmp_path)
     verify_bundle(tmp_path)
 
@@ -283,13 +369,15 @@ def test_source_payload_uses_installed_metadata_and_validates_before_writing(
     monkeypatch.setattr(metadata, "version", installed_version)
     repository = tmp_path / "consumer"
     repository.mkdir()
+    configure(repository)
+    before = _snapshot(repository)
     if version == "0.1.0":
         assert bundle.sync_bundle(repository)
         assert verify_bundle(repository)["toolkit_version"] == version
     else:
         with pytest.raises(BundleError):
             bundle.sync_bundle(repository)
-        assert not any(repository.iterdir())
+        assert _snapshot(repository) == before
 
 
 def test_changed_destination_during_staging_is_rejected(
