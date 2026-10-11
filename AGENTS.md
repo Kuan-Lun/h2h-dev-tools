@@ -161,6 +161,9 @@
 - Review 的單次 Codex invocation 固定 `notify=[]`，防止非同步完成通知在
   CLI 退出後留下子程序。保留既有模型、認證、plugins、MCP 與安全 hooks
   設定，不修改全域配置；其他 descendants 仍須符合相同 cleanup 契約。
+  使用 CLI 正常持久 session，不強制 `--ephemeral`，讓子代理能解析 parent
+  thread。CLI rollout 依正常機制保留；reviewer 不自動刪除，Git metadata 中的
+  原始審查結果、診斷與 exact-candidate evidence 仍各自保留並驗證。
 - Online review 目前限 POSIX，逾時或中斷會清理 Codex process group；刻意脫離
   group 的 descendants 不在保證內。Windows 可執行 offline verify；未驗證
   Windows Job Object review lifecycle 前不得聲稱支援 Windows online review。
