@@ -6,8 +6,8 @@ repository_root=${1:?repository root is required}
 after_build=${2-}
 shift 2
 source_base=$PWD
-source_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$repository_root"
+source_directory="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CDPATH= cd "$repository_root"
 for executable in uv npm; do
     command -v "$executable" >/dev/null || {
         printf 'rebuild-env: %s is required\n' "$executable" >&2

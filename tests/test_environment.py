@@ -277,6 +277,7 @@ def test_rebuild_uses_caller_artifact_instead_of_repository_decoy(
     monkeypatch.setenv("UV_NO_INDEX", "1")
     caller = tmp_path / "caller checkout"
     caller.mkdir()
+    monkeypatch.setenv("CDPATH", str(caller))
     for checkout in (environment, caller):
         subprocess.run(
             ("git", "init", "-b", "master", str(checkout)),
@@ -289,13 +290,13 @@ def test_rebuild_uses_caller_artifact_instead_of_repository_decoy(
         assert _wheel(caller, origin="caller-selected") == expected
     callback = environment / "after-build.py"
     callback.write_text(
-        "import json\nfrom importlib.metadata import distribution\n"
+        "import json, os\nfrom importlib.metadata import distribution\n"
         "from pathlib import Path\nimport source_example\n"
         "package = distribution('source-example')\n"
         "Path('installed.json').write_text(json.dumps({\n"
         " 'origin': source_example.ORIGIN, 'version': package.version,\n"
         " 'direct_url': json.loads(package.read_text('direct_url.json')),\n"
-        " 'cwd': str(Path.cwd())}))\n"
+        " 'cwd': str(Path.cwd()), 'cdpath': os.environ.get('CDPATH')}))\n"
     )
     if entry == "local-wrapper":
         for relative in (
@@ -349,6 +350,7 @@ def test_rebuild_uses_caller_artifact_instead_of_repository_decoy(
     assert installed["version"] == "1.0"
     assert installed["direct_url"]["url"] == expected.as_uri()
     assert installed["cwd"] == str(environment)
+    assert installed["cdpath"] == str(caller)
     assert (environment / ".npm-ran").exists()
     assert not (caller / ".venv").exists()
 

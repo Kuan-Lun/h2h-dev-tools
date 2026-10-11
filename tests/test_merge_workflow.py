@@ -374,13 +374,17 @@ def test_successful_merge_preserves_a_task_advanced_during_the_gate(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX newline path and shell workflow")
-def test_full_workflow_preserves_task_root_trailing_newlines(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cdpath", [None, "."])
+def test_full_workflow_preserves_task_root_trailing_newlines(
+    tmp_path: Path, cdpath: str | None
+) -> None:
     root = tmp_path / "repository\n\n"
     base = fixture_repository(root, succeeds=True)
     task = git(root, "rev-parse", "task")
     result = subprocess.run(
         ("scripts/git-flow-merge.sh",),
         cwd=root,
+        env=os.environ | ({"CDPATH": cdpath} if cdpath is not None else {}),
         capture_output=True,
         text=True,
         check=False,

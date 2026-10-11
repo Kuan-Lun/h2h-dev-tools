@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_root=${1:?repository root is required}
-resource_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$repo_root"
+resource_dir="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CDPATH= cd "$repo_root"
 
 existing_hooks_path="$(git config --get core.hooksPath || true)"
 if [[ -n "$existing_hooks_path" && "$existing_hooks_path" != ".githooks" ]]; then

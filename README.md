@@ -213,6 +213,9 @@ while locating the repository. The shared rebuild captures it before changing to
 the repository, then passes it as `--source-base` to the source resolver. The
 repository's `.[dev]` installation, npm and after-build callback still run from
 the repository root; absolute paths, URLs and index sources keep their meaning.
+Repository path changes use command-local `CDPATH=` so an interactive shell's
+search paths cannot redirect tooling or contaminate machine-readable output.
+The caller's environment remains available to invoked commands and callbacks.
 Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Primary worktree discovery queries the exact branch with NUL-delimited fields;
