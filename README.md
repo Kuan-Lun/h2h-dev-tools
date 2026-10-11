@@ -154,8 +154,10 @@ commit, then offline verification before and after the existing full gate.
 Documentation-only changes retain their documentation gate without online review.
 Review reads the repository's root `AGENTS.md`; findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
-The merge launcher owns the complete review stage, including classification,
-CLI-version preflight, reviewer and Codex descendants, in one process group.
+The merge launcher first owns classification in a dedicated process group and
+proves that group empty. Only a full-profile candidate then requires the local
+review entry and starts the reviewer, CLI-version preflight and Codex descendants
+in their next owned group. Documentation needs neither the review entry nor Codex.
 The owner is exported from the actual staged candidate after the three-way merge,
 so an independently updated primary does not require rebasing the task. The owner
 holds the candidate review lock through cleanup and publication. Managed reviewers

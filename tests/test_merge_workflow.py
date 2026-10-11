@@ -14,10 +14,13 @@ import pytest
 from h2h_dev_tools import bundle_verify, merge_command, process
 
 _ROOT = Path(__file__).resolve().parents[1]
-_REVIEWER = """import json
-import subprocess
+_REVIEWER = """import subprocess
 import sys
 from pathlib import Path
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from h2h_dev_tools.code_review import main
 
 def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
@@ -26,18 +29,29 @@ directory = Path(git("rev-parse", "--git-common-dir"))
 mode = sys.argv[1]
 with (directory / "fixture-review-events").open("a") as events:
     events.write(mode + "\\n")
-candidate = [git("rev-parse", "HEAD"), git("rev-parse", "MERGE_HEAD"), git("write-tree")]
-receipt = directory / "fixture-review"
-if mode == "run":
-    if (directory / "reject-review").exists():
-        raise SystemExit(1)
-    receipt.write_text(json.dumps(candidate))
-elif mode == "verify":
-    assert sys.argv[2:] == ["--index", "--expected-tree", candidate[2]]
-    assert json.loads(receipt.read_text()) == candidate
-else:
-    raise AssertionError(mode)
+if mode == "run" and (directory / "reject-review").exists():
+    raise SystemExit(1)
+main(root)
 """
+
+
+@pytest.fixture(autouse=True)
+def offline_codex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    binary = tmp_path / "fake-review-cli"
+    binary.mkdir()
+    executable(
+        binary / "codex",
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli merge-fixture')\n"
+        "    raise SystemExit(0)\n"
+        "sys.stdin.read()\n"
+        "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+        "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n",
+    )
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ.get("PATH", ""))
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -216,7 +230,7 @@ def test_review_failure_aborts_merge_and_preserves_task(
     else:
         executable(
             root / "scripts/check-full.sh",
-            '#!/bin/sh\nrm "$(git rev-parse --git-path fixture-review)"\n',
+            '#!/bin/sh\nrm "$(git rev-parse --git-path h2h-review/receipts)"/*.json\n',
         )
         git(root, "add", ".")
         git(root, "commit", "-m", "test: invalidate review during checks")
@@ -251,6 +265,30 @@ def test_documentation_merge_does_not_run_or_verify_review(tmp_path: Path) -> No
     assert not (root / ".git/fixture-review-events").exists()
     assert not (root / ".git/fixture-gate").exists()
     assert git(root, "branch", "--show-current") == "master"
+
+
+def test_full_review_success_without_pending_evidence_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    (root / "scripts/review-code.py").write_text("raise SystemExit(0)\n")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: simulate reviewer losing its result")
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "No valid code review" in result.stderr
+    assert not (root / ".git/fixture-gate").exists()
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert git(root, "rev-parse", "master") == base
+    assert git(root, "branch", "--show-current") == "task"
 
 
 def test_missing_environment_leaves_task_checkout_and_primary_untouched(
@@ -330,6 +368,27 @@ def test_merge_accepts_windows_style_environment_layout(tmp_path: Path) -> None:
     assert not git(root, "branch", "--list", "task")
 
 
+def test_documentation_merge_does_not_require_a_local_review_entry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True, profile="documentation")
+    (root / "scripts/review-code.py").unlink()
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: omit unused online review entry")
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(root, "branch", "--show-current") == "master"
+    assert not (root / ".git/fixture-review-events").exists()
+
+
 @pytest.mark.parametrize("cleanup_proven", [False, True])
 def test_launcher_reserves_125_for_unproven_cleanup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleanup_proven: bool
@@ -388,7 +447,15 @@ def test_windows_documentation_stage_does_not_activate_online_review_protocol(
         assert (
             not set(merge_command.REVIEW_OWNER_ENVIRONMENT) & phase.environment.keys()
         )
-        assert phase.argv == ("bash", "scripts/review-merge-candidate.sh")
+        assert phase.argv == (
+            sys.executable,
+            "scripts/check_change_scope.py",
+            "--index",
+            "--base",
+            "HEAD",
+        )
+        assert phase.stdout is not None and not isinstance(phase.stdout, int)
+        phase.stdout.write(b"documentation\n")
         return 0
 
     monkeypatch.setattr(process, "run_command", run_command)
@@ -667,18 +734,17 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
     owner = root / "src/h2h_dev_tools/merge_command.py"
     owner.write_text(
         owner.read_text().replace(
-            "        if managed_review and status == 0 and pending.exists():",
-            "        if arguments.review:\n"
-            "            import time\n"
-            "            state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
-            "            (state / 'ready').touch()\n"
-            "            while not (state / 'release').exists():\n"
-            "                time.sleep(0.01)\n"
-            f"            if {owner_result!r} == 'crash':\n"
-            "                os._exit(1)\n"
-            f"            if {owner_result!r} == 'corrupt':\n"
-            "                pending.write_text('{}')\n"
-            "        if managed_review and status == 0 and pending.exists():",
+            "        if status == 0:",
+            "        import time\n"
+            "        state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
+            "        (state / 'ready').touch()\n"
+            "        while not (state / 'release').exists():\n"
+            "            time.sleep(0.01)\n"
+            f"        if {owner_result!r} == 'crash':\n"
+            "            os._exit(1)\n"
+            f"        if {owner_result!r} == 'corrupt':\n"
+            "            pending.write_text('{}')\n"
+            "        if status == 0:",
         )
     )
     git(root, "add", ".")

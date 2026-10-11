@@ -134,8 +134,10 @@
   Windows Job Object review lifecycle 前不得聲稱支援 Windows online review。
   預設 900 秒，`run --timeout-seconds` 只接受 1..3600 秒；merge 可透過
   `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
-- Merge 的 review stage（分類、CLI version preflight、reviewer 與 Codex）由
-  外部 owner 管理同一 process group，reviewer 驗證 parent PID 及 group leader
+- Merge 的 review stage 先以獨立 owned process group 完成分類；確認該組清空
+  後，只有 full profile 才要求 local review 入口、取得 candidate lock 並啟動
+  reviewer。純文件不要求 local review 入口或 Codex。CLI version preflight、
+  reviewer 與 Codex 由外部 owner 管理同一 process group，reviewer 驗證 parent PID 及 group leader
   與 owner execution closure 完全符合 candidate 後才共用 ownership；owner 從真正
   staged candidate 匯出完整 review closure，不要求 task 包含最新 primary。
   Owner 持有 candidate lock 至清理及 evidence publication 完成；managed reviewer
