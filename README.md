@@ -49,6 +49,7 @@ Python modules and shell resources share the same hash-bound manifest.
 | `offline-wheel` | Temporary candidate-wheel environment with development dependencies and a local smoke callback |
 | `process` | Owned process trees, deadlines, signal deferral and Windows Job start gates |
 | `formal` | Pinned TLC download and offline host/Docker execution |
+| `code-review` | Exact-candidate Codex review and offline evidence verification |
 
 Schema-1 snapshots from 0.1 use a fixed payload and are not accepted by normal
 schema-2 verification or sync. After declaring components, convert once:
@@ -116,6 +117,22 @@ replacing the environment. Merge checks dirty worktrees, in-progress Git operati
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Already-integrated tasks use checked cleanup without another merge or gate.
 
+The `code-review` component owns the reviewer implementation; each repository's
+`scripts/review-code.py` calls `code_review.main(repository_root)`, and its merge
+entry point delegates to the shared `review-merge-candidate.sh` with that root.
+Full changes require online review of the staged two-parent candidate before
+commit, then offline verification before and after the existing full gate.
+Documentation-only changes retain their documentation gate without online review.
+Review reads the repository's root `AGENTS.md`; findings, incomplete results,
+timeouts and invalid output block the merge and preserve the task branch.
+
+Review evidence in Git common metadata `h2h-review` binds the exact tree, ordered
+parents, root policy, local entry point and shared reviewer source. It is separate
+from test evidence. Run needs an authenticated `codex` CLI and POSIX process-group
+support; offline verify also works on Windows. The default timeout is 900 seconds
+(`--timeout-seconds` accepts 1..3600). Old Core `h2hdb-review` receipts are not
+converted: run the new review to establish evidence for the current implementation.
+
 The low-level process launch API is silent and accepts file-backed stdout/stderr.
 Its caller must defer signals until it owns the returned process. `run_command`
 provides that lifecycle, reserves cleanup time, rejects surviving descendants and
@@ -157,8 +174,8 @@ scripts/check-full.sh
 
 The expected primary branch is `master`. Create a dedicated task branch before
 changing tracked files, then finish with `scripts/git-flow-merge.sh`. The merge
-hook validates the real staged candidate and its version impact before running
-the applicable documentation or full gate. `scripts/format.sh` applies formatters;
+flow reviews full candidates before the hook verifies review evidence, version
+impact and the applicable documentation or full gate. `scripts/format.sh` applies formatters;
 the check commands are read-only. Ruff and strict mypy use `pyproject.toml`.
 
 The full gate builds fresh distributions, then installs the sdist-derived wheel
