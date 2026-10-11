@@ -75,6 +75,74 @@ allow-none-impact = {str(allow_none).lower()}
     (directory / "dependency-audit.json").write_text(json.dumps(receipt))
 
 
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        (None, 'dev = ["pytest>=9"]'),
+        ('dev = ["pytest>=9"]', None),
+        ('dev = ["pytest>=9"]', 'dev = ["pytest>=10"]'),
+        (None, ""),
+        ("", None),
+        (None, "dev = []"),
+        ('runtime = ["httpx>=0.28"]', 'runtime = ["httpx>=0.28"]\ndev = []'),
+        ('runtime = ["httpx>=0.28"]\ndev = []', 'runtime = ["httpx>=0.28"]'),
+    ],
+)
+def test_dev_extra_changes_do_not_require_a_release(
+    repository: Path, before: str | None, after: str | None
+) -> None:
+    write_project(repository, "0.1.0")
+    manifest = repository / "pyproject.toml"
+    original = manifest.read_text()
+    if before is not None:
+        manifest.write_text(original + "\n[project.optional-dependencies]\n" + before)
+    base = commit(repository, "feat: baseline")
+    manifest.write_text(original)
+    if after is not None:
+        manifest.write_text(original + "\n[project.optional-dependencies]\n" + after)
+    task = commit(repository, "chore!: change development requirements")
+    version_policy.validate(base, task, task)
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("dev = []", "runtime = []"),
+        ("runtime = []", "dev = []"),
+        ("dev = []", 'dev = []\nruntime = ["httpx>=0.28"]'),
+        ('dev = []\nruntime = ["httpx>=0.28"]', "dev = []"),
+        ('runtime = ["httpx>=0.28"]', 'dev = []\nruntime = ["httpx>=0.29"]'),
+    ],
+)
+def test_dev_extra_normalization_preserves_runtime_extra_changes(
+    repository: Path, before: str, after: str
+) -> None:
+    write_project(repository, "0.1.0")
+    manifest = repository / "pyproject.toml"
+    original = manifest.read_text()
+    manifest.write_text(original + "\n[project.optional-dependencies]\n" + before)
+    base = commit(repository, "feat: baseline")
+    manifest.write_text(original + "\n[project.optional-dependencies]\n" + after)
+    task = commit(repository, "fix: change public optional requirements")
+    with pytest.raises(ValueError, match="release surface changed without"):
+        version_policy.validate(base, task, task)
+
+
+def test_dev_extra_does_not_hide_other_project_metadata(repository: Path) -> None:
+    write_project(repository, "0.1.0")
+    manifest = repository / "pyproject.toml"
+    base = commit(repository, "feat: baseline")
+    manifest.write_text(
+        manifest.read_text().replace(
+            "dependencies = []", 'dependencies = ["packaging>=26"]'
+        )
+        + "\n[project.optional-dependencies]\ndev = []\n"
+    )
+    task = commit(repository, "fix: change runtime and development requirements")
+    with pytest.raises(ValueError, match="release surface changed without"):
+        version_policy.validate(base, task, task)
+
+
 @pytest.mark.parametrize("quote_paths", ["true", "false"])
 @pytest.mark.parametrize(
     "name",

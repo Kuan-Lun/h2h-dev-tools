@@ -51,6 +51,8 @@ def _release_metadata(document: dict[str, Any]) -> dict[str, Any]:
     optional = project.get("optional-dependencies")
     if isinstance(optional, dict):
         optional.pop("dev", None)
+        if not optional:
+            project.pop("optional-dependencies")
     return {
         "build-system": document.get("build-system", {}),
         "project": project,

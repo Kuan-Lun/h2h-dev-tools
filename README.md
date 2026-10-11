@@ -131,7 +131,9 @@ detection, hook installation and environment rebuild run before a `.venv` exists
 they do not import the Python package.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
-from the project manifests. Shared version evaluation considers only commits that
+from the project manifests. Adding, changing or removing only the `dev` optional
+extra does not require a release; other named extras, including empty extras,
+remain release metadata. Shared version evaluation considers only commits that
 actually change release surface. Where enabled, `Version-Impact: none` and its
 nonempty `Version-Reason` exempt only their own commit; later release changes
 still require the task's single version bump, and extra candidate changes cannot
