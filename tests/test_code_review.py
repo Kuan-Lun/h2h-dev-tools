@@ -284,20 +284,51 @@ def _held_review(repo: ReviewRepository, mode: str) -> Iterator[subprocess.Popen
             process.communicate(timeout=5)
 
 
+@pytest.mark.parametrize("model", [None, "fixture-model"], ids=["default", "explicit"])
 def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
-    review_repository: ReviewRepository,
+    review_repository: ReviewRepository, model: str | None
 ) -> None:
     repo = review_repository
     base = repo.git("rev-parse", "HEAD")
     tree = repo.git("write-tree")
-    _assert_passed(repo.review("run", "--index", "--model", "fixture-model"))
+    model_arguments = () if model is None else ("--model", model)
+    _assert_passed(repo.review("run", "--index", *model_arguments))
     calls = repo.calls()
     assert len(calls) == 1
     arguments = calls[0]["args"]
     assert isinstance(arguments, list)
     assert arguments[0] == "exec"
     assert arguments[arguments.index("--sandbox") + 1] == "read-only"
-    assert arguments[arguments.index("--model") + 1] == "fixture-model"
+    if model is None:
+        assert "--model" not in arguments
+    else:
+        assert arguments[arguments.index("--model") + 1] == model
+    configuration = [
+        arguments[index + 1] for index, value in enumerate(arguments) if value == "-c"
+    ]
+    assert configuration == ['approval_policy="never"', "notify=[]"]
+    assert all(
+        isinstance(value, str)
+        and '"' not in value.partition("=")[0]
+        and "'" not in value.partition("=")[0]
+        for value in configuration
+    )
+    # Only completion notifications are disabled. Do not suppress user model,
+    # authentication, tools/plugins, feature flags, or safety-hook settings.
+    expected_options = {
+        "--sandbox",
+        "-c",
+        "--ephemeral",
+        "--json",
+        "--output-schema",
+        "--output-last-message",
+        "-",
+    }
+    if model is not None:
+        expected_options.add("--model")
+    assert {
+        value for value in arguments if isinstance(value, str) and value.startswith("-")
+    } == expected_options
     assert {
         "--json",
         "--output-schema",

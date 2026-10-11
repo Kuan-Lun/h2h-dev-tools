@@ -239,6 +239,11 @@ or alternate-stream semantics. Export also checks resolved destination containme
 and refuses filesystem name collisions instead of overwriting another document.
 Review reads the repository's root `AGENTS.md`; findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
+Each review invocation sets `notify=[]`: asynchronous completion notifications
+can otherwise outlive the CLI and violate its process ownership contract.
+This override applies only to that invocation. Model preferences, authentication,
+plugins, MCP servers and security hooks retain their existing configuration;
+their descendants remain subject to the same cleanup requirements.
 The merge launcher first owns classification in a dedicated process group and
 proves that group empty. Only a full-profile candidate then requires the local
 review entry and starts the reviewer, CLI-version preflight and Codex descendants

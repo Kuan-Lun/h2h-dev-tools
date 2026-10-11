@@ -141,6 +141,9 @@
   Finding、incomplete、逾時、非零退出及無效結果全部阻止合併，abort merge 並
   保留 task branch；無法證明 process cleanup 時適用前述保留 candidate 例外。
   修正後重新 review，不得忽略 finding 或手寫 passing receipt。
+- Review 的單次 Codex invocation 固定 `notify=[]`，防止非同步完成通知在
+  CLI 退出後留下子程序。保留既有模型、認證、plugins、MCP 與安全 hooks
+  設定，不修改全域配置；其他 descendants 仍須符合相同 cleanup 契約。
 - Online review 目前限 POSIX，逾時或中斷會清理 Codex process group；刻意脫離
   group 的 descendants 不在保證內。Windows 可執行 offline verify；未驗證
   Windows Job Object review lifecycle 前不得聲稱支援 Windows online review。

@@ -737,6 +737,9 @@ class Reviewer:
             "read-only",
             "-c",
             'approval_policy="never"',
+            # Completion notifications can outlive the CLI's owned command.
+            "-c",
+            "notify=[]",
             "--ephemeral",
             "--json",
             "--output-schema",
