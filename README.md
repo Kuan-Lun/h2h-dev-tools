@@ -185,8 +185,14 @@ The helper preserves pytest arguments and uses a unique empty bytecode-cache
 prefix with cache writes disabled. It prepends the verified package's import
 root to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix.
 An optional xdist gateway hook revalidates and source-loads the same package in
-each local worker before its pytest plugins and conftests load; path ordering
-alone cannot protect namespace packages from another checkout's regular package.
+each local worker before its pytest plugins and conftests load. It checks the
+controller's original source hashes, captured
+before pytest or its plugins are imported. A valid replacement snapshot is still
+a different generation and is rejected. Worker bootstrap and snapshot verifier
+code are compiled from the exact bytes checked against those hashes; subsequent
+module imports recheck their expected hashes before compiling their bytes.
+Path ordering alone cannot protect namespace packages from another checkout's
+regular package.
 The settings are restored and the temporary directory removed when pytest exits.
 This covers direct local Python workers; remote or chained
 workers need their own explicit source distribution and are not supported by this
