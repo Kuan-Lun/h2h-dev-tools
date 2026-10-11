@@ -116,18 +116,29 @@ def _validate_transition(message_range: str, version: str) -> None:
 
 def _changed_paths(base: str, candidate: str) -> tuple[str, ...]:
     # A move out of a public release path still retires its old surface.
-    return tuple(
-        path
-        for path in _git(
+    # Keep names as bytes until after splitting: text mode translates CR/LF,
+    # while Git's ordinary display quoting changes non-ASCII and control names.
+    output = subprocess.run(
+        (
+            "git",
             "diff",
             "--no-renames",
             "--name-only",
+            "-z",
             "--diff-filter=ACDMRT",
             base,
             candidate,
-        ).splitlines()
-        if path
-    )
+            "--",
+        ),
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if not output:
+        return ()
+    paths = output.split(b"\0")
+    if paths.pop() != b"" or not all(paths):
+        raise ValueError("malformed NUL-delimited Git difference")
+    return tuple(os.fsdecode(path) for path in paths)
 
 
 def _release_changed(
@@ -249,19 +260,23 @@ def _validate_audit(tree: str, document: dict[str, Any], version: str) -> None:
 
 def _candidate(arguments: argparse.Namespace) -> tuple[str, str, str]:
     if arguments.index:
-        merge_task_ref = os.environ.get("WORKFLOW_MERGE_TASK_REF")
-        if merge_task_ref:
-            merge_revision = _git(
-                "rev-parse", "--verify", f"{merge_task_ref}^{{commit}}"
-            )
+        base = _git("rev-parse", "--verify", "HEAD^{commit}")
+        merge_head = Path(_git("rev-parse", "--git-path", "MERGE_HEAD"))
+        if merge_head.exists():
+            parents = merge_head.read_text(encoding="ascii").splitlines()
+            if len(parents) != 1:
+                raise ValueError("--index requires a two-parent merge")
+            merge_parent = parents[0]
         else:
-            merge_head = Path(_git("rev-parse", "--git-path", "MERGE_HEAD"))
-            if not merge_head.exists():
-                raise ValueError(
-                    "--index requires WORKFLOW_MERGE_TASK_REF or an active merge"
-                )
-            merge_revision = _git("rev-parse", "MERGE_HEAD")
-        return "HEAD", _git("write-tree"), f"HEAD..{merge_revision}"
+            # Git's direct pre-merge hook runs before writing MERGE_HEAD. The
+            # launcher must supply its captured commit, never a moving branch.
+            merge_parent = os.environ.get("WORKFLOW_MERGE_TASK_REF", "")
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_parent):
+            raise ValueError("--index requires an immutable full task commit OID")
+        merge_revision = _git("rev-parse", "--verify", f"{merge_parent}^{{commit}}")
+        if merge_revision != merge_parent:
+            raise ValueError("--index task OID must identify a commit, not a tag")
+        return base, _git("write-tree"), f"{base}..{merge_revision}"
     if arguments.base:
         return (
             str(arguments.base),

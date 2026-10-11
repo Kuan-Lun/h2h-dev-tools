@@ -168,6 +168,67 @@ def test_selected_merge_component_exports_the_complete_owner(
         assert (package / name).is_file(), f"Missing exported owner dependency: {name}"
 
 
+@pytest.mark.parametrize("strategy", ["direct", "candidate"])
+def test_merge_uses_captured_commit_when_task_advances_before_git_launch(
+    tmp_path: Path, strategy: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    observed_parent = tmp_path / "observed-parent"
+    if strategy == "direct":
+        # This fixture's real release gate is for candidate-style commits.
+        # Exercise Git's direct hook timing with its own explicit parent input.
+        executable(
+            root / ".githooks/pre-merge-commit",
+            f"#!{sys.executable}\n"
+            "import os\nfrom pathlib import Path\n"
+            f"Path({str(observed_parent)!r}).write_text(os.environ['WORKFLOW_MERGE_TASK_REF'])\n",
+        )
+        git(root, "add", ".githooks/pre-merge-commit")
+        git(root, "commit", "-m", "test: observe the direct hook parent")
+    task = git(root, "rev-parse", "task")
+    later = git(root, "commit-tree", "HEAD^{tree}", "-p", task, "-m", "later task")
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    executable(
+        binary / "git",
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys\n"
+        f"real_git = {real_git!r}\narguments = sys.argv[1:]\n"
+        "if 'merge' in arguments and '--no-ff' in arguments:\n"
+        f"    subprocess.run([real_git, '-C', {str(root)!r}, 'update-ref', "
+        f"'refs/heads/task', {later!r}, {task!r}], check=True)\n"
+        "os.execv(real_git, [real_git, *arguments])\n",
+    )
+    result = subprocess.run(
+        (
+            "bash",
+            "src/h2h_dev_tools/git-flow-merge.sh",
+            str(root),
+            strategy,
+            "scripts/review-merge-candidate.sh" if strategy == "candidate" else "",
+        ),
+        cwd=root,
+        env=os.environ
+        | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "Git ref changed during cleanup" in result.stderr
+    assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
+    assert git(root, "rev-parse", "task") == later
+    if strategy == "direct":
+        assert observed_parent.read_text() == task
+    assert "task" in git(root, "show", "-s", "--format=%s", "master")
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert git(root, "status", "--porcelain") == ""
+
+
 def test_successful_merge_preserves_a_task_advanced_during_the_gate(
     tmp_path: Path,
 ) -> None:

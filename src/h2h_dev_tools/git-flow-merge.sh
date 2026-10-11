@@ -405,16 +405,16 @@ if [[ -z "$primary_worktree" ]]; then
 fi
 assert_ref_equals "$merge_worktree" "$primary_ref" "$primary_oid"
 assert_ref_equals "$merge_worktree" "$task_ref" "$task_oid"
-export WORKFLOW_MERGE_TASK_REF="$task_branch"
+export WORKFLOW_MERGE_TASK_REF="$task_oid"
 if [[ "$strategy" == direct ]]; then
     # Git invokes pre-merge-commit for the exact candidate in these repositories.
     run_tracked process "$merge_worktree" git -C "$merge_worktree" \
-        merge --no-ff --no-edit "$task_branch" \
+        merge --no-ff --no-edit -m "Merge branch '$task_branch' into $primary" "$task_oid" \
         || fail 'merge or merge gate failed; task branch was retained'
 else
     # These repositories' pre-commit hooks delegate pending merges to their gate.
     run_tracked process "$merge_worktree" git -C "$merge_worktree" \
-        merge --no-ff --no-commit "$task_branch" \
+        merge --no-ff --no-commit -m "Merge branch '$task_branch' into $primary" "$task_oid" \
         || fail 'merge failed; task branch was retained'
     # The task need not contain primary's latest tools. Export the real staged
     # merge tree after Git has combined both branches, so review/commit execute

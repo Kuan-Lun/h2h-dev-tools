@@ -136,6 +136,10 @@ actually change release surface. Hook installation refuses to replace an existin
 third-party hook directory. Rebuild validates explicit source overrides before
 replacing the environment. Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
+Both merge strategies use the captured task commit, preserving its branch name
+in the merge message. Version checks use the actual `MERGE_HEAD`; before Git
+creates that file for a direct merge hook, `WORKFLOW_MERGE_TASK_REF` must contain
+the full immutable commit OID. Mutable branch names are no longer accepted there.
 Already-integrated tasks use checked cleanup without another merge or gate.
 Cleanup rechecks that the original task tip remains unchanged and is contained in
 primary before removing a linked worktree. Branch deletion uses primary's checked
