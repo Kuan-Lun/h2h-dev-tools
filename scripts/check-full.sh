@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+repository_root="$(git rev-parse --show-toplevel && printf '.')"
+repository_root="${repository_root%.}"
+repository_root="${repository_root%$'\n'}"
+cd -- "$repository_root"
 scripts/check-fast.sh
 .venv/bin/python -B src/h2h_dev_tools/git_environment.py --repository "$PWD" -- \
     .venv/bin/python -B scripts/run-pytest.py -p no:cacheprovider

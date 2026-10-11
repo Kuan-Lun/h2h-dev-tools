@@ -109,6 +109,10 @@
 - 本 repo 的 pytest 使用 repository-local Python 執行 `scripts/run-pytest.py`
   並傳入原 pytest arguments；full gate 與 Windows CI 共用此入口。它在 pytest、
   plugins 與 conftest 載入前建立 checkout source authority，不以 `-B` 取代。
+  共用 `pytest` component 為每次 invocation 建立空 cache prefix、停用 bytecode
+  寫入，並明確傳遞候選來源 import root 給 local xdist workers；worker 載入
+  pytest plugins 與 conftest 前重新驗證並載入相同來源，結束還原環境。
+  遠端 worker 不在此來源保證內，selectors、owner 與 deadline 仍由各 repo 擁有。
   已安裝 wheel 的隔離 smoke 保留正常 import，不套用 checkout loader。
 - Wheel smoke 僅複製已安裝 `packaging` distribution 供離線 resolver，禁止借用
   editable source 或整個 development site。此結果不代表 registry-backed clean
