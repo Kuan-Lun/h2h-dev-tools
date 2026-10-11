@@ -132,8 +132,12 @@ they do not import the Python package.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
 from the project manifests. Shared version evaluation considers only commits that
-actually change release surface. Hook installation refuses to replace an existing
-third-party hook directory. Rebuild validates explicit source overrides before
+actually change release surface. Where enabled, `Version-Impact: none` and its
+nonempty `Version-Reason` exempt only their own commit; later release changes
+still require the task's single version bump, and extra candidate changes cannot
+borrow that exemption. Exemptions that cannot be established from a clean
+automatic three-way merge are rejected. Hook installation refuses to replace an
+existing third-party hook directory. Rebuild validates explicit source overrides before
 replacing the environment. Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Both merge strategies use the captured task commit, preserving its branch name
