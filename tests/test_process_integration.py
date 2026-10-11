@@ -14,6 +14,53 @@ import pytest
 from h2h_dev_tools import process
 
 
+def test_windows_supervisor_cannot_run_python_startup_hooks_before_ownership(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "startup-ran"
+    (tmp_path / "sitecustomize.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['STARTUP_MARKER']).touch()\n",
+        encoding="utf-8",
+    )
+    # Even with site disabled, PYTHONPATH must not inject modules imported by
+    # the supervisor itself before the start gate is reached.
+    (tmp_path / "ctypes.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['STARTUP_MARKER']).touch()\n"
+        "raise RuntimeError('unowned environment module ran')\n",
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(tmp_path),
+        "STARTUP_MARKER": str(marker),
+    }
+    phase = process.ProcessCommand(
+        "startup isolation", (sys.executable, "-c", "pass"), tmp_path, environment
+    )
+    command, launch_environment = process._windows_supervisor_launch(phase)
+    # An unopened gate exits without running the command. This also works on
+    # POSIX: the Windows supervisor refuses that platform, after Python startup.
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=launch_environment,
+        input=b"",
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE, result.stderr
+    assert not marker.exists(), "Python startup ran before Job Object assignment"
+
+    # Isolation belongs to the supervisor, not the target: preserve the exact
+    # original Python environment for the command admitted after assignment.
+    assert launch_environment["PYTHONPATH"] == str(tmp_path)
+    assert process.run_command(phase, hard_deadline=time.monotonic() + 10) == 0
+    assert marker.exists()
+
+
 @pytest.mark.parametrize("status", [0, 7])
 def test_command_preserves_cwd_environment_output_and_exit_status(
     tmp_path: Path, status: int

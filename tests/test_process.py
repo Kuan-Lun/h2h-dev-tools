@@ -84,7 +84,7 @@ def test_windows_start_uses_new_process_group_and_inherits_live_output(
     monkeypatch.setattr(
         runner,
         "_windows_supervisor_launch",
-        Mock(return_value=("python", {})),
+        Mock(return_value=(("python",), {})),
     )
 
     owner = runner._start_windows_process(
@@ -311,7 +311,7 @@ def test_windows_start_assigns_job_before_opening_start_gate(
     monkeypatch.setattr(
         runner,
         "_windows_supervisor_launch",
-        Mock(return_value=("python", {})),
+        Mock(return_value=(("python",), {})),
     )
 
     owner = runner._start_windows_process(
@@ -344,7 +344,7 @@ def test_windows_assignment_failure_never_opens_start_gate(
     monkeypatch.setattr(
         runner,
         "_windows_supervisor_launch",
-        Mock(return_value=("python", {})),
+        Mock(return_value=(("python",), {})),
     )
 
     with pytest.raises(runner.ProcessOwnershipError):
@@ -379,7 +379,7 @@ def test_windows_establishment_cleanup_failure_fails_closed(
     monkeypatch.setattr(
         runner,
         "_windows_supervisor_launch",
-        Mock(return_value=("python", {})),
+        Mock(return_value=(("python",), {})),
     )
 
     with pytest.raises(runner.ProcessOwnershipError):
@@ -415,7 +415,7 @@ def test_windows_signal_during_establishment_cleanup_waits_for_receipt(
     monkeypatch.setattr(
         runner,
         "_windows_supervisor_launch",
-        Mock(return_value=("python", {})),
+        Mock(return_value=(("python",), {})),
     )
     cleanup_mock = Mock(side_effect=cleanup)
     monkeypatch.setattr(runner, "_cleanup_windows_supervisor", cleanup_mock)
@@ -442,9 +442,9 @@ def test_windows_venv_launch_uses_base_interpreter(
     monkeypatch.setattr(runner.sys, "_base_executable", str(base), raising=False)
     monkeypatch.setenv("__PYVENV_LAUNCHER__", "must-not-leak")
 
-    executable, environment = runner._windows_supervisor_launch(COMMAND)
+    command, environment = runner._windows_supervisor_launch(COMMAND)
 
-    assert executable == str(base)
+    assert command[0] == str(base)
     assert "__PYVENV_LAUNCHER__" not in environment
 
 
