@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import runpy
 import shutil
 import signal
 import subprocess
@@ -16,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from h2h_dev_tools import bundle_verify, code_review, merge_command
+from h2h_dev_tools import bundle, bundle_verify, code_review, merge_command
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -146,6 +148,28 @@ class ReviewRepository:
         return self.git("rev-parse", "HEAD")
 
 
+def _refresh_snapshot_manifest(repo: ReviewRepository) -> None:
+    """Represent deliberately changed test sources as a valid candidate bundle."""
+    package = (repo.path / repo.implementation).parent
+    manifest = package / "manifest.json"
+    if not manifest.exists():
+        return
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in package.iterdir()
+        if path.suffix in {".py", ".sh"}
+    }
+    if document["files"] == hashes:
+        return
+    document["files"] = hashes
+    document["payload_sha256"] = bundle_verify.payload_digest(hashes)
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    # A closure-change fixture also updates its verifier's component contract.
+    # Check that exact contract, rather than bypassing production validation.
+    runpy.run_path(str(package / "bundle_verify.py"))["verify_bundle"](repo.path)
+
+
 def _make_review_repository(tmp_path: Path, layout: str = "source") -> ReviewRepository:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
@@ -178,9 +202,16 @@ def _make_review_repository(tmp_path: Path, layout: str = "source") -> ReviewRep
     repo.git("config", "user.email", "review@example.invalid")
     repo.git("config", "workflow.primaryBranch", "main")
     package = local / package_parent / "h2h_dev_tools"
-    package.mkdir(parents=True)
-    for name in code_review.REVIEW_FILES:
-        shutil.copy2(ROOT / "src/h2h_dev_tools" / name, package / name)
+    if layout == "snapshot":
+        (local / "pyproject.toml").write_text(
+            "[tool.h2h-dev-tools]\ncomponents = ['code-review']\n",
+            encoding="utf-8",
+        )
+        bundle.sync_bundle(local)
+    else:
+        package.mkdir(parents=True)
+        for name in code_review.REVIEW_FILES:
+            shutil.copy2(ROOT / "src/h2h_dev_tools" / name, package / name)
     (local / "scripts").mkdir(exist_ok=True)
     shutil.copy2(
         ROOT / "scripts/review-merge-candidate.sh",
@@ -349,7 +380,10 @@ def test_review_receipt_does_not_cover_changed_code_policy_or_runner(
     path = repo.path / name
     with path.open("a", encoding="utf-8") as stream:
         stream.write("\n# Candidate changed after review.\n")
+    _refresh_snapshot_manifest(repo)
     repo.git("add", name)
+    if (path.parent / "manifest.json").exists():
+        repo.git("add", str(path.parent.relative_to(repo.path) / "manifest.json"))
     _assert_blocked(repo.review("verify", "--index"))
     assert len(repo.calls()) == 1
 
@@ -603,6 +637,7 @@ def test_review_receipt_binds_executed_shared_bytes_even_for_unchanged_revision(
     implementation = (repo.path / repo.implementation).with_name(implementation_name)
     with implementation.open("a", encoding="utf-8") as stream:
         stream.write("\n# Executed implementation changed without staging.\n")
+    _refresh_snapshot_manifest(repo)
     _assert_blocked(repo.review("verify", "--revision", revision))
     assert len(repo.calls()) == 1
 
@@ -621,6 +656,7 @@ def test_review_closure_changes_follow_the_exported_component_contract(
     verifier.write_text(extended, encoding="utf-8")
     dependency = package / "review_extra.py"
     dependency.write_text("value = 1\n", encoding="utf-8")
+    _refresh_snapshot_manifest(repo)
     repo.git("add", str(package.relative_to(repo.path)))
     _assert_passed(repo.review("run", "--index"))
     _assert_passed(repo.review("verify", "--index"))
@@ -629,6 +665,7 @@ def test_review_closure_changes_follow_the_exported_component_contract(
     # Verify the reviewed candidate without the index workspace guard: the
     # dependency fingerprint itself must reject changed executed source bytes.
     dependency.write_text("value = 2\n", encoding="utf-8")
+    _refresh_snapshot_manifest(repo)
     _assert_blocked(repo.review("verify"))
     assert len(repo.calls()) == 1
 
@@ -1051,7 +1088,10 @@ def test_changed_policy_or_shared_implementation_requires_repository_review(
     )
     with path.open("a", encoding="utf-8") as stream:
         stream.write("\n# Review contract changed.\n")
+    _refresh_snapshot_manifest(repo)
     repo.git("add", str(path.relative_to(repo.path)))
+    if (path.parent / "manifest.json").exists():
+        repo.git("add", str(path.parent.relative_to(repo.path) / "manifest.json"))
     _assert_passed(repo.review("run", "--index"))
     # Use the receipt reported by this subprocess: its changed implementation
     # intentionally has a different executed-bytes digest from this test process.
