@@ -206,7 +206,14 @@ still require the task's single version bump, and extra candidate changes cannot
 borrow that exemption. Exemptions that cannot be established from a clean
 automatic three-way merge are rejected. Hook installation refuses to replace an
 existing third-party hook directory. Rebuild validates explicit source overrides before
-replacing the environment. Merge checks dirty worktrees, in-progress Git operations
+replacing the environment. Relative `--source PACKAGE=SOURCE` paths are resolved
+from the caller's working directory, including when the rebuild script is invoked
+from outside its repository. Local wrappers must preserve that working directory
+while locating the repository. The shared rebuild captures it before changing to
+the repository, then passes it as `--source-base` to the source resolver. The
+repository's `.[dev]` installation, npm and after-build callback still run from
+the repository root; absolute paths, URLs and index sources keep their meaning.
+Merge checks dirty worktrees, in-progress Git operations
 and stable refs; it runs the local candidate review/gate and aborts on failure.
 Primary worktree discovery queries the exact branch with NUL-delimited fields;
 paths containing line breaks are preserved. Repository-local merge, gate and

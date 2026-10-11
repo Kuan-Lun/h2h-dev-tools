@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -13,7 +15,11 @@ _RESOURCES = Path(__file__).resolve().parents[1] / "src/h2h_dev_tools"
 
 
 def _wheel(
-    directory: Path, *, filename: str = "source_example", name: str = "source-example"
+    directory: Path,
+    *,
+    filename: str = "source_example",
+    name: str = "source-example",
+    origin: str = "fixture",
 ) -> Path:
     wheel = directory / f"{filename}-1.0-py3-none-any.whl"
     metadata = f"{filename}-1.0.dist-info"
@@ -27,6 +33,7 @@ def _wheel(
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
         archive.writestr(f"{metadata}/RECORD", "")
+        archive.writestr("source_example.py", f"ORIGIN = {origin!r}\n")
     return wheel
 
 
@@ -249,7 +256,122 @@ def test_local_uri_preserves_url_reserved_path_characters(tmp_path: Path) -> Non
         "git+https://example.invalid/repo.git@ref",
     ],
 )
-def test_index_and_remote_sources_retain_the_requested_package(source: str) -> None:
-    assert source_requirement(f"example={source}") == (
-        "example" if source == "index" else f"example @ {source}"
+def test_index_and_remote_sources_retain_the_requested_package(
+    source: str, tmp_path: Path
+) -> None:
+    expected = "example" if source == "index" else f"example @ {source}"
+    assert source_requirement(f"example={source}") == expected
+    assert source_requirement(f"example={source}", source_base=tmp_path) == expected
+
+
+@pytest.mark.parametrize("entry", ["shared", "local-wrapper"])
+@pytest.mark.parametrize("caller_has_wheel", [True, False])
+def test_rebuild_uses_caller_artifact_instead_of_repository_decoy(
+    environment: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    caller_has_wheel: bool,
+) -> None:
+    monkeypatch.delenv("UV_OFFLINE")
+    monkeypatch.setenv("UV_NO_INDEX", "1")
+    caller = tmp_path / "caller checkout"
+    caller.mkdir()
+    for checkout in (environment, caller):
+        subprocess.run(
+            ("git", "init", "-b", "master", str(checkout)),
+            capture_output=True,
+            check=True,
+        )
+    decoy = _wheel(environment, origin="repository-decoy")
+    expected = caller / decoy.name
+    if caller_has_wheel:
+        assert _wheel(caller, origin="caller-selected") == expected
+    callback = environment / "after-build.py"
+    callback.write_text(
+        "import json\nfrom importlib.metadata import distribution\n"
+        "from pathlib import Path\nimport source_example\n"
+        "package = distribution('source-example')\n"
+        "Path('installed.json').write_text(json.dumps({\n"
+        " 'origin': source_example.ORIGIN, 'version': package.version,\n"
+        " 'direct_url': json.loads(package.read_text('direct_url.json')),\n"
+        " 'cwd': str(Path.cwd())}))\n"
+    )
+    if entry == "local-wrapper":
+        for relative in (
+            "scripts/rebuild-env.sh",
+            "src/h2h_dev_tools/rebuild-env.sh",
+            "src/h2h_dev_tools/resolve-sources.sh",
+            "src/h2h_dev_tools/environment.py",
+        ):
+            target = environment / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_RESOURCES.parents[1] / relative, target)
+        command = ["bash", str(environment / "scripts/rebuild-env.sh")]
+    else:
+        command = [
+            "bash",
+            str(_RESOURCES / "rebuild-env.sh"),
+            str(environment),
+            callback.name,
+        ]
+    result = subprocess.run(
+        [*command, "--source", f"source-example=./{decoy.name}"],
+        cwd=caller,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if not caller_has_wheel:
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert (environment / ".venv/preserve-me").read_text() == (
+            "existing development environment"
+        )
+        assert not (environment / ".npm-ran").exists()
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    if entry == "local-wrapper":
+        python = (
+            environment
+            / ".venv"
+            / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        )
+        subprocess.run(
+            (str(python), callback.name),
+            cwd=environment,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    installed = json.loads((environment / "installed.json").read_text())
+    assert installed["origin"] == "caller-selected"
+    assert installed["version"] == "1.0"
+    assert installed["direct_url"]["url"] == expected.as_uri()
+    assert installed["cwd"] == str(environment)
+    assert (environment / ".npm-ran").exists()
+    assert not (caller / ".venv").exists()
+
+
+@pytest.mark.parametrize("kind", ["wheel", "project", "file-url", "absolute"])
+def test_explicit_source_base_only_resolves_relative_local_sources(
+    tmp_path: Path, kind: str
+) -> None:
+    caller = tmp_path / "caller # directory"
+    caller.mkdir()
+    source = caller / "candidate"
+    if kind == "project":
+        source.mkdir()
+        (source / "pyproject.toml").write_text('[project]\nname="example"\n')
+    else:
+        source.touch()
+    value = {
+        "wheel": "./candidate",
+        "project": "./candidate",
+        "file-url": "file:./candidate",
+        "absolute": str(source),
+    }[kind]
+    prefix = "-e " if kind == "project" else ""
+    assert source_requirement(f"example={value}", source_base=caller) == (
+        f"{prefix}example @ {source.as_uri()}"
     )

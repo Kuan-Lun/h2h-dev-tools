@@ -259,8 +259,10 @@ def test_mutating_entries_never_target_a_truncated_sibling_checkout(
         f"#!{sys.executable}\nfrom pathlib import Path\nPath('.npm-ran').touch()\n"
     )
     npm.chmod(0o755)
-    nested = intended / "nested"
+    nested = (sibling if entry == "rebuild-env.sh" else intended) / "nested"
     nested.mkdir()
+    if entry == "rebuild-env.sh":
+        (nested / "candidate.whl").write_bytes(b"caller-selected fixture source")
     arguments = (
         ("--source", "sample=./candidate.whl") if entry == "rebuild-env.sh" else ()
     )
@@ -312,6 +314,6 @@ def test_mutating_entries_never_target_a_truncated_sibling_checkout(
         assert plans == [
             {
                 "cwd": str(intended),
-                "plan": f"sample @ {(intended / 'candidate.whl').as_uri()}\n-e .[dev]\n",
+                "plan": f"sample @ {(nested / 'candidate.whl').as_uri()}\n-e .[dev]\n",
             }
         ]
