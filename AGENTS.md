@@ -106,6 +106,10 @@
   及適用 profile，檢查前後 candidate 一致；失敗不得產生 merge commit。
 - Full gate 執行 fast、完整離線 pytest、fresh sdist-derived wheel build 及隔離
   installed wheel／CLI smoke。明確手動呼叫 fast/full 不因文件差異而降級。
+- 本 repo 的 pytest 使用 repository-local Python 執行 `scripts/run-pytest.py`
+  並傳入原 pytest arguments；full gate 與 Windows CI 共用此入口。它在 pytest、
+  plugins 與 conftest 載入前建立 checkout source authority，不以 `-B` 取代。
+  已安裝 wheel 的隔離 smoke 保留正常 import，不套用 checkout loader。
 - Wheel smoke 僅複製已安裝 `packaging` distribution 供離線 resolver，禁止借用
   editable source 或整個 development site。此結果不代表 registry-backed clean
   dependency resolution；需要該證據時另以明確 wheels／index 執行並分別回報。
