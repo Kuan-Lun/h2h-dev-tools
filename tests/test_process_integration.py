@@ -14,6 +14,39 @@ import pytest
 from h2h_dev_tools import process
 
 
+@pytest.mark.parametrize("standard_output", [False, True])
+@pytest.mark.parametrize("status", [0, 143])
+@pytest.mark.parametrize("failure", ["closed-pipe", "closed-fd"])
+def test_failed_diagnostic_descriptor_preserves_interpreter_exit_status(
+    tmp_path: Path, standard_output: bool, status: int, failure: str
+) -> None:
+    marker = tmp_path / "completed"
+    script = (
+        "import os\nfrom pathlib import Path\n"
+        "from h2h_dev_tools.process import report_diagnostic\n"
+        + (
+            f"os.close({1 if standard_output else 2})\n"
+            if failure == "closed-fd"
+            else ""
+        )
+        + f"report_diagnostic('diagnostic', standard_output={standard_output!r})\n"
+        f"Path({str(marker)!r}).touch()\n"
+        f"raise SystemExit({status})\n"
+    )
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    with os.fdopen(write_fd, "wb", buffering=0) as closed_pipe:
+        result = subprocess.run(
+            (sys.executable, "-B", "-c", script),
+            stdout=closed_pipe if standard_output else subprocess.PIPE,
+            stderr=subprocess.PIPE if standard_output else closed_pipe,
+            check=False,
+            timeout=10,
+        )
+    assert marker.exists(), "A diagnostic failure interrupted the command"
+    assert result.returncode == status, result.stderr or result.stdout
+
+
 def test_windows_supervisor_cannot_run_python_startup_hooks_before_ownership(
     tmp_path: Path,
 ) -> None:

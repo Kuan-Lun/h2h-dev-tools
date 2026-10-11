@@ -622,12 +622,31 @@ def wait_for_owned_tree_exit(
 def report_diagnostic(message: str, *, standard_output: bool = False) -> None:
     """Keep a failed diagnostic stream from interrupting ownership cleanup."""
 
+    stream = sys.stdout if standard_output else sys.stderr
     try:
-        print(message, file=sys.stdout if standard_output else sys.stderr, flush=True)
+        print(message, file=stream, flush=True)
     except Exception:
         # Diagnostics are secondary to process ownership. Even an unusual stream
         # implementation must not prevent termination, fallback or Job closing.
-        pass
+        try:
+            # A failed TextIOWrapper flush can retain buffered bytes. Merely
+            # catching the error makes interpreter finalization retry it and
+            # replace the real exit status with 120. Retire only the failed
+            # diagnostic descriptor, then drain that buffer into the sink.
+            descriptor = stream.fileno()
+            sink = os.open(os.devnull, os.O_WRONLY)
+            if sink != descriptor:
+                try:
+                    os.dup2(sink, descriptor)
+                finally:
+                    os.close(sink)
+            # If the descriptor was closed, open may have reused that number.
+            # It now belongs to the original stream and must remain open.
+            stream.flush()
+        except Exception:
+            # Custom streams may have no descriptor, or even a working flush.
+            # Their diagnostics must still never interrupt process cleanup.
+            pass
 
 
 def _taskkill_windows_tree(
