@@ -9,13 +9,13 @@ run offline against the code present in that repository's Git tree.
 Use Python 3.14 or newer. Install the package in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools
+python -m pip install h2h-dev-tools==0.3.0
 ```
 
 For an unpublished candidate, install an explicitly supplied wheel instead:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.2.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.3.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -68,6 +68,7 @@ current-closure checks; none executes a compatibility fallback or downloads a wh
 | `distribution-check` | Installed requirements, RECORD and import-origin validation |
 | `offline-wheel` | Temporary candidate-wheel environment with development dependencies and a local smoke callback |
 | `process` | Owned process trees, deadlines, signal deferral and Windows Job start gates |
+| `git-environment` | Isolate test children from inherited Git hook repository authority |
 | `formal` | Pinned TLC download and offline host/Docker execution |
 | `code-review` | Exact-candidate Codex review and offline evidence verification |
 
@@ -97,6 +98,34 @@ or an installed copy of the tool:
 ```bash
 python scripts/_shared/h2h_dev_tools/bundle_verify.py --repository .
 ```
+
+Python consumer entry points must source-bootstrap before their first shared
+import (also before `runpy.run_module`):
+
+```python
+import runpy
+import sys
+from pathlib import Path
+
+repository = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(repository / "scripts"))
+package = repository / "scripts/_shared/h2h_dev_tools"
+runpy.run_path(str(package / "source_loader.py"))["load_package"](
+    package, "_shared.h2h_dev_tools"
+)
+```
+
+This entry verifies the complete snapshot and directly compiles the verified
+source bytes, including the package initializer and relative imports. Python
+bytecode caches may exist but are never executed by this loader; `-B` alone only
+prevents new cache writes. Repeated bootstrap of the same namespace, directory
+and bytes preserves existing module and class identity. A changed source set,
+conflicting directory or package imported before bootstrap is rejected; start a
+fresh process after an update. The namespace's parent remains repository-owned.
+Toolkit checkout development uses its `scripts/*.py` source entries, including
+editable environments. Snapshot synchronization uses a CLI installed from an
+explicit immutable release or candidate wheel, not an editable CLI. Ordinary
+installed-wheel imports retain Python's standard import/cache behavior.
 
 The manifest detects changed or incomplete source files; it is not a signature
 or proof of the publisher's identity. Review the package source and consumer diff
@@ -129,6 +158,15 @@ checks, adapter tests, pytest selectors, timeout budgets, formal targets and
 deployment acceptance remain owned by their original repositories. Primary-branch
 detection, hook installation and environment rebuild run before a `.venv` exists;
 they do not import the Python package.
+
+Test launchers select the `git-environment` component and call
+`without_local_git_environment(environment, repository=repository_root)` when
+building a test child's environment. Shell entry points can execute
+`python scripts/_shared/h2h_dev_tools/git_environment.py --repository ROOT -- COMMAND`.
+Both use Git's `rev-parse --local-env-vars` inventory, reject failed or malformed
+queries and preserve other environment values. The CLI replaces itself with the
+test command under the existing process owner. Apply this only to test children:
+gate checks before and after pytest must retain the real candidate's Git environment.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
 from the project manifests. Adding, changing or removing only the `dev` optional

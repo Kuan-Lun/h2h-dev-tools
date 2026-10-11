@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Review this repository with its authoritative shared implementation."""
 
-import sys
+import runpy
 from pathlib import Path
 
 
 def main() -> None:
     repository = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(repository / "src"))
+    package = repository / "src/h2h_dev_tools"
+    runpy.run_path(str(package / "source_loader.py"))["load_package"](
+        package, "h2h_dev_tools"
+    )
     from h2h_dev_tools.code_review import main as review
 
     review(repository)

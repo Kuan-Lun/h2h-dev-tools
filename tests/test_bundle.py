@@ -47,6 +47,7 @@ def test_component_selection_removes_only_verified_generated_files(
     assert set(manifest["files"]) == {
         "__init__.py",
         "bundle_verify.py",
+        "source_loader.py",
         "documentation.py",
         "change_scope.py",
     }
@@ -81,6 +82,9 @@ def test_v1_conversion_is_explicit_and_preserves_unmanaged_content(
     legacy = json.loads(path.read_bytes())
     legacy["schema_version"] = 1
     del legacy["components"]
+    del legacy["files"]["source_loader.py"]
+    (path.parent / "source_loader.py").unlink()
+    legacy["payload_sha256"] = payload_digest(legacy["files"])
     path.write_text(json.dumps(legacy))
     local = consumer / "scripts/private.py"
     local.write_text("keep this unrelated tool\n")
@@ -101,6 +105,9 @@ def test_v1_conversion_rejects_modified_source_without_writing(consumer: Path) -
     legacy = json.loads(path.read_bytes())
     legacy["schema_version"] = 1
     del legacy["components"]
+    del legacy["files"]["source_loader.py"]
+    (path.parent / "source_loader.py").unlink()
+    legacy["payload_sha256"] = payload_digest(legacy["files"])
     path.write_text(json.dumps(legacy))
     (path.parent / "dependency_manifest.py").write_text("private edits\n")
     before = _snapshot(consumer)
@@ -742,3 +749,22 @@ def test_unrecognized_cache_entries_are_rejected_without_modification(
     with pytest.raises(BundleError, match="cache"):
         operation(consumer)
     assert _snapshot(consumer) == before
+
+
+def test_previous_wheel_upgrade_adds_new_base_helper(
+    consumer: Path,
+) -> None:
+    directory = consumer / BUNDLE_DIRECTORY
+    path = directory / MANIFEST_NAME
+    manifest = json.loads(path.read_bytes())
+    del manifest["files"]["source_loader.py"]
+    (directory / "source_loader.py").unlink()
+    manifest["payload_sha256"] = payload_digest(manifest["files"])
+    path.write_text(json.dumps(manifest))
+    wheel = _write_previous_wheel(
+        consumer, {name: (directory / name).read_bytes() for name in manifest["files"]}
+    )
+    with pytest.raises(BundleError, match="complete source file set"):
+        verify_bundle(consumer)
+    assert bundle.sync_bundle(consumer, previous_wheel=wheel)
+    assert "source_loader.py" in verify_bundle(consumer)["files"]

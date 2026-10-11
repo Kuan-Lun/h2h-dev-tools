@@ -187,11 +187,12 @@ def _make_review_repository(tmp_path: Path, layout: str = "source") -> ReviewRep
         local / "scripts/review-merge-candidate.sh",
     )
     (local / "scripts/review-code.py").write_text(
-        "import sys\n"
+        "import runpy, sys\n"
         "from pathlib import Path\n"
         "sys.dont_write_bytecode = True\n"
         "root = Path(__file__).resolve().parents[1]\n"
-        f"sys.path.insert(0, str(root / {package_parent!r}))\n"
+        f"package = root / {package_parent!r} / 'h2h_dev_tools'\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
         "from h2h_dev_tools.code_review import main\n"
         "main(root)\n",
         encoding="utf-8",

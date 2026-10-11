@@ -19,6 +19,11 @@
   Consumer 的 generated snapshot 必須由 `h2h-dev-tools sync` 產生，禁止手改。
 - Consumer hooks 使用納入自身 Git tree 的 snapshot，離線驗證完整 payload 與
   manifest；不得以任意 sibling checkout 或已安裝的最新版替換 candidate 工具。
+- Python source entry 必須以 `runpy.run_path` 執行 `source_loader.py`，再呼叫
+  `load_package`；snapshot 核驗後直接編譯 source，不可用普通 import 或 `-B`
+  代替來源載入。相同 namespace／路徑／來源重入保留 module identity；來源改變
+  必須啟動新程序。本 repo 自用 scripts 同樣使用此入口；sync 使用明確版本或
+  candidate wheel 的標準 CLI，不以 editable CLI 作為快照來源權威。
 - Snapshot 更新是明確動作，不可在 hooks、一般 pytest 或 merge gate 中下載、
   安裝、同步或自動修正檔案。產物來源版本及 payload hash 必須可驗證。
 - Consumer 在 `[tool.h2h-dev-tools].components` 明列使用的機制；generator

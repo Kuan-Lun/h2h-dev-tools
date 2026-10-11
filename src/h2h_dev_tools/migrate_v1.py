@@ -15,10 +15,10 @@ from .bundle_verify import (
     MANIFEST_NAME,
     BundleError,
     BundleManifest,
+    _manifest_fields,
     _reject_duplicate_keys,
     bundle_directory,
     regular_bytes,
-    validate_manifest,
     verify_payload,
 )
 
@@ -52,7 +52,20 @@ def _legacy_manifest(repository: Path) -> BundleManifest:
         "documentation",
         "publish-version",
     ]
-    return verify_payload(repository, validate_manifest(document))
+    manifest = _manifest_fields(document)
+    # Schema 1 has a fixed historical payload, independent of the current
+    # component graph. New base helpers are added only by the replacement.
+    if set(manifest["files"]) != {
+        "__init__.py",
+        "bundle_verify.py",
+        "change_scope.py",
+        "ci_dependencies.py",
+        "dependency_manifest.py",
+        "documentation.py",
+        "publish_version.py",
+    }:
+        raise BundleError("Schema-1 bundle must declare its complete source file set")
+    return verify_payload(repository, manifest)
 
 
 def migrate_v1(repository: Path) -> bool:

@@ -139,6 +139,21 @@ print(installed.version)
             str(consumer),
             cwd=scratch,
         )
+        run(
+            str(python),
+            "-I",
+            "-B",
+            "-c",
+            "import runpy, sys; from pathlib import Path; "
+            "root = Path(sys.argv[1]); sys.path.insert(0, str(root / 'scripts')); "
+            "package = root / 'scripts/_shared/h2h_dev_tools'; "
+            "runpy.run_path(str(package / 'source_loader.py'))['load_package']("
+            "package, '_shared.h2h_dev_tools'); "
+            "from _shared.h2h_dev_tools import process; "
+            "assert Path(process.__file__).parent == package",
+            str(consumer),
+            cwd=scratch,
+        )
         if arguments.output_directory is not None:
             output = arguments.output_directory.resolve()
             output.mkdir(parents=True, exist_ok=True)

@@ -23,7 +23,6 @@ from packaging.utils import (
 )
 
 from .bundle_verify import (
-    BASE_FILES,
     MANIFEST_NAME,
     BundleError,
     BundleManifest,
@@ -39,6 +38,10 @@ from .bundle_verify import (
     verify_bundle,
     verify_payload,
 )
+
+# Ownership anchors identify the historical snapshot format, not the current
+# dependency closure: a new base helper must not make old wheel upgrades unsafe.
+_OWNERSHIP_ANCHORS = frozenset({"__init__.py", "bundle_verify.py"})
 
 
 def _source_payload(components: list[str]) -> tuple[dict[str, bytes], BundleManifest]:
@@ -117,7 +120,7 @@ def _previous_source(wheel: Path) -> _PreviousSource:
                         "Previous wheel source must contain regular files"
                     )
                 files[filename] = hashlib.sha256(archive.read(entry)).hexdigest()
-            if not BASE_FILES <= files.keys():
+            if not _OWNERSHIP_ANCHORS <= files.keys():
                 raise BundleError(
                     "Previous wheel is missing the source bundle base files"
                 )
@@ -149,7 +152,7 @@ def _verify_previous_bundle(
     manifest = _manifest_fields(document)
     if manifest["toolkit_version"] != source.version:
         raise BundleError("Previous wheel version does not match the existing bundle")
-    if not BASE_FILES <= manifest["files"].keys() or any(
+    if not _OWNERSHIP_ANCHORS <= manifest["files"].keys() or any(
         source.files.get(name) != digest for name, digest in manifest["files"].items()
     ):
         raise BundleError(

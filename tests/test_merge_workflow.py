@@ -15,12 +15,14 @@ import pytest
 from h2h_dev_tools import bundle_verify, merge_command, process
 
 _ROOT = Path(__file__).resolve().parents[1]
-_REVIEWER = """import subprocess
+_REVIEWER = """import runpy
+import subprocess
 import sys
 from pathlib import Path
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(root / "src"))
+package = root / "src/h2h_dev_tools"
+runpy.run_path(str(package / "source_loader.py"))["load_package"](package, "h2h_dev_tools")
 from h2h_dev_tools.code_review import main
 
 def git(*args):

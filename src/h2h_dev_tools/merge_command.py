@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import runpy
 import sys
 import tempfile
 import time
@@ -304,7 +305,10 @@ def main() -> int:
 if __name__ == "__main__":
     # The shell copies the source closure before switching to primary. Give its
     # directly executed entry the same relative imports as packaged/snapshot use.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    package = Path(__file__).resolve().parent
+    runpy.run_path(str(package / "source_loader.py"))["load_package"](
+        package, "h2h_dev_tools"
+    )
     __package__ = "h2h_dev_tools"
     if sys.argv[1:] == ["--print-source-files"]:
         print("\n".join(owner_source_files()))
