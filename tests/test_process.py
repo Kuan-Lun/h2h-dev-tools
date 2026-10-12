@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import io
+import os
 import signal
 import stat
 import subprocess
@@ -884,19 +885,30 @@ def test_diagnostic_failure_cannot_skip_teardown_or_job_close(
 
 
 @pytest.mark.parametrize("standard_output", [False, True])
-@pytest.mark.parametrize("binary_capture", [False, True])
+@pytest.mark.parametrize(
+    ("binary_capture", "newline"),
+    [(False, "\n"), (True, None), (True, "\n"), (True, "\r\n")],
+    ids=["string", "native", "lf", "crlf"],
+)
 def test_diagnostics_preserve_memory_only_capture(
-    monkeypatch: pytest.MonkeyPatch, standard_output: bool, binary_capture: bool
+    monkeypatch: pytest.MonkeyPatch,
+    standard_output: bool,
+    binary_capture: bool,
+    newline: str | None,
 ) -> None:
     binary = io.BytesIO()
     stream = (
-        io.TextIOWrapper(binary, encoding="utf-8") if binary_capture else io.StringIO()
+        io.TextIOWrapper(binary, encoding="utf-8", newline=newline)
+        if binary_capture
+        else io.StringIO()
     )
     with monkeypatch.context() as capture:
         capture.setattr(runner.sys, "stdout" if standard_output else "stderr", stream)
         runner.report_diagnostic("清理已完成 ✓", standard_output=standard_output)
     if binary_capture:
-        assert binary.getvalue().decode("utf-8") == "清理已完成 ✓\n"
+        # Native text streams retain their configured newline translation.
+        terminator = os.linesep if newline is None else newline
+        assert binary.getvalue() == f"清理已完成 ✓{terminator}".encode()
     else:
         assert isinstance(stream, io.StringIO)
         assert stream.getvalue() == "清理已完成 ✓\n"
@@ -963,11 +975,12 @@ class _NativeDiagnosticCapture(io.TextIOWrapper):
 
 
 @pytest.mark.parametrize("mode", [stat.S_IFREG, stat.S_IFCHR])
+@pytest.mark.parametrize("newline", [None, "\n", "\r\n"], ids=["native", "lf", "crlf"])
 def test_windows_regular_and_console_diagnostics_keep_native_text_encoding(
-    monkeypatch: pytest.MonkeyPatch, mode: int
+    monkeypatch: pytest.MonkeyPatch, mode: int, newline: str | None
 ) -> None:
     buffer = io.BytesIO()
-    sink = _NativeDiagnosticCapture(buffer, encoding="utf-16-le")
+    sink = _NativeDiagnosticCapture(buffer, encoding="utf-16-le", newline=newline)
     native = SimpleNamespace(
         name="nt",
         fstat=Mock(return_value=SimpleNamespace(st_mode=mode)),
@@ -980,7 +993,8 @@ def test_windows_regular_and_console_diagnostics_keep_native_text_encoding(
         capture.setattr(runner.sys, "stderr", sink)
         runner.report_diagnostic("清理已完成 ✓")
 
-    assert buffer.getvalue().decode("utf-16-le") == "清理已完成 ✓\n"
+    terminator = os.linesep if newline is None else newline
+    assert buffer.getvalue() == f"清理已完成 ✓{terminator}".encode("utf-16-le")
     native.get_blocking.assert_not_called()
     native.set_blocking.assert_not_called()
     native.write.assert_not_called()
