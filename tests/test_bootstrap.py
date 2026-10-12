@@ -157,6 +157,8 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
             "from pathlib import Path\n"
             "with open(os.environ['BOOTSTRAP_LOG'], 'a') as stream:\n"
             "    stream.write(json.dumps(sys.argv) + '\\n')\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            "    print('uv 0.13.0')\n"
             "if sys.argv[1:2] == ['venv']:\n"
             f"    python = Path(sys.argv[-1]) / {python_layout!r}\n"
             "    python.parent.mkdir(parents=True)\n"
@@ -189,6 +191,7 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
     )
     assert result.returncode == 0, result.stderr
     commands = [json.loads(line)[1:] for line in log.read_text().splitlines()]
+    assert commands.pop(0) == ["--version"]
     assert commands[0][:3] == ["venv", "--python", "3.14"]
     assert commands[1][:3] == ["pip", "compile", "--python"]
     assert commands[2:] == [
@@ -211,7 +214,7 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
         ],
     ]
     assert Path(str(log) + ".requirements").read_text() == (
-        f"-e example @ {source.as_uri()}\n-e .[dev]\n"
+        f"example @ {source.as_uri()}\n-e .[dev]\n"
     )
     if with_callback:
         assert json.loads((root / "callback.json").read_text()) == [
