@@ -219,6 +219,17 @@ while locating the repository. The shared rebuild captures it before changing to
 the repository, then passes it as `--source-base` to the source resolver. The
 repository's `.[dev]` installation, npm and after-build callback still run from
 the repository root; absolute paths, URLs and index sources keep their meaning.
+Environment rebuilds require uv 0.13.0 or newer, verified before creating or
+replacing an environment. uv 0.10.12 mishandles encoded local project paths
+containing `#` or `%`; 0.13.0 is the verified baseline for this rebuild workflow.
+Upgrade uv before rerunning the rebuild command.
+Local dependency checkouts supplied through `--source` are built and installed
+as ordinary distributions, so their imports and metadata satisfy installed-wheel
+verification. Unlike the editable installation of this repository itself, edits
+to a dependency checkout take effect only after rebuilding the environment.
+This replaces the automatic editable dependency installation from versions before
+0.4; existing environments can be converted by rerunning the same rebuild command.
+No application data conversion or deletion is needed.
 Repository path changes use command-local `CDPATH=` so an interactive shell's
 search paths cannot redirect tooling or contaminate machine-readable output.
 The caller's environment remains available to invoked commands and callbacks.

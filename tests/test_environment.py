@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -61,7 +62,12 @@ def environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         encoding="utf-8",
     )
     original = root / ".venv"
-    original.mkdir()
+    subprocess.run(
+        (sys.executable, "-m", "venv", "--without-pip", str(original)),
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
     (original / "preserve-me").write_text("existing development environment")
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("UV_OFFLINE", "1")
@@ -176,12 +182,14 @@ def test_real_uv_rejects_metadata_that_disagrees_with_named_source(
     assert "source-example" in result.stderr
 
 
-def test_local_project_remains_editable(environment: Path) -> None:
+def test_local_dependency_project_resolves_to_a_normal_install(
+    environment: Path,
+) -> None:
     result = _resolve(environment, f"environment-fixture={environment}")
     assert result.returncode == 0, result.stdout + result.stderr
     assert (
         environment / "requirements.in"
-    ).read_text() == f"-e environment-fixture @ {environment.as_uri()}\n"
+    ).read_text() == f"environment-fixture @ {environment.as_uri()}\n"
 
 
 @pytest.mark.parametrize(
@@ -202,6 +210,7 @@ def test_rejects_invalid_or_multiline_assignments(assignment: str) -> None:
 def test_validated_sources_install_without_a_preexisting_python_environment(
     environment: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    shutil.rmtree(environment / ".venv")
     monkeypatch.delenv("UV_OFFLINE")
     monkeypatch.setenv("UV_NO_INDEX", "1")
     wheel = _wheel(environment)
@@ -373,7 +382,175 @@ def test_explicit_source_base_only_resolves_relative_local_sources(
         "file-url": "file:./candidate",
         "absolute": str(source),
     }[kind]
-    prefix = "-e " if kind == "project" else ""
     assert source_requirement(f"example={value}", source_base=caller) == (
-        f"{prefix}example @ {source.as_uri()}"
+        f"example @ {source.as_uri()}"
     )
+
+
+def _buildable_project(
+    directory: Path, name: str, requires: tuple[str, ...] = ()
+) -> Path:
+    directory.mkdir(exist_ok=True)
+    module = name.replace("-", "_")
+    (directory / "pyproject.toml").write_text(
+        '[build-system]\nrequires=[]\nbuild-backend="fixture_backend"\nbackend-path=["."]\n'
+        f'[project]\nname="{name}"\nversion="1.0"\ndependencies={json.dumps(requires)}\n'
+        "[project.optional-dependencies]\ndev=[]\n",
+        encoding="utf-8",
+    )
+    source = directory / f"{module}.py"
+    source.write_text("ORIGIN = 'initial checkout'\n", encoding="utf-8")
+    (directory / "fixture_backend.py").write_text(
+        "from pathlib import Path\nimport base64, csv, hashlib, io, tomllib, zipfile\n"
+        "ROOT = Path(__file__).parent\n"
+        "def _build(destination, editable):\n"
+        "    project = tomllib.loads((ROOT / 'pyproject.toml').read_text())['project']\n"
+        "    name = project['name'].replace('-', '_')\n"
+        "    prefix = name + '-1.0.dist-info/'\n"
+        "    metadata = 'Metadata-Version: 2.3\\nName: ' + project['name'] + '\\nVersion: 1.0\\nProvides-Extra: dev\\n'\n"
+        "    metadata += ''.join('Requires-Dist: ' + item + '\\n' for item in project['dependencies'])\n"
+        "    files = {prefix + 'METADATA': metadata.encode(), prefix + 'WHEEL': b'Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n'}\n"
+        "    if editable:\n"
+        "        files[name + '.pth'] = (str(ROOT) + '\\n').encode()\n"
+        "    else:\n"
+        "        files[name + '.py'] = (ROOT / (name + '.py')).read_bytes()\n"
+        "    record = io.StringIO(newline='')\n"
+        "    writer = csv.writer(record)\n"
+        "    for path, data in files.items():\n"
+        "        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()\n"
+        "        writer.writerow((path, 'sha256=' + digest, len(data)))\n"
+        "    writer.writerow((prefix + 'RECORD', '', ''))\n"
+        "    files[prefix + 'RECORD'] = record.getvalue().encode()\n"
+        "    wheel = name + '-1.0-py3-none-any.whl'\n"
+        "    with zipfile.ZipFile(Path(destination) / wheel, 'w') as archive:\n"
+        "        for path, data in files.items():\n"
+        "            archive.writestr(path, data)\n"
+        "    return wheel\n"
+        "def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):\n"
+        "    return _build(wheel_directory, False)\n"
+        "def build_editable(wheel_directory, config_settings=None, metadata_directory=None):\n"
+        "    return _build(wheel_directory, True)\n",
+        encoding="utf-8",
+    )
+    return source
+
+
+@pytest.mark.parametrize("file_uri", (False, True))
+def test_rebuild_installs_local_dependency_as_distribution_and_own_repo_editable(
+    environment: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_uri: bool,
+) -> None:
+    # Rebuild requests fresh artifacts; uv rejects --refresh with UV_OFFLINE.
+    # No-index plus the stdlib-only backend keeps these installs network-free.
+    monkeypatch.delenv("UV_OFFLINE")
+    monkeypatch.setenv("UV_NO_INDEX", "1")
+    own_source = _buildable_project(
+        environment, "environment-fixture", ("source-example>=1",)
+    )
+    dependency = tmp_path / "dependency checkout # with %"
+    dependency_source = _buildable_project(dependency, "source-example")
+    source = dependency.as_uri() if file_uri else str(dependency)
+    result = subprocess.run(
+        (
+            "bash",
+            str(_RESOURCES / "rebuild-env.sh"),
+            str(environment),
+            "",
+            "--source",
+            f"source-example={source}",
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    python = (
+        environment
+        / ".venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    )
+    probe = (
+        "import importlib.metadata as metadata, json, sys\n"
+        "from pathlib import Path\n"
+        "import source_example, environment_fixture\n"
+        "def describe(name, module):\n"
+        "    package = metadata.distribution(name)\n"
+        "    return {'version': package.version, 'module': str(Path(module.__file__).resolve()),\n"
+        "        'origin': module.ORIGIN, 'metadata': str(Path(package.locate_file('')).resolve()),\n"
+        "        'direct_url': json.loads(package.read_text('direct_url.json')),\n"
+        "        'files': [str(item) for item in package.files]}\n"
+        "print(json.dumps({'prefix': str(Path(sys.prefix).resolve()),\n"
+        "    'dependency': describe('source-example', source_example),\n"
+        "    'own': describe('environment-fixture', environment_fixture)}))\n"
+    )
+
+    def installed() -> dict[str, object]:
+        output = subprocess.run(
+            (str(python), "-I", "-B", "-c", probe),
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        return json.loads(output.stdout)  # type: ignore[no-any-return]  # JSON object from the isolated probe.
+
+    first = installed()
+    dependency_info = first["dependency"]
+    own_info = first["own"]
+    assert isinstance(dependency_info, dict) and isinstance(own_info, dict)
+    assert dependency_info["version"] == own_info["version"] == "1.0"
+    assert dependency_info["direct_url"] == {
+        "url": dependency.as_uri(),
+        "dir_info": {},
+    }
+    assert own_info["direct_url"] == {
+        "url": environment.as_uri(),
+        "dir_info": {"editable": True},
+    }
+    assert Path(dependency_info["module"]).is_relative_to(Path(str(first["prefix"])))
+    assert Path(dependency_info["metadata"]).is_relative_to(Path(str(first["prefix"])))
+    assert "source_example.py" in dependency_info["files"]
+    assert Path(own_info["module"]) == own_source
+    dependency_source.write_text("ORIGIN = 'modified dependency checkout'\n")
+    own_source.write_text("ORIGIN = 'modified own editable checkout'\n")
+    second = installed()
+    dependency_info, own_info = second["dependency"], second["own"]
+    assert isinstance(dependency_info, dict) and isinstance(own_info, dict)
+    assert dependency_info["origin"] == "initial checkout"
+    assert own_info["origin"] == "modified own editable checkout"
+
+
+@pytest.mark.parametrize("version", ("uv 0.10.12", "uv 0.12.99", "unrecognized output"))
+def test_unsupported_uv_preserves_existing_environment_before_any_uv_mutation(
+    environment: Path, tmp_path: Path, version: str
+) -> None:
+    executable = tmp_path / "bin/uv"
+    executable.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >> "$0.calls"\n'
+        'if [[ "$*" == --version ]]; then\n'
+        f"    printf '%s\\n' '{version}'\n"
+        "else\n"
+        "    exit 97\n"
+        "fi\n"
+    )
+    executable.chmod(0o755)
+    result = subprocess.run(
+        ("bash", str(_RESOURCES / "rebuild-env.sh"), str(environment), ""),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "uv >=0.13.0 is required" in result.stderr
+    assert executable.with_suffix(".calls").read_text() == "--version\n"
+    assert (environment / ".venv/preserve-me").read_text() == (
+        "existing development environment"
+    )
+    assert not (environment / ".npm-ran").exists()
