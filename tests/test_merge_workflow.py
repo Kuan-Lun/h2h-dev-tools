@@ -158,6 +158,7 @@ def test_selected_merge_component_exports_the_complete_owner(
         (
             sys.executable,
             "-I",
+            "-S",
             "-B",
             str(package / "merge_command.py"),
             "--print-source-files",
@@ -1249,7 +1250,7 @@ def test_merge_only_aborts_after_owned_cleanup_is_proven(
         assert "process cleanup unproven" not in result.stderr
     else:
         assert git(root, "branch", "--show-current") == "master"
-        assert "process cleanup unproven; candidate and task retained" in result.stderr
+        assert "git-flow-merge: process cleanup unproven" not in result.stderr
 
 
 @pytest.mark.parametrize("exit_status", [0, 1, 125])
@@ -1283,7 +1284,7 @@ def test_launcher_unexpected_exit_without_receipt_preserves_candidate(
     assert git(root, "rev-parse", "task") == task
     assert git(root, "branch", "--show-current") == "master"
     assert (root / ".git/MERGE_HEAD").exists()
-    assert "process cleanup unproven; candidate and task retained" in result.stderr
+    assert "git-flow-merge: process cleanup unproven" not in result.stderr
 
 
 _BLOCKING_GATE = r"""import fcntl
@@ -1525,7 +1526,7 @@ def test_workflow_stops_mutating_after_unproven_stage_cleanup(
         timeout=20,
     )
     assert result.returncode != 0, result.stdout + result.stderr
-    assert "process cleanup unproven" in result.stderr
+    assert "git-flow-merge: process cleanup unproven" not in result.stderr
     commands = [json.loads(line) for line in events.read_text().splitlines()]
     assert commands[-1][-len(command) :] == list(command)
     assert git(root, "rev-parse", "task") == task
@@ -1805,7 +1806,10 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
                     git(root, "merge", "--no-ff", "--no-commit", "task")
                 else:
                     assert (root / ".git/MERGE_HEAD").exists()
-                    assert "process cleanup unproven" in (state / "output").read_text()
+                    assert (
+                        "git-flow-merge: process cleanup unproven"
+                        not in (state / "output").read_text()
+                    )
                 verify_arguments = ("--index",)
             verification = subprocess.run(
                 (sys.executable, "scripts/review-code.py", "verify", *verify_arguments),
@@ -2009,6 +2013,15 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
             wrapper.wait(timeout=5)
 
 
+def _assert_interrupted_workflow_cleanup(
+    owner: process.OwnedProcess, output: str, *, deadline: float
+) -> None:
+    assert "process cleanup unproven" not in output, output
+    assert "cleanup could not be proven" not in output, output
+    assert process.wait_for_owned_tree_exit(owner, deadline=deadline), output
+    assert process.close_owner(owner, deadline=deadline), output
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX process signals")
 @pytest.mark.parametrize("strategy", ["direct", "candidate"])
 @pytest.mark.parametrize("committed", [False, True])
@@ -2077,61 +2090,80 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
     git(root, "add", ".")
     git(root, "commit", "-m", "test: install blocking gate")
     task = git(root, "rev-parse", "HEAD")
-    wrapper = subprocess.Popen(
-        (
-            "bash",
-            str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
-            str(root),
-            strategy,
-            "scripts/review-merge-candidate.sh" if strategy == "candidate" else "",
-        ),
-        cwd=root,
-        env=os.environ | {"MERGE_INTERRUPTION_STATE": str(state)},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        deadline = time.monotonic() + 20
-        while not (state / "ready").exists():
-            assert wrapper.poll() is None, wrapper.communicate()[0]
-            assert time.monotonic() < deadline, "The gate descendant never started"
-            time.sleep(0.01)
-        if committed:
-            assert git(root, "rev-parse", "master") != base
-        if not handoff_signal:
-            wrapper.send_signal(signal.SIGTERM)
-        time.sleep(0.05)
-        # A repeated cancellation must not interrupt the first teardown.
-        wrapper.send_signal(signal.SIGTERM)
+    deadline = time.monotonic() + 25
+    with process.controlled_termination_signals() as controller:
+        with controller.defer():
+            owner = process.start_owned_process(
+                process.ProcessCommand(
+                    "merge interruption fixture",
+                    (
+                        "bash",
+                        str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
+                        str(root),
+                        strategy,
+                        "scripts/review-merge-candidate.sh"
+                        if strategy == "candidate"
+                        else "",
+                    ),
+                    root,
+                    environment=os.environ | {"MERGE_INTERRUPTION_STATE": str(state)},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                ),
+                deadline=deadline,
+                signal_controller=controller,
+            )
+        wrapper = owner.process
+        clean = False
         try:
-            output, _ = wrapper.communicate(timeout=15)
-        except subprocess.TimeoutExpired:
-            pytest.fail("TERM did not stop the merge gate and its owned descendants")
-        assert wrapper.returncode == 143, output
-        _assert_gate_lock_released(state / "leader-lock")
-        _assert_gate_lock_released(state / "child-lock")
-        assert not (root / ".git/MERGE_HEAD").exists()
-        assert git(root, "rev-parse", "task") == task
-        if committed:
-            assert git(root, "branch", "--show-current") == "master"
-            parents = git(root, "show", "-s", "--format=%P", "master").split()
-            assert parents == [base, task]
-        else:
-            assert git(root, "branch", "--show-current") == "task"
-            assert git(root, "rev-parse", "master") == base
-        assert git(root, "status", "--porcelain") == ""
-    finally:
-        groups = {wrapper.pid}
-        for group_path in state.glob("*group"):
-            groups.add(int(group_path.read_text()))
-        for group in groups:
+            while not (state / "ready").exists():
+                assert wrapper.poll() is None, wrapper.communicate()[0]
+                assert time.monotonic() < deadline - 6, (
+                    "The gate descendant never started"
+                )
+                time.sleep(0.01)
+            if committed:
+                assert git(root, "rev-parse", "master") != base
+            if not handoff_signal:
+                wrapper.send_signal(signal.SIGTERM)
+            time.sleep(0.05)
+            wrapper.send_signal(signal.SIGTERM)
             try:
-                os.killpg(group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        wrapper.communicate(timeout=5)
+                raw_output, _ = wrapper.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                pytest.fail(
+                    "TERM did not stop the merge gate and its owned descendants"
+                )
+            output = raw_output.decode("utf-8", errors="replace")
+            (state / "wrapper-output.txt").write_text(output)
+            (state / "wrapper-returncode.txt").write_text(str(wrapper.returncode))
+            assert wrapper.returncode == 143, output
+            # Exit 143 and released file locks do not prove that each cooperating
+            # owner discharged its obligation. Verify before any fixture rescue.
+            _assert_interrupted_workflow_cleanup(owner, output, deadline=deadline)
+            clean = True
+            _assert_gate_lock_released(state / "leader-lock")
+            _assert_gate_lock_released(state / "child-lock")
+            assert not (root / ".git/MERGE_HEAD").exists(), output
+            assert git(root, "rev-parse", "task") == task
+            if committed:
+                assert git(root, "branch", "--show-current") == "master"
+                parents = git(root, "show", "-s", "--format=%P", "master").split()
+                assert parents == [base, task]
+            else:
+                assert git(root, "branch", "--show-current") == "task"
+                assert git(root, "rev-parse", "master") == base
+            assert git(root, "status", "--porcelain") == ""
+        finally:
+            if not clean:
+                # Rescue is never a passing oracle. Retain an uncertain ledger;
+                # force-killing its owner cannot manufacture nested cleanup proof.
+                with controller.defer():
+                    empty = process.terminate_owned_tree(owner, deadline=deadline)
+                    closed = process.close_owner(owner, deadline=deadline)
+                    assert empty and closed, "Fixture cleanup remains unproven"
+            if wrapper.stdout is not None:
+                wrapper.stdout.close()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
@@ -2198,3 +2230,310 @@ def test_failed_gate_recovers_without_waiting_for_diagnostic_reader(
         if wrapper.poll() is None:
             os.killpg(wrapper.pid, signal.SIGKILL)
         wrapper.communicate(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real isolated shell diagnostic entry")
+@pytest.mark.parametrize("failure", ["ownership", "exit-zero", "exit-125"])
+def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
+    tmp_path: Path, failure: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=False)
+    calls = tmp_path / "diagnostic-calls"
+    commands = tmp_path / "commands.jsonl"
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    source = root / "src/h2h_dev_tools/process.py"
+    outcome = {
+        "ownership": "raise ProcessOwnershipError('fixture diagnostic cleanup unproven')",
+        "exit-zero": "raise SystemExit(0)",
+        "exit-125": "raise SystemExit(125)",
+    }[failure]
+    source.write_text(
+        source.read_text()
+        + "\n_original_run_command = run_command\n"
+        + "def run_command(phase, **kwargs):\n"
+        + "    import json\n"
+        + f"    with open({str(commands)!r}, 'a') as events:\n"
+        + "        events.write(json.dumps(phase.argv) + '\\n')\n"
+        + "    return _original_run_command(phase, **kwargs)\n"
+        + "_original_report_diagnostic = report_diagnostic\n"
+        + "def report_diagnostic(message, **kwargs):\n"
+        + "    if message.startswith('git-flow-merge:'):\n"
+        + f"        with open({str(calls)!r}, 'a') as events: events.write('called\\n')\n"
+        + f"        {outcome}\n"
+        + "    return _original_report_diagnostic(message, **kwargs)\n"
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: stop after diagnostic cleanup failure")
+    task = git(root, "rev-parse", "HEAD")
+    output = tmp_path / "output"
+    with output.open("wb") as stream:
+        status = process.run_command(
+            process.ProcessCommand(
+                "failed diagnostic workflow",
+                ("scripts/git-flow-merge.sh",),
+                root,
+                environment=os.environ | {"TMPDIR": str(exports)},
+                stdout=stream,
+                stderr=stream,
+            ),
+            hard_deadline=time.monotonic() + 20,
+        )
+    assert status == 1, output.read_text()
+    assert calls.read_text().splitlines() == ["called"]
+    events = [json.loads(line) for line in commands.read_text().splitlines()]
+    assert events[-1][-2:] == ["commit", "--no-edit"]
+    assert git(root, "rev-parse", "master") == base
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "branch", "--show-current") == "master"
+    assert (root / ".git/MERGE_HEAD").exists()
+    retained = list(exports.glob("h2h-merge-owner.*"))
+    assert len(retained) == 1
+    assert (retained[0] / "cleanup-4").read_text() == "owned_tree_empty\n"
+    assert not (retained[0] / "cleanup-5").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="Real venv site startup and shell recovery"
+)
+@pytest.mark.parametrize("startup", ["sitecustomize", "pth"])
+@pytest.mark.parametrize("launch", ["diagnostic", "recovery", "owner", "source-probe"])
+def test_workflow_and_diagnostic_launchers_exclude_site_startup_code(
+    tmp_path: Path, startup: str, launch: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=False)
+    task = git(root, "rev-parse", "HEAD")
+    shutil.rmtree(root / ".venv")
+    subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-m",
+            "venv",
+            "--without-pip",
+            str(root / ".venv"),
+        ),
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    python = root / ".venv/bin/python"
+    site = Path(
+        subprocess.check_output(
+            (
+                str(python),
+                "-I",
+                "-B",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ),
+            text=True,
+            timeout=5,
+        ).strip()
+    )
+    control = tmp_path / "startup-control"
+    marker = tmp_path / "forbidden-startup"
+    condition = {
+        "diagnostic": "'--workflow-diagnostic' in sys.orig_argv",
+        "recovery": "'--recovery' in sys.orig_argv",
+        "owner": "'--cleanup-receipt' in sys.orig_argv and '--recovery' not in sys.orig_argv",
+        "source-probe": "'--print-source-files' in sys.orig_argv",
+    }[launch]
+    code = (
+        "import subprocess, sys, time\nfrom pathlib import Path\n"
+        "if '--site-control' in sys.orig_argv:\n"
+        f"    Path({str(control)!r}).touch()\n"
+        f"if {condition}:\n"
+        f"    Path({str(marker)!r}).touch()\n"
+        "    subprocess.Popen([sys.executable, '-I', '-S', '-c', 'import time; time.sleep(60)'])\n"
+        "    time.sleep(60)\n"
+    )
+    if startup == "sitecustomize":
+        (site / "sitecustomize.py").write_text(code)
+    else:
+        (site / "diagnostic-startup.pth").write_text(f"import sys; exec({code!r})\n")
+    subprocess.run(
+        (str(python), "-I", "-B", "-c", "pass", "--site-control"),
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    assert control.exists(), "The regression must install a real active startup hook"
+    output = tmp_path / "output"
+    with output.open("wb") as stream:
+        status = process.run_command(
+            process.ProcessCommand(
+                "site-isolated failure diagnostic",
+                ("scripts/git-flow-merge.sh",),
+                root,
+                stdout=stream,
+                stderr=stream,
+            ),
+            hard_deadline=time.monotonic() + 15,
+        )
+    assert status == 1, output.read_text()
+    assert not marker.exists(), f"{launch} launch executed site startup code"
+    assert "merge commit or release gate failed" in output.read_text()
+    assert git(root, "rev-parse", "master") == base
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "branch", "--show-current") == "task"
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert git(root, "status", "--porcelain") == ""
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="Real diagnostic launcher signal handoff"
+)
+@pytest.mark.parametrize("handoff_signal", [False, True])
+def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
+    tmp_path: Path, *, handoff_signal: bool
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=False)
+    ready = tmp_path / "diagnostic-ready"
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    source = root / "src/h2h_dev_tools/process.py"
+    source.write_text(
+        source.read_text()
+        + "\n_original_report_diagnostic = report_diagnostic\n"
+        + "def report_diagnostic(message, **kwargs):\n"
+        + "    if message.startswith('git-flow-merge:'):\n"
+        + f"        Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+        + "        time.sleep(60)\n"
+        + "    return _original_report_diagnostic(message, **kwargs)\n"
+    )
+    if handoff_signal:
+        shell = root / "src/h2h_dev_tools/git-flow-merge.sh"
+        shell.write_text(
+            shell.read_text().replace(
+                "    active_pid=$!\n",
+                '    if [[ "$active_owner" == diagnostic ]]; then\n'
+                f"        while [[ ! -e {str(ready)!r} ]]; do sleep 0.01; done\n"
+                '        kill -TERM "$$"\n'
+                "    fi\n"
+                "    active_pid=$!\n",
+            )
+        )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: interrupt diagnostic launcher handoff")
+    task = git(root, "rev-parse", "HEAD")
+    deadline = time.monotonic() + 15
+    with process.controlled_termination_signals() as controller:
+        with controller.defer():
+            owner = process.start_owned_process(
+                process.ProcessCommand(
+                    "interrupted diagnostic launcher",
+                    ("scripts/git-flow-merge.sh",),
+                    root,
+                    environment=os.environ | {"TMPDIR": str(exports)},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                ),
+                deadline=deadline,
+                signal_controller=controller,
+            )
+        wrapper = owner.process
+        clean = False
+        try:
+            while not ready.exists():
+                assert wrapper.poll() is None, wrapper.communicate()[0]
+                assert time.monotonic() < deadline - 6
+                time.sleep(0.01)
+            if not handoff_signal:
+                wrapper.send_signal(signal.SIGTERM)
+            raw_output, _ = wrapper.communicate(timeout=5)
+            output = raw_output.decode("utf-8", errors="replace")
+            assert wrapper.returncode == 143, output
+            assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+            assert process.close_owner(owner, deadline=deadline)
+            clean = True
+            with pytest.raises(ProcessLookupError):
+                os.kill(int(ready.read_text()), 0)
+            assert git(root, "rev-parse", "master") == base
+            assert git(root, "rev-parse", "task") == task
+            assert git(root, "branch", "--show-current") == "master"
+            assert (root / ".git/MERGE_HEAD").exists()
+            retained = list(exports.glob("h2h-merge-owner.*"))
+            assert len(retained) == 1
+            assert not (retained[0] / "cleanup-5").exists()
+        finally:
+            if not clean:
+                with controller.defer():
+                    empty = process.terminate_owned_tree(owner, deadline=deadline)
+                    closed = process.close_owner(owner, deadline=deadline)
+                    assert empty and closed, "Diagnostic fixture cleanup is unproven"
+            if wrapper.stdout is not None:
+                wrapper.stdout.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX nested obligation oracle")
+def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
+    tmp_path: Path,
+) -> None:
+    from h2h_dev_tools._process_scope import PosixScope, _Capability
+
+    marker = tmp_path / "unlaunched-scope.json"
+    package = Path(process.__file__).resolve().parent
+    child = (
+        "import runpy, sys, time\nfrom pathlib import Path\n"
+        "package = Path(sys.argv[1])\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+        "from h2h_dev_tools._process_scope import PosixScope\n"
+        "scope = PosixScope.create(deadline=time.monotonic() + 3)\n"
+        "scope.close_admission(deadline=time.monotonic() + 3)\n"
+        "Path(sys.argv[2]).write_text(scope.capability.encode())\n"
+        # Deliberately omit close for an admitted scope that never launched a
+        # child. Actual process exit and an empty group cannot discharge it.
+        "raise SystemExit(143)\n"
+    )
+    deadline = time.monotonic() + 6
+    with process.controlled_termination_signals() as controller:
+        with controller.defer():
+            owner = process.start_owned_process(
+                process.ProcessCommand(
+                    "missing nested cleanup negative control",
+                    (
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        child,
+                        str(package),
+                        str(marker),
+                    ),
+                    tmp_path,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ),
+                deadline=deadline,
+                signal_controller=controller,
+            )
+        try:
+            assert owner.process.wait(timeout=3) == 143
+            with pytest.raises(ProcessLookupError):
+                os.killpg(owner.process.pid, 0)
+            assert owner.posix_scope is not None
+            assert owner.posix_scope.has_pending(deadline=deadline)
+            with pytest.raises(AssertionError):
+                _assert_interrupted_workflow_cleanup(
+                    owner, "normal signal exit", deadline=time.monotonic() + 0.1
+                )
+        finally:
+            # This fixture's exact child program never launches anything after
+            # scope creation. Only that known unlaunched obligation is discharged;
+            # this cannot recover an unknown runtime owner or make the oracle pass.
+            if marker.exists():
+                assert owner.posix_scope is not None
+                unlaunched = PosixScope(
+                    _Capability.decode(marker.read_text()),
+                    owner.posix_scope.capability,
+                    proven_empty=True,
+                )
+                unlaunched.close(deadline=deadline)
+            with controller.defer():
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+                assert process.close_owner(owner, deadline=deadline)

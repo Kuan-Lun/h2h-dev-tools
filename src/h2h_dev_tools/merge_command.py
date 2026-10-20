@@ -66,59 +66,77 @@ def _run_owned(phase: ProcessCommand, *, hard_deadline: float | None = None) -> 
         if not error.cleanup_proven:
             raise
         process.report_diagnostic(
-            f"merge-command: surviving descendants required cleanup: {error}"
+            f"merge-command: surviving descendants required cleanup: {error}",
+            deadline=hard_deadline,
         )
         return 1
 
 
-def _replay_recovery_output(output: BinaryIO) -> None:
+def _replay_recovery_output(output: BinaryIO, *, deadline: float) -> None:
+    import codecs
+
     from . import process
 
     try:
         output.seek(0)
         remaining = RECOVERY_DIAGNOSTIC_LIMIT_BYTES
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while remaining:
-            chunk = output.read(min(8192, remaining))
+            if time.monotonic() >= deadline:
+                return
+            chunk = output.read(min(2048, remaining))
             if not chunk:
                 break
             remaining -= len(chunk)
             process.report_diagnostic(
-                chunk.decode("utf-8", errors="replace").rstrip("\n")
+                decoder.decode(chunk), deadline=deadline, newline=False
             )
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            process.report_diagnostic(tail, deadline=deadline, newline=False)
         if remaining == 0 and output.read(1):
             process.report_diagnostic(
-                "merge-command: recovery diagnostics truncated after 64 KiB"
+                "\nmerge-command: recovery diagnostics truncated after 64 KiB",
+                deadline=deadline,
             )
     except OSError as error:
         process.report_diagnostic(
-            f"merge-command: could not read recovery diagnostics: {error}"
+            f"merge-command: could not read recovery diagnostics: {error}",
+            deadline=deadline,
         )
 
 
-def _run_git(phase: ProcessCommand, *, recovery: bool) -> int:
+def _run_git(
+    phase: ProcessCommand, *, recovery: bool, deadline: float | None = None
+) -> int:
     from . import process
 
     if not recovery:
         return _run_owned(phase)
-    # Git resets SIGPIPE itself. A closed caller pipe must not stop a recovery
-    # checkout after updating HEAD but before running its post-checkout hook.
-    # Only this human diagnostic channel is captured; review/data output keeps
-    # its normal semantics. Replay is bounded and follows proven tree cleanup.
+    if deadline is None:
+        raise ValueError("Recovery requires its existing absolute deadline")
+    # Git resets SIGPIPE. Capture only recovery's human output until its owned
+    # command has exited; replay shares the original ten-second phase deadline.
     output = tempfile.TemporaryFile()
+    diagnostics_clean = False
     try:
         status = _run_owned(
-            replace(phase, stdout=output, stderr=output),
-            hard_deadline=time.monotonic() + RECOVERY_TIMEOUT_SECONDS,
+            replace(phase, stdout=output, stderr=output), hard_deadline=deadline
         )
-        _replay_recovery_output(output)
+        _replay_recovery_output(output, deadline=deadline)
+        diagnostics_clean = True
         return status
     finally:
         try:
             output.close()
         except OSError as error:
-            process.report_diagnostic(
-                f"merge-command: could not close recovery diagnostics: {error}"
-            )
+            # Do not replace an ownership failure or spawn another writer after
+            # an uncertain replay. A normal file-close error is optional output.
+            if diagnostics_clean:
+                process.report_diagnostic(
+                    f"merge-command: could not close recovery diagnostics: {error}",
+                    deadline=deadline,
+                )
 
 
 def _review(
@@ -196,11 +214,12 @@ def _review(
         )
         if status == 0:
             try:
-                published = reviewer._publish_managed_receipt(target, pending)
                 process.report_diagnostic(
-                    f"Code review passed after owned cleanup; wrote {published}",
+                    "Code review cleanup verified; publishing "
+                    f"{reviewer._receipt_path(target)}",
                     standard_output=True,
                 )
+                reviewer._publish_managed_receipt(target, pending)
             except (code_review.ReviewError, OSError, ValueError) as error:
                 process.report_diagnostic(f"merge-command: {error}")
                 status = 1
@@ -218,6 +237,9 @@ def _execute(
     from . import process
 
     environment = without_review_owner(os.environ)
+    recovery_deadline = (
+        time.monotonic() + RECOVERY_TIMEOUT_SECONDS if recovery else None
+    )
     try:
         if review:
             status = _review(repository, command, environment)
@@ -230,20 +252,40 @@ def _execute(
                     environment=environment,
                 ),
                 recovery=recovery,
+                deadline=recovery_deadline,
             )
-    except process.ProcessOwnershipError as error:
-        process.report_diagnostic(
-            f"merge-command: cleanup could not be proven: {error}"
-        )
+    except process.ProcessOwnershipError:
         return process.TERMINATION_FAILED_EXIT_CODE
     # An exit status alone cannot distinguish a cleaned interrupt from an owner
     # killed before/during teardown. Every started phase must complete cleanup
     # before publishing proof, including classification-only documentation merges.
+    _write_cleanup_receipt(receipt)
+    # Reserve 125 for an unproven owner cleanup, never for a hook's own exit code.
+    return 1 if status == process.TERMINATION_FAILED_EXIT_CODE else status
+
+
+def _write_cleanup_receipt(receipt: Path) -> None:
     temporary_receipt = receipt.with_suffix(".pending")
     temporary_receipt.write_text("owned_tree_empty\n", encoding="ascii")
     temporary_receipt.replace(receipt)
-    # Reserve 125 for an unproven owner cleanup, never for a hook's own exit code.
-    return 1 if status == process.TERMINATION_FAILED_EXIT_CODE else status
+
+
+def _workflow_diagnostic(message: str, receipt: Path) -> int:
+    from . import process
+
+    # Invoked with -I -S -B: no site code can launch arbitrary descendants before
+    # ownership begins. Only report_diagnostic admits a fixed, bounded writer;
+    # the shell waits/reaps this launcher and requires proof for that new child.
+    try:
+        with (
+            os.fdopen(3, "w", encoding="utf-8", closefd=False) as diagnostic,
+            redirect_stderr(diagnostic),
+        ):
+            process.report_diagnostic(f"git-flow-merge: {message}")
+    except process.ProcessOwnershipError:
+        return process.TERMINATION_FAILED_EXIT_CODE
+    _write_cleanup_receipt(receipt)
+    return 0
 
 
 def main() -> int:
@@ -293,12 +335,13 @@ def main() -> int:
                 recovery=arguments.recovery,
                 receipt=arguments.cleanup_receipt,
             )
-        except OSError as error:
+        except process.ProcessOwnershipError:
+            return process.TERMINATION_FAILED_EXIT_CODE
+        except OSError:
             if not arguments.recovery:
                 raise
             # A failed receipt write is still a failure and publishes no proof;
             # reporting it must not block recovery on the caller's pipe.
-            process.report_diagnostic(f"merge-command: {error}")
             return 1
 
 
@@ -313,15 +356,7 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--print-source-files"]:
         print("\n".join(owner_source_files()))
         raise SystemExit(0)
-    if len(sys.argv) == 3 and sys.argv[1] == "--workflow-diagnostic":
-        # The shell gives only this diagnostic FD to us; startup errors use
-        # /dev/null and must never fall back to its potentially blocked stderr.
-        from .process import report_diagnostic
-
-        with (
-            os.fdopen(3, "w", encoding="utf-8", closefd=False) as diagnostic,
-            redirect_stderr(diagnostic),
-        ):
-            report_diagnostic(f"git-flow-merge: {sys.argv[2]}")
-        raise SystemExit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == "--workflow-diagnostic":
+        # FD 3 is the human destination; interpreter/bootstrap errors are null.
+        raise SystemExit(_workflow_diagnostic(sys.argv[3], Path(sys.argv[2])))
     raise SystemExit(main())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
@@ -14,17 +15,27 @@ import pytest
 from h2h_dev_tools import process
 
 
+def _source_bootstrap(package: Path) -> str:
+    return (
+        "import runpy\nfrom pathlib import Path\n"
+        f"package = Path({str(package)!r})\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](\n"
+        "    package, 'h2h_dev_tools')\n"
+    )
+
+
 @pytest.mark.parametrize("standard_output", [False, True])
+@pytest.mark.parametrize(
+    "poisoned_source_package", ["process.py", "_process_scope.py"], indirect=True
+)
 def test_full_diagnostic_pipe_preserves_completion_and_blocking_mode(
-    tmp_path: Path, standard_output: bool
+    tmp_path: Path, standard_output: bool, poisoned_source_package: Path
 ) -> None:
     """Also runs natively in Windows CI, where nonblocking support is pipe-only."""
     marker = tmp_path / "completed"
     descriptor = 1 if standard_output else 2
-    module_root = str(Path(process.__file__).resolve().parents[1])
-    script = (
-        "import os, sys\nfrom pathlib import Path\n"
-        f"sys.path.insert(0, {module_root!r})\n"
+    script = _source_bootstrap(poisoned_source_package) + (
+        "import os, sys\n"
         "from h2h_dev_tools.process import report_diagnostic\n"
         f"descriptor = {descriptor}\n"
         "os.set_blocking(descriptor, False)\n"
@@ -60,8 +71,11 @@ def test_full_diagnostic_pipe_preserves_completion_and_blocking_mode(
 )
 @pytest.mark.parametrize("standard_output", [False, True])
 @pytest.mark.parametrize("trigger", ["cancel", "timeout"])
+@pytest.mark.parametrize(
+    "poisoned_source_package", ["process.py", "_process_scope.py"], indirect=True
+)
 def test_full_diagnostic_pipe_cannot_delay_owned_cleanup(
-    tmp_path: Path, standard_output: bool, trigger: str
+    tmp_path: Path, standard_output: bool, trigger: str, poisoned_source_package: Path
 ) -> None:
     ready = tmp_path / "ready"
     completed = tmp_path / "completed"
@@ -77,10 +91,8 @@ def test_full_diagnostic_pipe_cannot_delay_owned_cleanup(
         f"Path({str(ready)!r}).write_text(str(os.getpgrp()))\n"
         "time.sleep(60)\n"
     )
-    module_root = str(Path(process.__file__).resolve().parents[1])
-    script = (
-        "import sys, time\nfrom pathlib import Path\n"
-        f"sys.path.insert(0, {module_root!r})\n"
+    script = _source_bootstrap(poisoned_source_package) + (
+        "import sys, time\n"
         "from h2h_dev_tools import process\n"
         f"phase = process.ProcessCommand('backpressure', (sys.executable, '-c', {child!r}), Path.cwd())\n"
         "try:\n"
@@ -132,12 +144,19 @@ def test_full_diagnostic_pipe_cannot_delay_owned_cleanup(
 @pytest.mark.parametrize("standard_output", [False, True])
 @pytest.mark.parametrize("status", [0, 143])
 @pytest.mark.parametrize("failure", ["closed-pipe", "closed-fd"])
+@pytest.mark.parametrize(
+    "poisoned_source_package", ["process.py", "_process_scope.py"], indirect=True
+)
 def test_failed_diagnostic_descriptor_preserves_interpreter_exit_status(
-    tmp_path: Path, standard_output: bool, status: int, failure: str
+    tmp_path: Path,
+    standard_output: bool,
+    status: int,
+    failure: str,
+    poisoned_source_package: Path,
 ) -> None:
     marker = tmp_path / "completed"
-    script = (
-        "import os\nfrom pathlib import Path\n"
+    script = _source_bootstrap(poisoned_source_package) + (
+        "import os\n"
         "from h2h_dev_tools.process import report_diagnostic\n"
         + (
             f"os.close({1 if standard_output else 2})\n"
@@ -152,7 +171,7 @@ def test_failed_diagnostic_descriptor_preserves_interpreter_exit_status(
     os.close(read_fd)
     with os.fdopen(write_fd, "wb", buffering=0) as closed_pipe:
         result = subprocess.run(
-            (sys.executable, "-B", "-c", script),
+            (sys.executable, "-I", "-B", "-c", script),
             stdout=closed_pipe if standard_output else subprocess.PIPE,
             stderr=subprocess.PIPE if standard_output else closed_pipe,
             check=False,
@@ -264,7 +283,7 @@ def test_low_level_launch_does_not_pollute_callers_output(
             assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
         finally:
             process.terminate_owned_tree(owner, deadline=deadline)
-            assert process.close_owner(owner)
+            assert process.close_owner(owner, deadline=deadline)
     assert capsys.readouterr().out == ""
 
 
@@ -362,3 +381,245 @@ def test_direct_api_defers_signal_until_spawned_process_has_an_owner(
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX parent ledger contention")
+@pytest.mark.parametrize("status", [0, 7])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_normal_exit_closes_parent_obligation_with_remaining_cleanup_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int, bounded: bool
+) -> None:
+    import threading
+
+    from h2h_dev_tools import _process_scope as scope_module
+
+    parent = scope_module.PosixScope.create(deadline=time.monotonic() + 3)
+    monkeypatch.setenv(scope_module.ENVIRONMENT_KEY, parent.capability.encode())
+    original_wait = process.wait_for_owned_tree_exit
+    owners: list[process.OwnedProcess] = []
+    locked = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def contend() -> None:
+        try:
+            with parent.capability.locked(deadline=time.monotonic() + 3):
+                locked.set()
+                # Longer than the normal-exit quick poll, within the original
+                # cleanup budget. This is real flock contention, not a clock mock.
+                release.wait(timeout=0.6)
+        except BaseException as error:
+            errors.append(error)
+            locked.set()
+
+    contender = threading.Thread(target=contend)
+
+    def wait_then_contend(owner: process.OwnedProcess, *, deadline: float) -> bool:
+        owners.append(owner)
+        assert original_wait(owner, deadline=deadline)
+        contender.start()
+        assert locked.wait(timeout=3)
+        assert not errors
+        return True
+
+    monkeypatch.setattr(process, "wait_for_owned_tree_exit", wait_then_contend)
+    command = process.ProcessCommand(
+        "parent ledger contention",
+        (sys.executable, "-c", f"raise SystemExit({status})"),
+        tmp_path,
+    )
+    started = time.monotonic()
+    try:
+        assert (
+            process.run_command(
+                command,
+                hard_deadline=started + 8 if bounded else None,
+                termination_reserve_seconds=2,
+            )
+            == status
+        )
+        assert 0.5 <= time.monotonic() - started < 8
+        assert len(owners) == 1
+        scope = owners[0].posix_scope
+        assert scope is not None
+        assert not scope.capability.directory.exists()
+        assert not parent.has_pending(deadline=time.monotonic() + 1)
+    finally:
+        release.set()
+        if contender.ident is not None:
+            contender.join(timeout=3)
+            assert not contender.is_alive()
+        assert not errors
+        # The OLD negative retains its proven-empty scope. After removing only
+        # our synthetic lock, independently prove and release that obligation.
+        for owner in owners:
+            assert owner.process.poll() == status
+            with pytest.raises(ProcessLookupError):
+                os.killpg(owner.process.pid, 0)
+            scope = owner.posix_scope
+            assert scope is not None
+            if scope.capability.directory.exists():
+                assert process.terminate_owned_tree(
+                    owner, deadline=time.monotonic() + 2
+                )
+                scope.close(deadline=time.monotonic() + 2)
+        assert not parent.has_pending(deadline=time.monotonic() + 1)
+        # This parent is a synthetic ledger: it never launches its own group.
+        parent.proven_empty = True
+        parent.close(deadline=time.monotonic() + 1)
+        assert not parent.capability.directory.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX parent ledger contention")
+def test_owner_close_deadline_retains_responsibility_until_lock_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+
+    from h2h_dev_tools import _process_scope as scope_module
+
+    parent = scope_module.PosixScope.create(deadline=time.monotonic() + 3)
+    monkeypatch.setenv(scope_module.ENVIRONMENT_KEY, parent.capability.encode())
+    owner = process.start_owned_process(
+        process.ProcessCommand(
+            "bounded close", (sys.executable, "-c", "pass"), tmp_path
+        ),
+        deadline=time.monotonic() + 3,
+        signal_controller=None,
+    )
+    scope = owner.posix_scope
+    assert scope is not None
+    try:
+        assert owner.process.wait(timeout=3) == 0
+        messages: list[str] = []
+        assert not process.close_owner(
+            owner, deadline=time.monotonic() + 1, diagnostic=messages.append
+        )
+        assert "Unproven process scope retained" in messages.pop()
+        assert parent.has_pending(deadline=time.monotonic() + 1)
+        assert process.wait_for_owned_tree_exit(owner, deadline=time.monotonic() + 1)
+        with (parent.capability.directory / "lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            started = time.monotonic()
+            assert not process.close_owner(
+                owner, deadline=started + 0.04, diagnostic=messages.append
+            )
+            assert time.monotonic() - started < 0.5
+            assert "Process scope lock deadline" in messages.pop()
+            assert scope.proven_empty
+            assert scope.capability.directory.is_dir()
+            assert (
+                parent.capability.directory / "pending" / scope.capability.token
+            ).is_file()
+        assert process.close_owner(owner, deadline=time.monotonic() + 1)
+        assert not scope.capability.directory.exists()
+        assert not parent.has_pending(deadline=time.monotonic() + 1)
+        assert not messages
+    finally:
+        if scope.capability.directory.exists():
+            cleanup_deadline = time.monotonic() + 3
+            assert process.terminate_owned_tree(owner, deadline=cleanup_deadline)
+            assert process.close_owner(owner, deadline=cleanup_deadline)
+        assert owner.process.poll() == 0
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
+        assert not parent.has_pending(deadline=time.monotonic() + 1)
+        parent.proven_empty = True  # Synthetic ledger, no parent process launched.
+        parent.close(deadline=time.monotonic() + 1)
+        assert not parent.capability.directory.exists()
+
+
+def _observe_exited_unreaped(child: subprocess.Popen[bytes], deadline: float) -> None:
+    status = None
+    while status is None:
+        status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        assert time.monotonic() < deadline, "Native child did not exit"
+        if status is None:
+            time.sleep(0.001)
+    assert status.si_pid == child.pid
+    assert status.si_code == os.CLD_EXITED and status.si_status == 0
+    assert child.returncode is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="XNU reports EPERM when a process group is exited but unreaped",
+)
+@pytest.mark.parametrize("edge", ["term", "kill"])
+def test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edge: str
+) -> None:
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    child = (
+        "import signal,sys,time\nfrom pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).touch()\n"
+        "while not Path(sys.argv[2]).exists(): time.sleep(.001)\n"
+        if edge == "kill"
+        else "pass"
+    )
+    deadline = time.monotonic() + 6
+    real_killpg = os.killpg
+    observations: list[tuple[int, int]] = []
+    with process.controlled_termination_signals() as controller:
+        with controller.defer():
+            owner = process.start_owned_process(
+                process.ProcessCommand(
+                    "native signal exit barrier",
+                    (sys.executable, "-I", "-S", "-c", child, str(ready), str(release)),
+                    tmp_path,
+                ),
+                deadline=deadline,
+                signal_controller=controller,
+            )
+        scope = owner.posix_scope
+        assert scope is not None
+        try:
+            if edge == "term":
+                _observe_exited_unreaped(owner.process, deadline)
+            else:
+                while not ready.exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
+
+            def observe(group: int, number: int) -> None:
+                assert group == owner.process.pid
+                if edge == "kill" and number == signal.SIGKILL:
+                    # The last real group probe observed a live child. Make it
+                    # exit here, then preserve its actual wait status so the
+                    # following real SIGKILL observes XNU's native EPERM race.
+                    release.touch()
+                    _observe_exited_unreaped(owner.process, deadline)
+                try:
+                    real_killpg(group, number)
+                except OSError as error:
+                    assert error.errno is not None
+                    observations.append((number, error.errno))
+                    raise
+                else:
+                    observations.append((number, 0))
+
+            with monkeypatch.context() as boundary:
+                boundary.setattr(os, "killpg", observe)
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+            expected_signal = signal.SIGTERM if edge == "term" else signal.SIGKILL
+            assert (expected_signal, errno.EPERM) in observations
+            assert observations[-1] == (0, errno.ESRCH)
+            assert owner.process.returncode == 0
+            assert scope.proven_empty
+            assert not scope.has_pending(deadline=deadline)
+            with pytest.raises(ChildProcessError):
+                os.waitpid(owner.process.pid, os.WNOHANG)
+        finally:
+            # The OLD regression control also cleans its real exited child,
+            # using the same absolute deadline and the existing absence oracle.
+            release.touch()
+            if not scope.proven_empty:
+                assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+            assert process.close_owner(owner, deadline=deadline)
+        assert not scope.capability.directory.exists()
+        if scope.parent is not None:
+            with scope.parent.locked(deadline=deadline):
+                assert not (
+                    scope.parent.directory / "pending" / scope.capability.token
+                ).exists()

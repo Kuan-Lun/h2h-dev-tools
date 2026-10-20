@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-20T15:45:08+00:00",
+  "checked_at": "2026-10-20T17:12:50+00:00",
   "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.5.0",
+  "project_version": "0.6.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -102,7 +102,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.5.0 requires explicit runtime_sources in pytest_source.main; existing sync regenerates snapshots and each thin caller must declare its owned packages. There is no no-argument fallback, inferred package discovery or application data conversion. Controller and local workers validate the same Python hashes and directory topology, including empty/resource-only namespaces; standard TraversableResources access deliberately leaves resource bytes outside the source-hash guarantee. The pytest assertion installer preserves exactly the registered toolkit finder and runtime finder, including an empty mapping, while ordinary tests/conftests retain rewrite and plain mode. Isolated workers explicitly receive fresh cache settings under -I/-E. All 185 source/entry/bundle regressions passed, including real source/snapshot controller/worker imports, namespace resources, topology drift, unrecorded Python source, post-rewrite mutation and registration rejection. Isolated negative controls against preserved prior source prove both assertion bypass and all three namespace failures. Ruff, formatter, strict mypy and Markdown checks passed; final formal review and full release gate remain independently required. No dependency bounds, pins, runtime dependencies or global tools changed. Fresh registry discovery finds all Python candidates support 3.14 and all Python/Node latest versions satisfy declared ranges. Hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0 and markdownlint-cli2 0.23.3 match the previously reviewed 0.4.0 candidates, so the identical release-note conclusions remain applicable. Ruff alone advanced to 0.17.1. Official https://github.com/astral-sh/ruff/releases/tag/0.17.1 describes preview whitespace-keyword fixes, multiline dedent fixes, PYI/PERF fixes and mutable-container recognition. This repo does not enable preview/PYI/PERF and passes its strict selected rules and formatter with 0.17.1. A fresh normally resolved environment built 0.5.0 project metadata with uv 0.13.0 and these candidates.",
+    "note": "Release 0.6.0 requires close_owner callers to pass their existing absolute cleanup deadline. Generated snapshot consumers update through normal sync; explicit callers select their phase deadline, with no implicit poll-deadline fallback. run_command keeps its API and no application data migration is needed. POSIX diagnostic writers preserve inherited descriptor flags and register before spawn; Windows uses isolated base interpreters and Job-assigned start gates. Writing, reap, scope removal and recovery replay share existing bounds. V2 callers finish optional output before evidence publication and never start another writer or publish passing evidence after unknown cleanup. All pre-owner stdlib launcher modes, including source discovery, normal/review owners, recovery and diagnostics, use -I -S -B; actual owned children retain normal dependencies. The diagnostic launcher shares existing PID/signal/receipt management. Process/scope/diagnostic targets, standalone/managed publication failure and a real exited-group/unclosed-obligation negative control passed. The complete affected merge workflow/command modules passed 152 cases in 479.53 seconds, including all 16 interruption combinations and real active sitecustomize/.pth controls for four startup entry modes. Ruff, formatter, strict mypy and Markdown checks pass. A limited independent launcher-boundary check found no remaining concrete defect; this does not replace formal full-repository review or the exact-candidate gate. Native Windows remains a separate platform CI target. No dependency bounds, pins or runtime dependencies changed. Fresh registry candidates match the already reviewed 0.5.0 set: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, ruff 0.17.1 and markdownlint-cli2 0.23.3; all satisfy declared ranges and Python candidates support 3.14. Identical upstream release-note conclusions still apply, including https://github.com/astral-sh/ruff/releases/tag/0.17.1; no preview/PYI/PERF rules are enabled. The normally resolved repository environment uses Python 3.14.1, command-local uv 0.13.0 and these candidates with project version 0.6.0.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

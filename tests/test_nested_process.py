@@ -57,13 +57,49 @@ runpy.run_path(str(package / "source_loader.py"))["load_package"](
 )
 from h2h_dev_tools import process
 
+# Delay real metadata operations without changing any ownership deadline.
+metadata_mode = os.environ.get("H2H_TEST_METADATA_WINDOW")
+if level == 1 and metadata_mode:
+    parent = Path(json.loads(os.environ["H2H_PRIVATE_POSIX_PROCESS_SCOPE"])["directory"])
+    original_mkdir, original_unlink = Path.mkdir, Path.unlink
+    def metadata_pause(path, boundary):
+        record("metadata-window.json", {"scope": str(path.parent), "boundary": boundary,
+               "parent": str(parent), "parent_pending": len(list((parent / "pending").iterdir())),
+               "local_names": sorted(item.name for item in path.parent.iterdir())})
+        time.sleep(0.15)
+    def observed_mkdir(path, *args, **kwargs):
+        result = original_mkdir(path, *args, **kwargs)
+        if metadata_mode == "create" and path.name == "pending" and (parent / "closed").exists():
+            metadata_pause(path, "after-local-pending-mkdir-before-parent-registration")
+        return result
+    def observed_unlink(path, *args, **kwargs):
+        result = original_unlink(path, *args, **kwargs)
+        if metadata_mode == "close" and path.name == "closed" and (parent / "closed").exists():
+            metadata_pause(path, "after-closed-unlink")
+        return result
+    Path.mkdir, Path.unlink = observed_mkdir, observed_unlink
+
 command = (
     sys.executable, "-I", __file__, str(package), str(root), scenario,
     str(level + 1), str(depth),
 )
-if scenario == "missing-executable" and level == 1:
-    command = (str(root / "missing-executable"),)
-phase = process.ProcessCommand(name, command, root)
+environment = None
+if level == 1:
+    if scenario == "missing-executable":
+        command = (str(root / "missing-executable"),)
+    elif scenario == "empty-argv":
+        command = ()
+    elif scenario == "nul-argv":
+        command = (sys.executable, "\0")
+    elif scenario == "invalid-env-key":
+        environment = {"INVALID=KEY": "value"}
+    elif scenario == "nul-env-key":
+        environment = {"INVALID\0KEY": "value"}
+    elif scenario == "nul-env-value":
+        environment = {"KEY": "invalid\0value"}
+    elif scenario == "invalid-env-value-type":
+        environment = {"KEY": 1}
+phase = process.ProcessCommand(name, command, root, environment=environment)
 
 try:
     if scenario == "phases" and level == 1:
@@ -122,7 +158,10 @@ except process.ProcessOwnershipError as error:
         "kind": "ownership-error", "status": status,
         "cleanup_proven": error.cleanup_proven,
     }
-    if scenario == "missing-executable":
+    if scenario in {
+        "missing-executable", "empty-argv", "nul-argv", "invalid-env-key",
+        "nul-env-key", "nul-env-value", "invalid-env-value-type",
+    }:
         result["cause"] = type(error.__cause__).__name__
 record(name + ".result.json", result)
 raise SystemExit(status)
@@ -188,7 +227,13 @@ class _Probe:
 
 
 @contextmanager
-def _probe(tmp_path: Path, *, scenario: str, depth: int = 2) -> Iterator[_Probe]:
+def _probe(
+    tmp_path: Path,
+    *,
+    scenario: str,
+    depth: int = 2,
+    metadata_window: str | None = None,
+) -> Iterator[_Probe]:
     script = tmp_path / "probe.py"
     script.write_text(_CHILD, encoding="utf-8")
     scopes = tmp_path / "scopes"
@@ -199,6 +244,9 @@ def _probe(tmp_path: Path, *, scenario: str, depth: int = 2) -> Iterator[_Probe]
     # This disposable fault experiment owns its own tree. An intentionally
     # killed supervisor must not leave a stale obligation in pytest's owner.
     environment.pop("H2H_PRIVATE_POSIX_PROCESS_SCOPE", None)
+    environment.pop("H2H_TEST_METADATA_WINDOW", None)
+    if metadata_window is not None:
+        environment["H2H_TEST_METADATA_WINDOW"] = metadata_window
     package = Path(process.__file__).resolve().parent
     with (tmp_path / "owner.log").open("wb") as output:
         owner = subprocess.Popen(
@@ -275,14 +323,28 @@ def test_nested_completion_releases_all_obligations(
         probe.assert_no_scopes()
 
 
+@pytest.mark.parametrize(
+    ("scenario", "cause"),
+    [
+        ("missing-executable", "FileNotFoundError"),
+        ("empty-argv", "IndexError"),
+        ("nul-argv", "ValueError"),
+        ("invalid-env-key", "ValueError"),
+        ("nul-env-key", "ValueError"),
+        ("nul-env-value", "ValueError"),
+        ("invalid-env-value-type", "TypeError"),
+    ],
+)
 def test_failed_nested_exec_releases_obligation_without_hiding_failure(
     tmp_path: Path,
+    scenario: str,
+    cause: str,
 ) -> None:
-    with _probe(tmp_path, scenario="missing-executable") as probe:
+    with _probe(tmp_path, scenario=scenario) as probe:
         assert probe.owner.wait(timeout=10) == 125, probe.log()
         assert probe.result() == {"kind": "return", "status": 125}
         assert probe.result("owner1")["kind"] == "ownership-error"
-        assert probe.result("owner1")["cause"] == "FileNotFoundError"
+        assert probe.result("owner1")["cause"] == cause
         assert set(probe.identities()) == {"owner0", "owner1"}
         assert "owned_tree_empty=True" in probe.log()
         probe.assert_all_exited()
@@ -349,3 +411,26 @@ def test_scope_lock_contention_is_bounded_and_never_proves_empty(
         assert not (tmp_path / "leaf.identity.json").exists()
         assert "owned_tree_empty=True" not in probe.log()
         assert list((tmp_path / "scopes").glob("h2h-process-scope-*"))
+
+
+@pytest.mark.parametrize("boundary", ["create", "close"])
+def test_cancellation_cannot_leave_unowned_scope_metadata(
+    tmp_path: Path, boundary: str
+) -> None:
+    with _probe(tmp_path, scenario="cancel", metadata_window=boundary) as probe:
+        probe.wait_for("leaf-ready")
+        started = time.monotonic()
+        probe.owner.send_signal(signal.SIGTERM)
+        assert probe.owner.wait(timeout=10) == 143, probe.log()
+        assert time.monotonic() - started < 8
+        assert probe.result()["kind"] == "interrupted"
+        probe.assert_all_exited()
+        probe.assert_no_scopes()
+        marker = tmp_path / "metadata-window.json"
+        if boundary == "create":
+            # Closed admission must reject before any unpublished allocation.
+            assert not marker.exists()
+        else:
+            observed = json.loads(marker.read_text())
+            assert observed["parent_pending"] == 1
+            assert observed["local_names"] == ["lock", "pending", "token"]

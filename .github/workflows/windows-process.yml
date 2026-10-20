@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - src/h2h_dev_tools/process.py
+      - src/h2h_dev_tools/_process_diagnostic.py
+      - src/h2h_dev_tools/_process_scope.py
       - src/h2h_dev_tools/git_environment.py
       - src/h2h_dev_tools/source_loader.py
       - src/h2h_dev_tools/pytest_source.py
@@ -36,5 +38,6 @@ jobs:
         run: >-
           .venv/Scripts/python -B scripts/run-pytest.py -p no:cacheprovider
           tests/test_process.py tests/test_process_integration.py
+          tests/test_process_diagnostic_windows.py
           tests/test_git_environment.py tests/test_pytest_source_entry.py
           tests/test_pytest_source.py

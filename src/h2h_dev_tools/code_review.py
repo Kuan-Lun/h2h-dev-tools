@@ -275,16 +275,32 @@ Otherwise use changes_requested. Write summary and findings in Traditional Chine
 
 
 def _stop(owner: process_control.OwnedProcess) -> None:
-    # Online review admits only POSIX. Its group can outlive a successful leader;
-    # use the shared bounded group oracle before publishing any passing receipt.
+    # Termination and scope closure share the existing five-second cleanup bound.
+    # Failed ownership cannot start another diagnostic writer.
+    deadline = time.monotonic() + 5
+    messages: list[str] = []
+    empty = False
+    failure: Exception | None = None
     try:
-        if not process_control.terminate_owned_tree(
-            owner, deadline=time.monotonic() + 5
-        ):
-            raise ReviewError("Codex process-group cleanup could not be proven")
-    finally:
-        if not process_control.close_owner(owner):
-            raise ReviewError("Codex nested process-scope cleanup could not be proven")
+        empty = process_control.terminate_owned_tree(
+            owner, deadline=deadline, diagnostic=messages.append
+        )
+    except Exception as error:
+        failure = error
+    try:
+        closed = process_control.close_owner(
+            owner, deadline=deadline, diagnostic=messages.append
+        )
+    except Exception as error:
+        closed = False
+        failure = failure or error
+    if not empty or not closed:
+        cleanup_failure = process_control.ProcessOwnershipError(
+            "Codex process-group and scope cleanup could not be proven"
+        )
+        for message in messages:
+            cleanup_failure.add_note(message)
+        raise cleanup_failure from failure
 
 
 def _external_process_owner() -> bool:
@@ -669,7 +685,9 @@ class Reviewer:
             )
             raise ReviewError(f"Code review interrupted by signal {signum}") from error
         except ScopeError as error:
-            raise ReviewError("Codex nested ownership could not be proven") from error
+            raise process_control.ProcessOwnershipError(
+                "Codex nested ownership could not be proven"
+            ) from error
 
     def _write_receipt(
         self,
@@ -805,35 +823,32 @@ class Reviewer:
                 f"Codex returned no valid JSON review; see {run_directory}"
             ) from error
         _require_pass(result)
+        managed = _external_process_owner()
+        destination = (
+            Path(os.environ["H2H_REVIEW_PENDING_RECEIPT"]) if managed else None
+        )
+        receipt = self._receipt_path(target) if destination is None else destination
+        # Optional output can own a helper. Finish that ownership before the last
+        # candidate checks and any passing/pending evidence publication.
+        process_control.report_diagnostic(
+            f"{result['summary']}\nReview result ready; writing "
+            f"{'pending' if managed else 'passing'} evidence: {receipt}",
+            standard_output=True,
+        )
         self._assert_workspace(target)
         if self._target(index=index, revision=revision) != target:
             raise ReviewError("The candidate or review policy changed during review")
-        # Re-read every receipt, but reuse the locks retained by selection. A
-        # second descriptor per ancestor can exhaust an otherwise adequate FD
-        # budget on long first-parent histories after a successful online review.
+        # Reuse retained ancestor locks; reacquiring them can exhaust descriptors.
         self._require_coverage(target, coverage, locked_ancestors=locked_ancestors)
-        managed = _external_process_owner()
-        receipt = self._write_receipt(
+        self._write_receipt(
             target,
             result,
             version,
             model,
             run_directory,
             coverage,
-            destination=Path(os.environ["H2H_REVIEW_PENDING_RECEIPT"])
-            if managed
-            else None,
+            destination=destination,
         )
-        if managed:
-            process_control.report_diagnostic(
-                f"{result['summary']}\nReview result pending owner cleanup: {receipt}",
-                standard_output=True,
-            )
-        else:
-            process_control.report_diagnostic(
-                f"{result['summary']}\nCode review passed; wrote {receipt}",
-                standard_output=True,
-            )
 
 
 def main(repository: Path) -> None:
@@ -900,6 +915,8 @@ def main(repository: Path) -> None:
                     model=args.model,
                     force_repository=args.scope == "repository",
                 )
+    except process_control.ProcessOwnershipError as error:
+        raise SystemExit(process_control.TERMINATION_FAILED_EXIT_CODE) from error
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError) as error:
         process_control.report_diagnostic(f"h2h code review: {error}")
         raise SystemExit(1) from error
