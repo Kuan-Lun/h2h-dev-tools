@@ -6,16 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. Install the package in a development environment:
+Use Python 3.14 or newer. When version 0.5.0 is available on your selected
+index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.3.4
+python -m pip install h2h-dev-tools==0.5.0
 ```
 
-For an unpublished candidate, install an explicitly supplied wheel instead:
+For candidate validation, install an explicitly supplied wheel instead. These
+examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.3.4-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.5.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -179,25 +181,83 @@ inside the existing Job. Neither path creates another process owner.
 Apply this only to test children:
 gate checks before and after pytest must retain the real candidate's Git environment.
 
-Pytest entry points select the `pytest` component, source-bootstrap their package
-as above, then call its `pytest_source.main()` before importing pytest or plugins.
+Pytest entry points select the `pytest` component, source-bootstrap their shared
+package as above, then call `pytest_source.main(runtime_sources=...)` before
+importing pytest, plugins or repository runtime. The required mapping explicitly
+names this repository's pure Python runtime packages and their absolute source
+directories. For example, after the verified shared-source bootstrap:
+
+```python
+from pathlib import Path
+from _shared.h2h_dev_tools.pytest_source import main
+
+repository = Path(__file__).resolve().parents[1]
+main(runtime_sources={"h2hdb": repository / "src/h2hdb"})
+```
+
+The repository entry owns these declarations; the runner does not infer packages,
+search sibling repositories or bind installed dependencies. The six H2H entries
+use the following explicit values:
+
+| Repository | Runtime mapping relative to its own root |
+| --- | --- |
+| Core | `{"h2hdb": root / "src/h2hdb"}` |
+| Ingest | `{"h2hdb_ingest": root / "src/h2hdb_ingest"}` |
+| OPDS | `{"h2hdb_opds": root / "src/h2hdb_opds"}` |
+| Komga | `{"h2hdb_komga": root / "src/h2hdb_komga"}` |
+| Downloader | `{"h2hdb_downloader": root / "src/h2hdb_downloader"}` |
+| hbrowser | `{"hbrowser": root / "hbrowser"}` |
+
+hbrowser keeps its existing runtime owner and passes a zero-argument callback,
+`adapter.run(lambda: main(runtime_sources={"hbrowser": root / "hbrowser"}), pytest_entry=True)`.
+The toolkit's own `scripts/run-pytest.py` explicitly passes `{}` because its only
+owned runtime package is already covered by the verified toolkit source loader.
+
+The controller captures the complete Python source inventory and directory
+topology before pytest loads.
+Each local xdist worker must match that same inventory before loading plugins or
+conftests. Imports under declared names use candidate source even if `PYTHONPATH`
+points at another checkout; source bytes are checked again when each module is
+first loaded. Earlier ordinary imports, changed or added source, source symlinks,
+redirected package paths and falling back to another installation are rejected.
+Roots must be regular Python packages. Nested namespace directories, including
+empty and resource-only directories, are retained and checked against the same
+controller inventory. Namespace resource access uses ordinary file reads; resource
+bytes are outside the Python source hash guarantee.
+Native extension modules and installed dependency packages are outside this
+pure-Python source declaration. Start a fresh process for each invocation.
+
+The verified toolkit package and declared runtime packages are compiled directly
+from verified source, even when a plugin registers them for assertion rewriting.
+The runner wraps pytest's
+`assertion.install_importhook` only for this invocation to keep the runtime finder
+and this invocation's unique registered toolkit finder before the newly installed
+rewrite hook, including an empty runtime mapping. An unsupported installer or registration
+fails explicitly. Tests, conftests and other packages retain normal assertion
+rewriting; `--assert=plain` keeps its ordinary meaning. The installer is restored
+when the controller exits.
+
 The helper preserves pytest arguments and uses a unique empty bytecode-cache
-prefix with cache writes disabled. It prepends the verified package's import
-root to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix.
-An optional xdist gateway hook revalidates and source-loads the same package in
-each local worker before its pytest plugins and conftests load. It checks the
-controller's original source hashes, captured
-before pytest or its plugins are imported. A valid replacement snapshot is still
-a different generation and is rejected. Worker bootstrap and snapshot verifier
-code are compiled from the exact bytes checked against those hashes; subsequent
-module imports recheck their expected hashes before compiling their bytes.
-Path ordering alone cannot protect namespace packages from another checkout's
-regular package.
-The settings are restored and the temporary directory removed when pytest exits.
-This covers direct local Python workers; remote or chained
-workers need their own explicit source distribution and are not supported by this
-entry's source guarantee. Each repository still owns selectors, dependencies,
-process ownership and deadlines; the toolkit has no runtime pytest dependency.
+prefix with cache writes disabled. It prepends the verified toolkit import root
+to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix.
+The local xdist gateway hook revalidates and source-loads the same toolkit package
+using the controller's original hashes. Worker bootstrap and snapshot verifier
+code are compiled from the bytes checked against those hashes. Workers explicitly
+set the same cache prefix and write policy, including interpreters started with
+`-I` or `-E`, which ignore inherited `PYTHON*` environment variables.
+Settings and the runtime finder are restored when pytest exits; imported modules
+are not unloaded. Remote or chained workers need their own explicit source
+distribution and are outside this entry's guarantee. Selectors, dependencies,
+process ownership and deadlines remain repository-owned.
+
+Version 0.5 removes the no-argument `main()` call; there is no fallback that silently
+leaves runtime imports unbound. To update a consumer, install an explicit release
+or candidate wheel, regenerate its snapshot with the existing `h2h-dev-tools sync
+--repository ROOT` command, and update its thin entry with the mapping above in
+the same task. Existing snapshots continue using their own recorded version until
+that explicit update. Application data needs no conversion. No automatic source
+rewriter is provided: package names and source paths remain the entry's declared
+contract, and installed-wheel smoke keeps ordinary imports.
 
 Version paths are declared in `[tool.h2h.version]`; dependency inventory comes
 from the project manifests. Adding, changing or removing only the `dev` optional

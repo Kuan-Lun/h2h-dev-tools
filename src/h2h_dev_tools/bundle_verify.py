@@ -37,7 +37,7 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "version-policy": frozenset({"dependency_manifest.py", "version_policy.py"}),
     "publish-version": frozenset({"publish_version.py"}),
     "process": frozenset({"process.py", "_process_scope.py"}),
-    "pytest": frozenset({"pytest_source.py"}),
+    "pytest": frozenset({"pytest_source.py", "pytest_runtime.py"}),
     "distribution-check": frozenset({"distribution_check.py"}),
     "offline-wheel": frozenset({"offline_wheel.py"}),
     "formal": frozenset({"formal.py"}),

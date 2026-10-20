@@ -179,6 +179,19 @@
   必須吻合此集合，不能自行接納另一份有效 snapshot。Worker 的 bootstrap 與
   snapshot verifier 直接編譯已核對該集合的 bytes，避免重讀路徑的時間窗口；
   每個 module 的實際 import 仍核對同一來源 hash。
+  自用入口必須明列 `runtime_sources`；本 repo 使用 `{}`，因 toolkit runtime
+  已由上述 source loader 綁定。Consumer 入口明列自身 pure Python package 名稱
+  與絕對來源路徑，不推測 sibling 或已安裝依賴。Controller 在 pytest 載入前
+  擷取 runtime Python source hashes 及目錄 topology（含 empty/resource-only
+  namespace），local worker 必須吻合同一 inventory；resource bytes 不屬 hash 契約。
+  每次首次 import 再核對 bytes，拒絕預先匯入、來源漂移及外部來源 fallback。
+  已驗證 toolkit 及宣告 runtime 即使被 register_assert_rewrite 標記，仍直接
+  編譯已驗證 source。在 assertion hook 安裝點保護本次唯一註冊的 toolkit
+  finder 及 runtime finder，空 mapping 也適用；未知或重複 registration 拒絕。
+  一般 tests/conftests 的 assertion rewrite 與 --assert=plain 行為保留。
+  Worker 明確設定 cache prefix 與禁止 bytecode 寫入，不能只依賴 `PYTHON*`
+  環境，因 `-I`／`-E` 會忽略它。每次 invocation 使用新程序；不負責卸載
+  已匯入 modules。不得保留無參數 `main()` 或自動推測 package 的相容路徑。
   已安裝 wheel 的隔離 smoke 保留正常 import，不套用 checkout loader。
 - Wheel smoke 僅複製已安裝 `packaging` distribution 供離線 resolver，禁止借用
   editable source 或整個 development site。此結果不代表 registry-backed clean
