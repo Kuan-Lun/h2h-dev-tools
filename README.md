@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.6.0 is available on your selected
+Use Python 3.14 or newer. When version 0.7.0 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.6.0
+python -m pip install h2h-dev-tools==0.7.0
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.6.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.7.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -124,7 +124,25 @@ bytecode caches may exist but are never executed by this loader; `-B` alone only
 prevents new cache writes. Repeated bootstrap of the same namespace, directory
 and bytes preserves existing module and class identity. A changed source set,
 conflicting directory or package imported before bootstrap is rejected; start a
-fresh process after an update. The namespace's parent remains repository-owned.
+fresh process after an update.
+
+Qualified namespaces also pin every parent package to its explicit directory.
+Parent initializers remain repository-owned and outside the snapshot manifest;
+the loader records their source hashes and compiles source without reading
+bytecode. A namespace parent records the absence of an initializer. An earlier
+ordinary parent import, changed initializer, changed parent path, or newly added
+initializer requires a fresh process. Parent initializers may import the verified
+child package. Their unrelated imports are outside this flat-package guarantee.
+
+Version 0.7 requires bootstrap before any ordinary import of a qualified parent.
+Update generated snapshots with the existing `h2h-dev-tools sync --repository ROOT`
+command, start a fresh process, and keep bootstrap ahead of parent or shared imports
+in handwritten entries. There is no fallback to an already imported parent.
+An automatic entry rewriter cannot infer arbitrary initializer side effects or
+safe import ordering. Application data is unchanged and needs no conversion.
+Existing review evidence is invalidated; establish a new full-repository review
+through the normal merge workflow rather than converting old receipts.
+
 Toolkit checkout development uses its `scripts/*.py` source entries, including
 editable environments. Snapshot synchronization uses a CLI installed from an
 explicit immutable release or candidate wheel, not an editable CLI. Ordinary
@@ -241,8 +259,11 @@ The helper preserves pytest arguments and uses a unique empty bytecode-cache
 prefix with cache writes disabled. It prepends the verified toolkit import root
 to `sys.path` and `PYTHONPATH`, preserving the existing environment suffix.
 The local xdist gateway hook revalidates and source-loads the same toolkit package
-using the controller's original hashes. Worker bootstrap and snapshot verifier
-code are compiled from the bytes checked against those hashes. Workers explicitly
+using the controller's original hashes and complete parent directory/initializer
+authority, captured before pytest or plugins are imported. A missing parent
+initializer is explicit authority, so adding one later is also rejected.
+Worker bootstrap and snapshot verifier code are compiled from the bytes checked
+against those hashes. Workers explicitly
 set the same cache prefix and write policy, including interpreters started with
 `-I` or `-E`, which ignore inherited `PYTHON*` environment variables.
 Settings and the runtime finder are restored when pytest exits; imported modules
@@ -406,9 +427,22 @@ Aborted candidates and old difference-only receipts cannot establish a baseline.
 
 Review evidence in Git common metadata `h2h-review` binds the exact tree, ordered
 parents, scope, baseline, root policy, local review entry points and shared reviewer,
-process and classification sources. It is separate
-from test evidence. Run needs an authenticated `codex` CLI and POSIX process-group
-support; offline verify also works on Windows. The default timeout is 900 seconds
+process and classification sources. Snapshot reviewer parent initializers also
+bind their candidate Git mode/blob (or explicit absence) and their current source
+mode/hash independently. Managed owners pre-read the same repository dependency;
+qualified reviewers additionally verify it against their loaded parent authority.
+These identities use repository-relative paths, not checkout locations. Changing
+parent source, mode, or presence invalidates earlier evidence, including offline
+revision verification. A new review also rejects a current initializer that differs
+from the exact candidate, even if Git ignores that file. Historical tree identities
+do not claim that the current initializer was executed in that historical review.
+Review evidence is separate from test evidence. Run needs an authenticated `codex`
+CLI and POSIX process-group support; offline verify also works on Windows when
+the recorded source bytes, initializer presence and observed modes are preserved.
+A checkout that cannot preserve an executable parent initializer's mode cannot
+reuse that receipt; verify it in a supported POSIX checkout instead. This does not
+normalize filesystem modes or claim native Windows validation of executable
+initializers. The default timeout is 900 seconds
 (`--timeout-seconds` accepts 1..3600). Set `H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600`
 when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
 review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not

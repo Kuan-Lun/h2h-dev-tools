@@ -1009,3 +1009,113 @@ def test_workers_reject_namespace_directory_topology_drift(
     )
     assert (candidate.root / "master.json").exists()
     assert not (candidate.root / "gw0.json").exists()
+
+
+@pytest.mark.parametrize("cache_mode", ["TIMESTAMP", "UNCHECKED_HASH"])
+def test_snapshot_entry_and_workers_ignore_parent_bytecode(
+    tmp_path: Path, cache_mode: str
+) -> None:
+    candidate = _candidate(tmp_path, "snapshot")
+    parent = candidate.package.parent / "__init__.py"
+    stale = b"raise RuntimeError('STALE PARENT CACHE')\n"
+    current = b"VALUE = 'current'\n".ljust(len(stale), b" ")
+    parent.write_bytes(stale)
+    timestamp = parent.stat().st_mtime_ns
+    cache = py_compile.compile(
+        str(parent),
+        cfile=str(
+            parent.parent
+            / "__pycache__"
+            / f"__init__.{sys.implementation.cache_tag}.pyc"
+        ),
+        doraise=True,
+        invalidation_mode=getattr(py_compile.PycInvalidationMode, cache_mode),
+    )
+    assert cache is not None
+    parent.write_bytes(current)
+    os.utime(parent, ns=(timestamp, timestamp))
+    cached = Path(cache).read_bytes()
+    test = candidate.root / "test_candidate.py"
+    test.write_text(
+        "import _shared\nassert _shared.VALUE == 'current'\n" + test.read_text()
+    )
+    result = _run(
+        candidate,
+        _environment(candidate),
+        "-I",
+        "-B",
+        "entry.py",
+        "-p",
+        "no:cacheprovider",
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "-q",
+        "test_candidate.py",
+        "-k",
+        "not deliberate_failure",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "4 passed" in result.stdout
+    assert Path(cache).read_bytes() == cached
+    for worker in ("master", "gw0", "gw1"):
+        assert (candidate.root / f"{worker}.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["replace-init", "add-init", "remove-init", "link-init", "link-parent"]
+)
+def test_workers_reject_parent_authority_changes_after_controller_bootstrap(
+    tmp_path: Path, mutation: str
+) -> None:
+    candidate = _candidate(tmp_path, "snapshot")
+    parent = candidate.package.parent / "__init__.py"
+    if mutation != "add-init":
+        parent.write_text("VALUE = 'original'\n")
+    executed = candidate.root / "changed-parent-executed"
+    code = f"from pathlib import Path\nPath({str(executed)!r}).touch()\n"
+    if mutation in {"replace-init", "add-init"}:
+        change = f"changed.write_text({code!r})"
+    elif mutation == "remove-init":
+        change = "changed.unlink()"
+    elif mutation == "link-init":
+        replacement = candidate.root / "other-init.py"
+        replacement.write_text(code)
+        change = f"changed.unlink(); changed.symlink_to({str(replacement)!r})"
+    else:
+        change = "parent = changed.parent; moved = parent.with_name('moved-parent'); parent.rename(moved); parent.symlink_to(moved, target_is_directory=True)"
+    conftest = candidate.root / "conftest.py"
+    conftest.write_text(
+        conftest.read_text()
+        + "def pytest_configure(config):\n"
+        + "    if not hasattr(config, 'workerinput'):\n"
+        + f"        changed = Path({str(parent)!r})\n"
+        + f"        {change}\n"
+    )
+    result = _run(
+        candidate,
+        _environment(candidate),
+        "entry.py",
+        "-p",
+        "no:cacheprovider",
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "2",
+        "-q",
+        "test_candidate.py",
+        "-k",
+        "not deliberate_failure",
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    expected_error = (
+        "Managed bundle path must be a real directory"
+        if mutation == "link-parent"
+        else "SourceLoadError"
+    )
+    assert expected_error in result.stdout + result.stderr
+    assert (candidate.root / "master.json").exists()
+    assert not (candidate.root / "gw0.json").exists()
+    assert not (candidate.root / "gw1.json").exists()
+    assert not executed.exists()

@@ -122,11 +122,30 @@ def _install_pytest_sources(runtime: RuntimeSources) -> Callable[[], None]:
     return restore
 
 
+def _registered_parents() -> dict[str, tuple[str, str | None]]:
+    parents = getattr(globals().get("__loader__"), "_h2h_parent_sources", None)
+    if not isinstance(parents, dict):
+        raise RuntimeError("Pytest runner requires verified parent source authority")
+    result = {}
+    for name, source in parents.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(source, tuple)
+            or len(source) != 2
+            or not isinstance(source[0], str)
+            or (source[1] is not None and not isinstance(source[1], str))
+        ):
+            raise RuntimeError("Invalid controller parent source registration")
+        result[name] = source
+    return result
+
+
 def _run_pytest(
     package: Path,
     namespace: str,
     import_root: str,
     hashes: dict[str, str],
+    parents: dict[str, tuple[str, str | None]],
     cache: str,
     runtime: RuntimeSources,
 ) -> None:
@@ -165,7 +184,8 @@ def _run_pytest(
                 "'__name__': '<worker_source_bootstrap>'}\n"
                 "exec(compile(content, str(path), 'exec'), bootstrap)\n"
                 "bootstrap['load_package'](\n"
-                f"    package, {namespace!r}, expected_hashes=hashes)\n"
+                f"    package, {namespace!r}, expected_hashes=hashes,\n"
+                f"    expected_parents={parents!r})\n"
                 f"from {namespace}.pytest_source import _install_pytest_sources\n"
                 f"_install_pytest_sources({runtime!r})\n"
             ).waitclose()
@@ -187,6 +207,7 @@ def main(*, runtime_sources: Mapping[str, Path]) -> None:
     if tuple(package.parts[-len(parts) :]) != tuple(parts):
         raise RuntimeError("Pytest source package path does not match its namespace")
     hashes = _registered_hashes(package, __package__)
+    parents = _registered_parents()
     runtime = capture_runtime_sources(runtime_sources)
     import_root = str(package.parents[len(parts) - 1])
     environment_keys = (
@@ -213,7 +234,9 @@ def main(*, runtime_sources: Mapping[str, Path]) -> None:
             )
             restore_sources = _install_pytest_sources(runtime)
             try:
-                _run_pytest(package, __package__, import_root, hashes, cache, runtime)
+                _run_pytest(
+                    package, __package__, import_root, hashes, parents, cache, runtime
+                )
             finally:
                 restore_sources()
         finally:

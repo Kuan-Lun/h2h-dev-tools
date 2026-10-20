@@ -172,8 +172,9 @@ def test_selected_merge_component_exports_the_complete_owner(
 
 
 @pytest.mark.parametrize("profile", ["full", "documentation"])
+@pytest.mark.parametrize("parent_initializer", [False, True])
 def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
-    tmp_path: Path, profile: str
+    tmp_path: Path, profile: str, parent_initializer: bool
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True, profile=profile)
@@ -182,6 +183,10 @@ def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
         "[tool.h2h-dev-tools]\ncomponents = ['git-flow', 'code-review', 'hooks']\n"
     )
     bundle.sync_bundle(root)
+    if parent_initializer:
+        (root / "scripts/_shared/__init__.py").write_text(
+            "VALUE = 'current parent source'\n"
+        )
     shutil.rmtree(root / "src")
     for name in (
         "detect-primary-branch.sh",
