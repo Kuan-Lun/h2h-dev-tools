@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-12T09:07:19+00:00",
+  "checked_at": "2026-10-20T15:45:08+00:00",
   "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.4.0",
+  "project_version": "0.5.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -92,7 +92,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.0",
+      "latest": "0.17.1",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -102,7 +102,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.4.0 changes explicit local dependency project sources to ordinary distributions, retaining only the rebuilt repository itself as editable. The installed dependency module and METADATA now belong to its new venv and direct_url.json is written by uv without an editable flag; source edits no longer affect installed dependency bytes until the environment is rebuilt. This intentional breaking CLI contract has a documented one-time environment conversion: upgrade uv to >=0.13.0 and rerun the original rebuild command, preserving all application data. Two real stdlib build backend cases cover spaces, # and % through both path and file URI, normal dependency resolution, installed file inventory and isolated imports, and own-project editable updates. Three unsupported/malformed uv cases reject before any Python environment mutation. All 35 environment and 35 bootstrap/path regressions passed, as did the full fast checks; five corresponding tests fail against committed 0.3.4. The first complete pytest diagnostic run found stale bootstrap mock expectations; it was interrupted via its verified canonical owner with owned_tree_empty=True, those tests were updated and their 35-case slice passed. Canonical full gate remains separately required. No dependency bound or pin changes. Current registry discovery exactly matches the previously reviewed 0.3.4 Python and Node candidates: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.0, markdownlint-cli2 0.23.3; all Python candidates support Python 3.14 and satisfy the declared ranges. Previous release-note conclusions for those identical versions remain applicable. External bootstrap uv is now explicitly >=0.13.0. Official https://github.com/astral-sh/uv/releases/tag/0.11.27 documents encoded hash-path fix #19807; https://github.com/astral-sh/uv/releases/tag/0.13.0 documents the Python 3.15 default (our commands explicitly select 3.14), stricter constraints/editable handling (our editable own-project is in requirements, never constraints), cache refresh/rebuild and archive changes. Isolated uv 0.13.0 reproduced successful encoded path builds where installed 0.10.12 fails. Test fixture venvs are genuine Python venvs to respect new uv refusal to clear arbitrary directories; no --force workaround. Build fixtures use UV_NO_INDEX=1, UV_PYTHON_DOWNLOADS=never, fresh caches and stdlib-only backends because --refresh and UV_OFFLINE are incompatible. Global uv and all consumer repositories are unchanged by this toolkit task.",
+    "note": "Release 0.5.0 requires explicit runtime_sources in pytest_source.main; existing sync regenerates snapshots and each thin caller must declare its owned packages. There is no no-argument fallback, inferred package discovery or application data conversion. Controller and local workers validate the same Python hashes and directory topology, including empty/resource-only namespaces; standard TraversableResources access deliberately leaves resource bytes outside the source-hash guarantee. The pytest assertion installer preserves exactly the registered toolkit finder and runtime finder, including an empty mapping, while ordinary tests/conftests retain rewrite and plain mode. Isolated workers explicitly receive fresh cache settings under -I/-E. All 185 source/entry/bundle regressions passed, including real source/snapshot controller/worker imports, namespace resources, topology drift, unrecorded Python source, post-rewrite mutation and registration rejection. Isolated negative controls against preserved prior source prove both assertion bypass and all three namespace failures. Ruff, formatter, strict mypy and Markdown checks passed; final formal review and full release gate remain independently required. No dependency bounds, pins, runtime dependencies or global tools changed. Fresh registry discovery finds all Python candidates support 3.14 and all Python/Node latest versions satisfy declared ranges. Hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0 and markdownlint-cli2 0.23.3 match the previously reviewed 0.4.0 candidates, so the identical release-note conclusions remain applicable. Ruff alone advanced to 0.17.1. Official https://github.com/astral-sh/ruff/releases/tag/0.17.1 describes preview whitespace-keyword fixes, multiline dedent fixes, PYI/PERF fixes and mutable-container recognition. This repo does not enable preview/PYI/PERF and passes its strict selected rules and formatter with 0.17.1. A fresh normally resolved environment built 0.5.0 project metadata with uv 0.13.0 and these candidates.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

@@ -12,7 +12,7 @@ def main() -> None:
     )
     from h2h_dev_tools.pytest_source import main as run_pytest
 
-    run_pytest()
+    run_pytest(runtime_sources={})
 
 
 if __name__ == "__main__":
