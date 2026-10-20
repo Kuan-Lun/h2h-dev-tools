@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import io
 import os
 import signal
 import stat
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -17,6 +18,7 @@ from unittest.mock import ANY, Mock, call
 
 import pytest
 
+from h2h_dev_tools import _process_diagnostic as diagnostic
 from h2h_dev_tools import process as implementation
 
 runner: ModuleType = implementation
@@ -40,6 +42,21 @@ def require_explicit_process_launch_double(
     popen.assert_not_called()
 
 
+@pytest.fixture
+def memory_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep owner-unit output real without introducing a second process owner.
+
+    Tests of the pipe writer opt into their own transport boundary or real
+    process fixture; these lifecycle units use ordinary in-memory text streams.
+    """
+    # Pytest restores global streams between fixture setup and the test call.
+    # Bind this unit's streams without replacing pytest's own capture objects.
+    streams = SimpleNamespace(**vars(sys))
+    streams.stdout = io.StringIO()
+    streams.stderr = io.StringIO()
+    monkeypatch.setattr(runner, "sys", streams)
+
+
 def test_start_phase_inherits_live_output_and_starts_posix_process_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -53,6 +70,61 @@ def test_start_phase_inherits_live_output_and_starts_posix_process_group(
     assert keywords["start_new_session"] is True
     assert keywords["stdout"] is None
     assert keywords["stderr"] is None
+
+
+@pytest.mark.parametrize("startup_error", [IndexError(), TypeError(), ValueError()])
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_posix_startup_argument_failure_rolls_back_only_proven_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    startup_error: Exception,
+    rollback_fails: bool,
+) -> None:
+    from h2h_dev_tools import _process_scope
+
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="posix"))
+    scope = Mock(proven_empty=False)
+    rollback_error = _process_scope.ScopeError("obligation identity changed")
+    if rollback_fails:
+        scope.close.side_effect = rollback_error
+    monkeypatch.setattr(_process_scope.PosixScope, "create", Mock(return_value=scope))
+    monkeypatch.setattr(runner, "_start_posix_process", Mock(side_effect=startup_error))
+
+    with pytest.raises(runner.ProcessOwnershipError) as caught:
+        runner.start_owned_process(COMMAND, deadline=100.0, signal_controller=None)
+
+    assert caught.value.cleanup_proven is False
+    assert caught.value.__cause__ is (
+        rollback_error if rollback_fails else startup_error
+    )
+    assert scope.proven_empty is True
+    scope.close.assert_called_once_with(deadline=100.0)
+
+
+@pytest.mark.parametrize(
+    "startup_error",
+    [
+        RuntimeError("unknown startup failure"),
+        KeyboardInterrupt(),
+        implementation.RunnerSignalInterrupt(15),
+    ],
+)
+def test_posix_unknown_startup_failure_retains_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+    startup_error: BaseException,
+) -> None:
+    from h2h_dev_tools import _process_scope
+
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="posix"))
+    scope = Mock(proven_empty=False)
+    monkeypatch.setattr(_process_scope.PosixScope, "create", Mock(return_value=scope))
+    monkeypatch.setattr(runner, "_start_posix_process", Mock(side_effect=startup_error))
+
+    with pytest.raises(type(startup_error)) as caught:
+        runner.start_owned_process(COMMAND, deadline=100.0, signal_controller=None)
+
+    assert caught.value is startup_error
+    assert scope.proven_empty is False
+    scope.close.assert_not_called()
 
 
 def test_windows_start_requires_a_real_new_process_group_flag(
@@ -109,18 +181,29 @@ def test_windows_start_uses_new_process_group_and_inherits_live_output(
 
 @pytest.mark.parametrize("with_windows_job", [False, True])
 @pytest.mark.parametrize("terminated", [True, False])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_timeout_checks_owned_tree_termination(
     monkeypatch: pytest.MonkeyPatch,
     terminated: bool,
     with_windows_job: bool,
 ) -> None:
     process = Mock()
-    process.wait.side_effect = subprocess.TimeoutExpired(cmd="pytest", timeout=3.0)
     job = Mock() if with_windows_job else None
-    owner = runner.OwnedProcess(process, job)
-    start = Mock(return_value=owner)
+    owner = implementation.OwnedProcess(process, job)
+    monotonic = Mock(return_value=100.0)
+
+    def started(*_args: object, **_kwargs: object) -> implementation.OwnedProcess:
+        monotonic.return_value = 101.0
+        return owner
+
+    def expired(*, timeout: float) -> int:
+        assert timeout == 3.0
+        monotonic.return_value = 104.0
+        raise subprocess.TimeoutExpired(cmd="pytest", timeout=timeout)
+
+    process.wait.side_effect = expired
+    start = Mock(side_effect=started)
     terminate = Mock(return_value=terminated)
-    monotonic = Mock(side_effect=(100.0, 101.0, 102.0))
     monkeypatch.setattr(runner, "start_owned_process", start)
     monkeypatch.setattr(runner, "terminate_owned_tree", terminate)
     monkeypatch.setattr(runner.time, "monotonic", monotonic)
@@ -134,23 +217,38 @@ def test_timeout_checks_owned_tree_termination(
             runner.run_command(COMMAND, hard_deadline=110.0)
     process.wait.assert_called_once_with(timeout=3.0)
     start.assert_called_once_with(COMMAND, deadline=110.0, signal_controller=ANY)
-    terminate.assert_called_once_with(owner, deadline=110.0)
+    terminate.assert_called_once_with(owner, deadline=110.0, diagnostic=ANY)
     if job is not None:
         job.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("with_windows_job", [False, True])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_phase_wait_subtracts_ownership_overhead_from_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
     with_windows_job: bool,
 ) -> None:
     process = Mock()
-    process.wait.return_value = 0
     job = Mock() if with_windows_job else None
-    owner = runner.OwnedProcess(process, job)
-    start = Mock(return_value=owner)
-    monotonic = Mock(side_effect=(100.0, 103.0, 103.5, 104.0))
-    wait_for_tree = Mock(return_value=True)
+    owner = implementation.OwnedProcess(process, job)
+    monotonic = Mock(return_value=100.0)
+
+    def started(*_args: object, **_kwargs: object) -> implementation.OwnedProcess:
+        monotonic.return_value = 103.0
+        return owner
+
+    def waited(*, timeout: float) -> int:
+        assert timeout == 1.0
+        monotonic.return_value = 103.5
+        return 0
+
+    def empty(*_args: object, **_kwargs: object) -> bool:
+        monotonic.return_value = 104.0
+        return True
+
+    process.wait.side_effect = waited
+    start = Mock(side_effect=started)
+    wait_for_tree = Mock(side_effect=empty)
     monkeypatch.setattr(runner, "start_owned_process", start)
     monkeypatch.setattr(runner, "wait_for_owned_tree_exit", wait_for_tree)
     monkeypatch.setattr(runner.time, "monotonic", monotonic)
@@ -218,6 +316,70 @@ def test_posix_termination_reports_a_group_that_survives_sigkill(
     assert not runner._terminate_posix_process_group(process, deadline=1000.0)
 
 
+@pytest.mark.parametrize("edge", [15, 9], ids=["term", "kill"])
+@pytest.mark.parametrize(
+    "outcome", ["resolved", "permission", "other-error", "pending"]
+)
+def test_posix_signal_eperm_requires_bounded_complete_cleanup_proof(
+    monkeypatch: pytest.MonkeyPatch, edge: int, outcome: str
+) -> None:
+    process = Mock(pid=4312)
+    process.poll.return_value = 0
+    process.wait.return_value = 0
+    scope = Mock()
+    clock = 100.0
+    deadline = 106.0
+    signaled = False
+    probes = 0
+    calls: list[int] = []
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    def pending(*, deadline: float) -> bool:
+        assert deadline <= 106.0
+        return signaled and outcome == "pending"
+
+    def kill_process_group(group: int, number: int) -> None:
+        nonlocal signaled, probes
+        assert group == process.pid
+        calls.append(number)
+        if number == edge:
+            signaled = True
+            if outcome == "other-error":
+                raise OSError(errno.EIO, "Unknown signaling failure")
+            raise PermissionError(errno.EPERM, "No absence evidence")
+        if number == 0 and signaled:
+            probes += 1
+            if outcome == "permission" or (outcome == "resolved" and probes == 1):
+                raise PermissionError(errno.EPERM, "Still no absence evidence")
+            raise ProcessLookupError(errno.ESRCH, "Group absent")
+
+    scope.has_pending.side_effect = pending
+    monkeypatch.setattr(runner, "os", SimpleNamespace(killpg=kill_process_group))
+    monkeypatch.setattr(runner, "signal", SimpleNamespace(SIGTERM=15, SIGKILL=9))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+
+    assert runner._terminate_posix_process_group(
+        process, deadline=deadline, scope=scope
+    ) is (outcome == "resolved")
+    scope.close_admission.assert_called_once_with(deadline=deadline)
+    assert signaled and calls.count(edge) == 1
+    assert clock <= deadline
+    if outcome == "resolved":
+        assert probes == 2
+        assert clock < deadline
+        process.wait.assert_called_once()
+    else:
+        process.wait.assert_not_called()
+        if outcome == "other-error":
+            assert probes == 0 and clock < deadline
+        else:
+            assert probes >= 2 and clock == deadline
+
+
 def test_windows_taskkill_success_is_checked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,6 +406,7 @@ def test_windows_taskkill_success_is_checked(
     )
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_taskkill_nonzero_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -500,20 +663,24 @@ def test_signal_controller_defers_first_signal_and_ignores_repeats() -> None:
     controller.receive(21)
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_bounded_interrupt_cleanup_never_extends_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = Mock()
-    process.wait.side_effect = KeyboardInterrupt
+    monotonic = Mock(return_value=100.0)
+
+    def interrupted(*, timeout: float) -> int:
+        assert timeout == 4.0
+        monotonic.return_value = 109.0
+        raise KeyboardInterrupt
+
+    process.wait.side_effect = interrupted
     owner = runner.OwnedProcess(process)
     terminate = Mock(return_value=True)
     monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
     monkeypatch.setattr(runner, "terminate_owned_tree", terminate)
-    monkeypatch.setattr(
-        runner.time,
-        "monotonic",
-        Mock(side_effect=(100.0, 101.0, 109.0)),
-    )
+    monkeypatch.setattr(runner.time, "monotonic", monotonic)
 
     with pytest.raises(KeyboardInterrupt):
         runner.run_command(
@@ -522,9 +689,10 @@ def test_bounded_interrupt_cleanup_never_extends_absolute_deadline(
             signal_controller=runner.SignalController(),
         )
 
-    terminate.assert_called_once_with(owner, deadline=110.0)
+    terminate.assert_called_once_with(owner, deadline=110.0, diagnostic=ANY)
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_signal_during_timeout_cleanup_waits_for_empty_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -533,7 +701,10 @@ def test_windows_signal_during_timeout_cleanup_waits_for_empty_receipt(
     process.wait.side_effect = subprocess.TimeoutExpired("pytest", 3.0)
     owner = runner.OwnedProcess(process)
 
-    def terminate(_owner: object, *, deadline: float) -> bool:
+    def terminate(
+        _owner: object, *, deadline: float, diagnostic: Callable[[str], None]
+    ) -> bool:
+        assert callable(diagnostic)
         assert deadline == 110.0
         controller.receive(signal.SIGINT)
         controller.receive(21)
@@ -544,7 +715,7 @@ def test_windows_signal_during_timeout_cleanup_waits_for_empty_receipt(
     monkeypatch.setattr(
         runner.time,
         "monotonic",
-        Mock(side_effect=(100.0, 101.0)),
+        Mock(return_value=100.0),
     )
 
     with pytest.raises(KeyboardInterrupt):
@@ -555,6 +726,7 @@ def test_windows_signal_during_timeout_cleanup_waits_for_empty_receipt(
         )
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_failed_cleanup_cannot_publish_interrupt_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -563,7 +735,10 @@ def test_windows_failed_cleanup_cannot_publish_interrupt_receipt(
     process.wait.side_effect = subprocess.TimeoutExpired("pytest", 3.0)
     owner = runner.OwnedProcess(process)
 
-    def terminate(_owner: object, *, deadline: float) -> bool:
+    def terminate(
+        _owner: object, *, deadline: float, diagnostic: Callable[[str], None]
+    ) -> bool:
+        assert callable(diagnostic)
         assert deadline == 110.0
         controller.receive(signal.SIGINT)
         return False
@@ -573,7 +748,7 @@ def test_windows_failed_cleanup_cannot_publish_interrupt_receipt(
     monkeypatch.setattr(
         runner.time,
         "monotonic",
-        Mock(side_effect=(100.0, 101.0)),
+        Mock(return_value=100.0),
     )
 
     with pytest.raises(runner.ProcessOwnershipError):
@@ -584,6 +759,7 @@ def test_windows_failed_cleanup_cannot_publish_interrupt_receipt(
         )
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_normal_leader_survivor_is_cleaned_and_fails_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -598,17 +774,18 @@ def test_windows_normal_leader_survivor_is_cleaned_and_fails_phase(
     monkeypatch.setattr(
         runner.time,
         "monotonic",
-        Mock(side_effect=(100.0, 101.0, 102.0)),
+        Mock(return_value=100.0),
     )
 
     with pytest.raises(runner.ProcessOwnershipError):
         runner.run_command(COMMAND, hard_deadline=110.0)
 
-    terminate.assert_called_once_with(owner, deadline=110.0)
+    terminate.assert_called_once_with(owner, deadline=110.0, diagnostic=ANY)
 
 
 @pytest.mark.parametrize("terminated", [False, True])
 @pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_ownership_failure_reports_cleanup_only_after_empty_tree_and_owner_close(
     monkeypatch: pytest.MonkeyPatch, terminated: bool, closed: bool
 ) -> None:
@@ -625,6 +802,7 @@ def test_ownership_failure_reports_cleanup_only_after_empty_tree_and_owner_close
     assert failure.value.cleanup_proven is (terminated and closed)
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_job_termination_falls_back_to_taskkill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -639,7 +817,7 @@ def test_windows_job_termination_falls_back_to_taskkill(
     monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
 
     assert runner._terminate_windows_tree(owner, deadline=110.0)
-    taskkill.assert_called_once_with(process, deadline=110.0)
+    taskkill.assert_called_once_with(process, deadline=110.0, diagnostic=None)
     wait_tree.assert_called_once_with(owner, deadline=110.0)
 
 
@@ -734,6 +912,7 @@ def test_windows_job_wait_uses_active_process_count_until_empty(
     assert kernel32.QueryInformationJobObject.call_count == 2
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_job_close_failure_fails_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -747,13 +926,14 @@ def test_windows_job_close_failure_fails_phase(
     monkeypatch.setattr(
         runner.time,
         "monotonic",
-        Mock(side_effect=(100.0, 101.0, 102.0)),
+        Mock(return_value=100.0),
     )
 
     with pytest.raises(runner.ProcessOwnershipError):
         runner.run_command(COMMAND, hard_deadline=110.0)
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_windows_signal_during_job_close_is_delivered_after_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -768,7 +948,7 @@ def test_windows_signal_during_job_close_is_delivered_after_close(
     monkeypatch.setattr(
         runner.time,
         "monotonic",
-        Mock(side_effect=(100.0, 101.0, 102.0)),
+        Mock(return_value=100.0),
     )
 
     with pytest.raises(KeyboardInterrupt):
@@ -782,6 +962,7 @@ def test_windows_signal_during_job_close_is_delivered_after_close(
 
 @pytest.mark.parametrize("hard_deadline", [None, 110.0])
 @pytest.mark.parametrize("failed_wait", ["leader", "tree"])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_wait_error_still_terminates_and_closes_owner(
     monkeypatch: pytest.MonkeyPatch,
     hard_deadline: float | None,
@@ -816,12 +997,13 @@ def test_wait_error_still_terminates_and_closes_owner(
         hard_deadline if failed_wait == "tree" and hard_deadline else 106.0
     )
     assert lifecycle.mock_calls == [
-        call.terminate(owner, deadline=expected_deadline),
+        call.terminate(owner, deadline=expected_deadline, diagnostic=ANY),
         call.close(),
     ]
 
 
 @pytest.mark.parametrize("cleanup_error", [False, OSError("termination failed")])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_failed_termination_still_closes_job_and_fails_ownership(
     monkeypatch: pytest.MonkeyPatch,
     cleanup_error: bool | OSError,
@@ -842,7 +1024,7 @@ def test_failed_termination_still_closes_job_and_fails_ownership(
     with pytest.raises(runner.ProcessOwnershipError):
         runner.run_command(COMMAND, hard_deadline=110.0)
 
-    terminate.assert_called_once_with(owner, deadline=106.0)
+    terminate.assert_called_once_with(owner, deadline=106.0, diagnostic=ANY)
     job.close.assert_called_once_with()
 
 
@@ -851,6 +1033,7 @@ def test_failed_termination_still_closes_job_and_fails_ownership(
     [BrokenPipeError, OSError, ValueError, RuntimeError],
 )
 @pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_diagnostic_failure_cannot_skip_teardown_or_job_close(
     monkeypatch: pytest.MonkeyPatch,
     diagnostic_error: type[Exception],
@@ -865,8 +1048,9 @@ def test_diagnostic_failure_cannot_skip_teardown_or_job_close(
     job = Mock()
     owner = runner.OwnedProcess(process, job)
     terminate = Mock(return_value=True)
-    diagnostic_stream = Mock()
-    diagnostic_stream.write.side_effect = diagnostic_error("diagnostic unavailable")
+    diagnostic_stream = io.StringIO()
+    failed_write = Mock(side_effect=diagnostic_error("diagnostic unavailable"))
+    monkeypatch.setattr(diagnostic_stream, "write", failed_write)
     monkeypatch.setattr(runner.sys, "stderr", diagnostic_stream)
     monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
     monkeypatch.setattr(runner, "terminate_owned_tree", terminate)
@@ -880,8 +1064,11 @@ def test_diagnostic_failure_cannot_skip_teardown_or_job_close(
             runner.run_command(COMMAND, hard_deadline=110.0) == runner.TIMEOUT_EXIT_CODE
         )
 
-    terminate.assert_called_once_with(owner, deadline=106.0 if interrupted else 110.0)
+    terminate.assert_called_once_with(
+        owner, deadline=106.0 if interrupted else 110.0, diagnostic=ANY
+    )
     job.close.assert_called_once_with()
+    failed_write.assert_called()
 
 
 @pytest.mark.parametrize("standard_output", [False, True])
@@ -930,41 +1117,37 @@ def test_diagnostics_never_write_to_an_unknown_no_descriptor_sink(
     sink.flush.assert_not_called()
 
 
-@pytest.mark.parametrize("blocking", [False, True])
-@pytest.mark.parametrize("pipe_full", [False, True])
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le"])
-def test_windows_pipe_diagnostics_restore_flags_without_buffered_fallback(
-    monkeypatch: pytest.MonkeyPatch, blocking: bool, pipe_full: bool, encoding: str
+def test_windows_pipe_diagnostics_preserve_payload_without_mutating_shared_flags(
+    monkeypatch: pytest.MonkeyPatch, encoding: str
 ) -> None:
     sink = Mock(encoding=encoding, errors="strict")
     sink.fileno.return_value = 42
     payload = "清理已完成 ✓\n".encode(encoding)
-    written: list[bytes] = []
-
-    def write(descriptor: int, value: bytes | memoryview) -> int:
-        assert descriptor == 42
-        if pipe_full:
-            raise BlockingIOError("pipe reader is not consuming")
-        # A short write must preserve the remaining Unicode bytes exactly.
-        chunk = bytes(value[:3])
-        written.append(chunk)
-        return len(chunk)
-
     native = SimpleNamespace(
         name="nt",
         fstat=Mock(return_value=SimpleNamespace(st_mode=stat.S_IFIFO)),
-        get_blocking=Mock(return_value=blocking),
+        get_blocking=Mock(),
         set_blocking=Mock(),
-        write=Mock(side_effect=write),
+        write=Mock(),
     )
+    transport = Mock()
+    monkeypatch.setattr(diagnostic, "write_diagnostic", transport)
     monkeypatch.setattr(runner, "os", native)
     monkeypatch.setattr(runner.sys, "stderr", sink)
+    monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
+    controller = runner.SignalController()
+    runner.report_diagnostic(
+        "清理已完成 ✓", deadline=101.0, signal_controller=controller
+    )
 
-    runner.report_diagnostic("清理已完成 ✓")
-
-    assert native.set_blocking.call_args_list == [call(42, False), call(42, blocking)]
-    assert b"".join(written) == (b"" if pipe_full else payload)
-    native.write.assert_called()
+    transport.assert_called_once()
+    assert transport.call_args.args == (42, payload)
+    assert 100.0 < transport.call_args.kwargs["deadline"] <= 101.0
+    assert transport.call_args.kwargs["signal_controller"] is controller
+    native.get_blocking.assert_not_called()
+    native.set_blocking.assert_not_called()
+    native.write.assert_not_called()
     sink.write.assert_not_called()
     sink.flush.assert_not_called()
 
@@ -1002,6 +1185,7 @@ def test_windows_regular_and_console_diagnostics_keep_native_text_encoding(
 
 
 @pytest.mark.parametrize("taskkill_status", [0, 1])
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_broken_diagnostics_cannot_skip_windows_taskkill_fallback_or_job_close(
     monkeypatch: pytest.MonkeyPatch,
     taskkill_status: int,
@@ -1015,8 +1199,9 @@ def test_broken_diagnostics_cannot_skip_windows_taskkill_fallback_or_job_close(
         return_value=subprocess.CompletedProcess((), taskkill_status, "", "failed")
     )
     wait_tree = Mock(return_value=True)
-    diagnostic_stream = Mock()
-    diagnostic_stream.write.side_effect = BrokenPipeError("diagnostic pipe closed")
+    diagnostic_stream = io.StringIO()
+    failed_write = Mock(side_effect=BrokenPipeError("diagnostic pipe closed"))
+    monkeypatch.setattr(diagnostic_stream, "write", failed_write)
     monkeypatch.setattr(runner.sys, "stderr", diagnostic_stream)
     monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
     monkeypatch.setattr(runner.subprocess, "run", taskkill)
@@ -1024,8 +1209,9 @@ def test_broken_diagnostics_cannot_skip_windows_taskkill_fallback_or_job_close(
     monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
 
     if taskkill_status:
-        with pytest.raises(runner.ProcessOwnershipError):
+        with pytest.raises(runner.ProcessOwnershipError) as failure:
             runner.run_command(COMMAND, hard_deadline=110.0)
+        assert "job termination failed" in failure.value.__notes__
         wait_tree.assert_not_called()
     else:
         assert (
@@ -1041,8 +1227,13 @@ def test_broken_diagnostics_cannot_skip_windows_taskkill_fallback_or_job_close(
         timeout=runner.TERMINATION_GRACE_SECONDS,
     )
     job.close.assert_called_once_with()
+    if taskkill_status:
+        failed_write.assert_not_called()
+    else:
+        failed_write.assert_called()
 
 
+@pytest.mark.usefixtures("memory_diagnostics")
 def test_explicit_controller_does_not_replace_callers_handlers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1101,3 +1292,189 @@ def test_startup_cleanup_wait_error_always_closes_job(
     else:
         process.kill.assert_called_once_with()
         job.terminate.assert_not_called()
+
+
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize("custom_sink", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+def test_owner_close_uses_phase_deadline_and_caller_diagnostic_sink(
+    monkeypatch: pytest.MonkeyPatch, windows: bool, custom_sink: bool, failure: bool
+) -> None:
+    resource = Mock()
+    if failure:
+        resource.close.side_effect = OSError("resource close failed")
+    owner = runner.OwnedProcess(
+        Mock(),
+        resource if windows else None,
+        None if windows else resource,
+    )
+    default_sink = Mock()
+    messages: list[str] = []
+    monkeypatch.setattr(runner, "report_diagnostic", default_sink)
+    assert runner.close_owner(
+        owner, deadline=123.0, diagnostic=messages.append if custom_sink else None
+    ) is (not failure)
+    if windows:
+        resource.close.assert_called_once_with()
+    else:
+        resource.close.assert_called_once_with(deadline=123.0)
+    if failure and custom_sink:
+        assert messages == ["resource close failed"]
+        default_sink.assert_not_called()
+    elif failure:
+        assert not messages
+        default_sink.assert_called_once_with("resource close failed", deadline=123.0)
+    else:
+        assert not messages
+        default_sink.assert_not_called()
+
+
+def test_diagnostic_transport_ownership_failure_is_not_optional_output_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = Mock(encoding="utf-8", errors="strict")
+    sink.fileno.return_value = 42
+    error = runner.ProcessOwnershipError("helper cleanup unproven")
+    transport = Mock(side_effect=error)
+    monkeypatch.setattr(diagnostic, "write_diagnostic", transport)
+    monkeypatch.setattr(runner.sys, "stderr", sink)
+    monkeypatch.setattr(runner, "_diagnostic_requires_writer", lambda _fd: True)
+    with pytest.raises(runner.ProcessOwnershipError) as caught:
+        runner.report_diagnostic(
+            "cleanup failed", signal_controller=runner.SignalController()
+        )
+    assert caught.value is error
+    transport.assert_called_once()
+    sink.write.assert_not_called()
+    sink.flush.assert_not_called()
+
+
+@pytest.mark.parametrize("taskkill_status", [0, 1])
+@pytest.mark.parametrize(
+    "interrupt",
+    [None, int(signal.SIGINT), int(getattr(signal, "SIGBREAK", signal.SIGTERM))],
+    ids=["no-signal", "sigint", "platform-termination"],
+)
+@pytest.mark.usefixtures("memory_diagnostics")
+def test_windows_fallback_diagnostics_wait_for_owner_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    taskkill_status: int,
+    interrupt: int | None,
+) -> None:
+    child = Mock(pid=4312)
+    child.wait.side_effect = subprocess.TimeoutExpired("command", 4.0)
+    job = Mock()
+    job.terminate.side_effect = OSError("job termination failed")
+    owner = runner.OwnedProcess(child, job)
+    wait_tree = Mock(return_value=True)
+    diagnostic_events: list[tuple[int, bool, bytes]] = []
+    sink = _NativeDiagnosticCapture(io.BytesIO(), encoding="utf-8")
+    monkeypatch.setattr(runner.sys, "stderr", sink)
+    monkeypatch.setattr(runner, "_diagnostic_requires_writer", Mock(return_value=True))
+    monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
+    monkeypatch.setattr(runner, "wait_for_owned_tree_exit", wait_tree)
+    monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
+
+    def deliver_signal() -> None:
+        if interrupt is not None:
+            handler = signal.getsignal(interrupt)
+            assert callable(handler)
+            handler(interrupt, None)
+
+    def taskkill(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        # The primary controller must keep this signal pending during cleanup.
+        deliver_signal()
+        return subprocess.CompletedProcess((), taskkill_status, "", "fallback failed")
+
+    def write_diagnostic(
+        descriptor: int,
+        payload: bytes,
+        *,
+        deadline: float,
+        signal_controller: implementation.SignalController,
+    ) -> None:
+        assert descriptor == 42 and deadline <= 110.0
+        diagnostic_events.append(
+            (job.close.call_count, signal_controller is controller, payload)
+        )
+        # Model arrival while the optional pipe writer is outside its own defer.
+        deliver_signal()
+
+    monkeypatch.setattr(runner.subprocess, "run", taskkill)
+    monkeypatch.setattr(diagnostic, "write_diagnostic", write_diagnostic)
+    caught: BaseException | None = None
+    result: int | None = None
+    try:
+        with runner.controlled_termination_signals() as controller:
+            try:
+                result = runner.run_command(
+                    COMMAND, hard_deadline=110.0, signal_controller=controller
+                )
+            except (
+                KeyboardInterrupt,
+                runner.RunnerSignalInterrupt,
+                runner.ProcessOwnershipError,
+            ) as error:
+                caught = error
+    finally:
+        sink.close()
+
+    job.close.assert_called_once_with()
+    if taskkill_status:
+        assert isinstance(caught, implementation.ProcessOwnershipError)
+        assert not caught.cleanup_proven
+        notes = "\n".join(getattr(caught, "__notes__", []))
+        assert "taskkill failed with exit 1: fallback failed" in notes
+        assert "job termination failed" in notes
+        assert diagnostic_events == []
+        wait_tree.assert_not_called()
+    else:
+        wait_tree.assert_called_once_with(owner, deadline=110.0)
+        assert diagnostic_events
+        assert all(closed == 1 and same for closed, same, _ in diagnostic_events)
+        assert b"job termination failed" in diagnostic_events[0][2]
+        if interrupt is None:
+            assert caught is None and result == runner.TIMEOUT_EXIT_CODE
+        elif interrupt == signal.SIGINT:
+            assert isinstance(caught, KeyboardInterrupt)
+        else:
+            assert isinstance(caught, implementation.RunnerSignalInterrupt)
+            assert caught.signal_number == interrupt
+
+
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("previous_cleanup_proven", [False, True])
+@pytest.mark.usefixtures("memory_diagnostics")
+def test_cleanup_notes_preserve_original_ownership_error_and_cause(
+    monkeypatch: pytest.MonkeyPatch, closed: bool, previous_cleanup_proven: bool
+) -> None:
+    child = Mock()
+    child.wait.side_effect = subprocess.TimeoutExpired("command", 4.0)
+    owner = runner.OwnedProcess(child)
+    original = implementation.ProcessOwnershipError("native cleanup failed")
+    original.cleanup_proven = previous_cleanup_proven
+    cause = OSError("native Job failure")
+    original.__cause__ = cause
+
+    def terminate(
+        actual: implementation.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None],
+    ) -> bool:
+        assert actual is owner and deadline == 110.0
+        diagnostic("saved termination detail")
+        raise original
+
+    monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
+    monkeypatch.setattr(runner, "terminate_owned_tree", terminate)
+    close = Mock(return_value=closed)
+    monkeypatch.setattr(runner, "close_owner", close)
+    monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
+    with pytest.raises(implementation.ProcessOwnershipError) as caught:
+        runner.run_command(COMMAND, hard_deadline=110.0)
+    assert caught.value is original and caught.value.__cause__ is cause
+    assert not caught.value.cleanup_proven
+    assert "saved termination detail" in original.__notes__
+    close.assert_called_once()

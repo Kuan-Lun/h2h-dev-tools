@@ -3,13 +3,12 @@
 set -euo pipefail
 
 diagnose() {
+    # An uncertain owner cannot admit another writer, even to report the failure.
+    [[ "${owner_cleanup_failed:-0}" -eq 0 ]] || return 0
     if [[ -n "${merge_launcher-}" || "${recovering:-0}" -eq 1 ]]; then
-        # A failure must reach EXIT recovery even when the caller stops reading.
-        # Use the prepared owner for normal failures as well as recovery. Startup
-        # failures are silent, never a blocking printf fallback. FD 3 preserves
-        # the destination while startup stderr is null.
-        "${merge_python-}" -I -B "${merge_launcher-}" --workflow-diagnostic "$1" \
-            3>&2 >/dev/null 2>&1 || true
+        # Use the same signal handoff, wait and cleanup receipt as Git owners.
+        # A failed diagnostic must prevent recovery even if Git was already clean.
+        run_tracked diagnostic "$PWD" "$1" || true
         return
     fi
     # Preflight has no owned child or Git mutation to recover. It must still
@@ -252,7 +251,8 @@ receive_signal() {
 prepare_owner() {
     local source_directory=$1 destination=$2 source_file owner_source_files
     mkdir -p "$destination/h2h_dev_tools"
-    owner_source_files="$("$merge_python" -I -B "$source_directory/merge_command.py" --print-source-files)" \
+    # Resolve the stdlib owner closure without admitting arbitrary site startup.
+    owner_source_files="$("$merge_python" -I -S -B "$source_directory/merge_command.py" --print-source-files)" \
         || fail 'could not resolve the process owner source closure'
     while IFS= read -r source_file; do
         cp "$source_directory/$source_file" "$destination/h2h_dev_tools/$source_file"
@@ -277,19 +277,32 @@ run_tracked() {
     shift 2
     command_number=$((command_number + 1))
     active_cleanup_receipt="$execution_directory/cleanup-$command_number"
-    set -- "$working_directory" -- "$@"
-    if [[ "$active_owner" == review ]]; then
-        set -- --review "$@"
+    if [[ "$active_owner" == diagnostic ]]; then
+        # This fixed stdlib entry must not run site code before ownership begins.
+        # Only its canonical bounded writer can spawn children; the receipt is
+        # published after that writer is reaped and its obligation is discharged.
+        set -- "$merge_python" -I -S -B "$merge_launcher" \
+            --workflow-diagnostic "$active_cleanup_receipt" "$1"
+    else
+        set -- "$working_directory" -- "$@"
+        if [[ "$active_owner" == review ]]; then
+            set -- --review "$@"
+        fi
+        if [[ "$recovering" -eq 1 ]]; then
+            set -- --recovery --recovery-output-fds 3 4 "$@"
+        fi
+        # Ownership and recovery deadlines start in this fixed stdlib launcher.
+        # Site startup must not spawn or block before those boundaries exist.
+        set -- "$merge_python" -I -S -B "$merge_launcher" \
+            --cleanup-receipt "$active_cleanup_receipt" "$@"
     fi
-    if [[ "$recovering" -eq 1 ]]; then
-        set -- --recovery --recovery-output-fds 3 4 "$@"
-    fi
-    set -- "$merge_python" -I -B "$merge_launcher" \
-        --cleanup-receipt "$active_cleanup_receipt" "$@"
     # Do not leave a forked supervisor unregistered if a signal arrives between
     # the background launch and assignment of its PID.
     starting_child=1
-    if [[ "$recovering" -eq 1 ]]; then
+    if [[ "$active_owner" == diagnostic ]]; then
+        # Startup errors remain silent; never fall back to a blocking printf.
+        (CDPATH= cd "$working_directory" && exec "$@") 3>&2 >/dev/null 2>&1 &
+    elif [[ "$recovering" -eq 1 ]]; then
         # Preserve destinations for the nonblocking diagnostic writer only.
         # Startup errors (missing cwd/interpreter/launcher) must not block before
         # the owner can install that writer or establish its hard deadline.

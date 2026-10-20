@@ -723,7 +723,7 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     monkeypatch.setattr(code_review, "_stop", remember_owner)
     try:
         started = time.monotonic()
-        with pytest.raises(code_review.ReviewError, match=r"cleanup.*proven"):
+        with pytest.raises(process.ProcessOwnershipError, match=r"cleanup.*proven"):
             reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
         assert time.monotonic() - started < 8
         assert len(review_processes) == 1
@@ -737,7 +737,7 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
         monkeypatch.setattr(os, "killpg", original_killpg)
         for owner in owners:
             assert process.terminate_owned_tree(owner, deadline=time.monotonic() + 5)
-            assert process.close_owner(owner)
+            assert process.close_owner(owner, deadline=time.monotonic() + 5)
 
 
 @pytest.mark.parametrize("implementation_name", code_review.REVIEW_FILES)
@@ -1435,3 +1435,84 @@ def test_managed_receipt_revalidates_candidate_and_coverage_before_publication(
         reviewer._publish_managed_receipt(target, pending)
     assert not receipt.exists()
     assert pending.exists()
+
+
+def test_result_diagnostic_failure_cannot_publish_standalone_evidence(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    original = process.report_diagnostic
+    failure = process.ProcessOwnershipError("diagnostic cleanup unproven")
+
+    def report(message: str, *, standard_output: bool = False) -> None:
+        if "Review result ready; writing" in message:
+            raise failure
+        original(message, standard_output=standard_output)
+
+    monkeypatch.setenv("PATH", repo.environment["PATH"])
+    monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
+    monkeypatch.setattr(process, "report_diagnostic", report)
+    with pytest.raises(process.ProcessOwnershipError) as raised:
+        reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
+    assert raised.value is failure
+    assert not reviewer._receipt_path(target).exists()
+    assert len(repo.calls()) == 1
+
+
+def test_owner_diagnostic_failure_precedes_managed_evidence_publication(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    classifier = repo.path / "scripts/check_change_scope.py"
+    classifier.write_text(
+        "import runpy\nfrom pathlib import Path\n"
+        "root = Path(__file__).resolve().parents[1]\n"
+        f"package = root / {str(Path(repo.implementation).parent)!r}\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+        "runpy.run_module('h2h_dev_tools.change_scope', run_name='__main__')\n"
+    )
+    repo.git("add", "scripts/check_change_scope.py")
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    original = process.report_diagnostic
+    failure = process.ProcessOwnershipError("diagnostic cleanup unproven")
+
+    def report(message: str, **options: Any) -> None:
+        if message.startswith("Code review cleanup verified; publishing"):
+            raise failure
+        original(message, **options)
+
+    monkeypatch.setattr(process, "report_diagnostic", report)
+    with pytest.raises(process.ProcessOwnershipError) as raised:
+        merge_command._review(
+            repo.path,
+            (sys.executable, "scripts/review-code.py", "run", "--index"),
+            dict(repo.environment),
+        )
+    assert raised.value is failure
+    assert not reviewer._receipt_path(target).exists()
+    assert len(repo.calls()) == 1
+
+
+def test_cli_does_not_launch_diagnostic_after_unknown_review_cleanup(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    failure = process.ProcessOwnershipError("review cleanup unproven")
+    reports: list[str] = []
+
+    def fail_review(*args: Any, **kwargs: Any) -> None:
+        raise failure
+
+    monkeypatch.setattr(code_review.Reviewer, "_run", fail_review)
+    monkeypatch.setattr(
+        process, "report_diagnostic", lambda message: reports.append(message)
+    )
+    monkeypatch.setattr(sys, "argv", ["review-code.py", "run", "--index"])
+    with pytest.raises(SystemExit) as raised:
+        code_review.main(repo.path)
+    assert raised.value.code == process.TERMINATION_FAILED_EXIT_CODE
+    assert raised.value.__cause__ is failure
+    assert reports == []

@@ -118,6 +118,11 @@
   正常操作可由外層中斷；failure recovery 的每次 abort 或 checkout 各有
   10 秒 hard budget（含 6 秒 teardown reserve），abort 失敗不得繼續 checkout。
   `--cleanup-only` 仍可安全重試清理，不重跑已完成 merge 的 review。
+- `close_owner` 必須明確收到 caller 原有的絕對 cleanup deadline；不得重用短暫
+  poll 的期限。診斷 writer 先登記責任、共用原 deadline，清理不明時不得啟動
+  新 writer 或發布 passing review／cleanup evidence。Shell 在 ownership 建立前的
+  stdlib owner 啟動及 closure 探測一律使用 `-I -S -B`，不得執行 site 啟動碼；
+  已納入 owner 的實際 Git／review／gate child 保留正常依賴環境。
 - Primary 禁止 rebase。Hooks 安裝設定 `pull.rebase=false`、primary rebase=false
   與 `pull.ff=only`。No-op cleanup 只在 task tip 已包含於 primary 時進行。
 - 本機 task branch、commit、merge 及安全清理已獲授權。
@@ -199,6 +204,8 @@
 - 新功能涵蓋正常、邊界、錯誤路徑；bug fix 加 regression test。Git 測試使用
   disposable local repositories；不連 production、live account 或外部 network。
   Flaky 視為失敗；skip/xfail 須理由，xfail 預設 strict。
+- 中斷測試必須在 fixture 救援前證明實際 process group 與 nested obligations
+  清空；exit code、檔案鎖釋放或救援 SIGKILL 不能替代 canonical cleanup。
 - GitHub Actions 只保留 trusted publishing 或本機無法驗證的平台檢查，
   不複製另一套一般 gate。首次發布可明確 dispatch exact version，仍須 default
   branch guard；一般 push 必須是已存在版本的遞增才發布。

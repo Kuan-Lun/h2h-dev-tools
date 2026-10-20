@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -201,3 +203,28 @@ def test_exported_git_owner_passes_strict_typing_without_installed_toolkit(
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le"])
+@pytest.mark.parametrize("shape", ["split-unicode", "trailing-newlines", "truncated"])
+def test_recovery_replay_preserves_exact_decoded_text_and_sink_encoding(
+    monkeypatch: pytest.MonkeyPatch, encoding: str, shape: str
+) -> None:
+    if shape == "split-unicode":
+        data = b"a" * 2047 + "漢字✓\n\n尾\n\n".encode()
+    elif shape == "trailing-newlines":
+        data = b"x" * 2046 + b"\n\ntail\n\n\n"
+    else:
+        data = ("漢字\n\n" * 10000).encode()
+    limit = 64 * 1024
+    expected = data[:limit].decode("utf-8", errors="replace")
+    if len(data) > limit:
+        expected += "\nmerge-command: recovery diagnostics truncated after 64 KiB\n"
+    binary = io.BytesIO()
+    sink = io.TextIOWrapper(binary, encoding=encoding, newline="\n")
+    monkeypatch.setattr(sys, "stderr", sink)
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    merge_command._replay_recovery_output(io.BytesIO(data), deadline=101.0)
+    sink.flush()
+    assert binary.getvalue() == expected.encode(encoding)
+    sink.close()

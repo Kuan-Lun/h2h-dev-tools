@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.5.0 is available on your selected
+Use Python 3.14 or newer. When version 0.6.0 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.5.0
+python -m pip install h2h-dev-tools==0.6.0
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.5.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.6.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -338,6 +338,14 @@ further mutation. Owner progress, replay and shell failure messages use the shar
 best-effort diagnostic writer described below, so a closed or stalled pipe cannot
 delay recovery cleanup or receipt publication. Once the owner is prepared,
 this also covers ordinary failures before the shell enters its recovery trap.
+All shell launches of the stdlib process owner, including source-closure discovery,
+normal commands, review, recovery and diagnostics, use `-I -S -B` to exclude site
+startup code before ownership and deadlines exist. The owned Git/classifier/reviewer
+children retain their normal environment and installed dependencies.
+The diagnostic launcher shares the workflow's tracked PID, signal handoff and
+cleanup-receipt checks.
+Missing diagnostic cleanup proof retains the candidate and owner files and
+stops both further diagnostics and Git recovery.
 Preflight messages before an owner exists retain normal stdio behavior; no Git
 mutation or owned child has started at that point.
 A failed abort prevents the recovery checkout; recovery never rolls back an
@@ -406,18 +414,52 @@ when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
 review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not
 converted: run the new review to establish evidence for the current implementation.
 
-Process-owner and code-review human diagnostics use nonblocking writes on POSIX
-descriptors and Windows pipes. A closed or full pipe can discard diagnostic text;
-it cannot change the review result or leave buffered output to fail after receipt
-publication. It cannot delay
-cancellation, timeout cleanup or completion. Each write restores the original
-blocking flags, but inherited descriptors share those flags while the write runs;
-this is not isolation from concurrent writers during failure teardown. Child data
-streams are not converted into diagnostic output. Standard memory-only text
-capture is supported; unknown sinks without a descriptor are skipped. Windows
-regular files and consoles retain native text output. This does not promise
-nonblocking console or filesystem I/O. Native Windows validation belongs to its
-platform CI; mocked branch tests do not substitute for that evidence.
+Process-owner and code-review human diagnostics use a small, finite writer
+process for POSIX descriptors and Windows pipes. It never changes inherited FD
+flags. The POSIX writer stays in the caller's process group. When the caller
+inherits an owner scope, the writer registers its own cleanup obligation under
+that parent's admission lock before spawn and releases it only after actual
+reaping and complete local scope removal. Scope allocation, initialization
+rollback and removal remain inside the parent's admission lock; only fully
+removed local metadata permits releasing a completed obligation. Uncertain
+registration or rollback retains responsibility and fails closed. A verified
+closed parent allocates no diagnostic scope or writer; malformed scope,
+lock failure or unproven cleanup instead remains an ownership error. This also
+protects output emitted after a main command has closed its own scope. Windows uses the
+base interpreter with isolated startup and a Job-assigned start gate. The fixed
+stdlib writer starts no descendants and has no dependency on a consumer runtime.
+Spawn, writing, termination and reaping share the caller's original absolute
+deadline; an expired or insufficient budget admits no writer. Diagnostic output
+uses at most 0.25 seconds within that bound, including cleanup. Only a standalone
+CLI without an outer deadline receives that explicit default budget. Failure to
+prove helper cleanup remains an ownership error, even after the main command is
+empty. No additional cleanup grace, process session or recursive command runner is created.
+Automatic diagnostic signal handling requires the main thread; callers already
+controlling signals pass their existing controller. Parallel cleanup workers only
+collect text; the controlling thread emits it after every worker has joined.
+
+A writable pipe retains normal human output. Discarding text for a closed or
+stalled pipe does not change the command result. A writer whose cleanup cannot be
+proven instead fails with an ownership error. Human `owned_tree_empty` output is
+not a cleanup receipt: only successful owner return and the canonical receipt
+prove completion, including diagnostic writers and scope closure. Payloads are
+limited to 20 KiB of complete encoded characters with a visible truncation marker;
+Windows also checks the complete command-line UTF-16 length before spawn.
+Recovery replays at most its existing 64 KiB raw prefix using incremental UTF-8
+decoding and exact text chunks, inside the same recovery deadline. Process stdout
+and other command data streams keep their original semantics. Known in-memory
+capture and Windows native console/regular-file streams retain their existing
+TextIOWrapper encoding and newline behavior; these direct native writes can still
+block in the operating system's console or filesystem. Unknown no-descriptor
+writers are not invoked. Timeout and interruption messages wait until primary command-tree
+teardown, so optional output does not spend the main cleanup reserve first.
+
+`close_owner(owner, *, deadline, diagnostic=None)` requires the caller's existing
+absolute cleanup deadline. It no longer reuses a prior short polling deadline.
+Callers that already own cleanup collect diagnostic text until termination and
+closure succeed; an unproven owner must not start a diagnostic helper. Update
+explicit callers when syncing the snapshot; no application-data conversion is
+needed. `run_command` keeps its existing API.
 
 The low-level process launch API is silent and accepts file-backed stdout/stderr.
 Its caller must defer signals until it owns the returned process. `run_command`
