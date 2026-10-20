@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-20T17:12:50+00:00",
+  "checked_at": "2026-10-20T17:44:47+00:00",
   "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.6.0",
+  "project_version": "0.7.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -102,7 +102,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.6.0 requires close_owner callers to pass their existing absolute cleanup deadline. Generated snapshot consumers update through normal sync; explicit callers select their phase deadline, with no implicit poll-deadline fallback. run_command keeps its API and no application data migration is needed. POSIX diagnostic writers preserve inherited descriptor flags and register before spawn; Windows uses isolated base interpreters and Job-assigned start gates. Writing, reap, scope removal and recovery replay share existing bounds. V2 callers finish optional output before evidence publication and never start another writer or publish passing evidence after unknown cleanup. All pre-owner stdlib launcher modes, including source discovery, normal/review owners, recovery and diagnostics, use -I -S -B; actual owned children retain normal dependencies. The diagnostic launcher shares existing PID/signal/receipt management. Process/scope/diagnostic targets, standalone/managed publication failure and a real exited-group/unclosed-obligation negative control passed. The complete affected merge workflow/command modules passed 152 cases in 479.53 seconds, including all 16 interruption combinations and real active sitecustomize/.pth controls for four startup entry modes. Ruff, formatter, strict mypy and Markdown checks pass. A limited independent launcher-boundary check found no remaining concrete defect; this does not replace formal full-repository review or the exact-candidate gate. Native Windows remains a separate platform CI target. No dependency bounds, pins or runtime dependencies changed. Fresh registry candidates match the already reviewed 0.5.0 set: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, ruff 0.17.1 and markdownlint-cli2 0.23.3; all satisfy declared ranges and Python candidates support 3.14. Identical upstream release-note conclusions still apply, including https://github.com/astral-sh/ruff/releases/tag/0.17.1; no preview/PYI/PERF rules are enabled. The normally resolved repository environment uses Python 3.14.1, command-local uv 0.13.0 and these candidates with project version 0.6.0.",
+    "note": "Release 0.7.0 makes qualified source bootstrap own each parent initializer's bytes or explicit absence and requires bootstrap before ordinary parent imports. Controller-to-worker authority preserves the existing runtime source, namespace topology, assertion-hook protections and three-item toolkit registration. V2 review evidence independently binds candidate parent Git mode/blob and current mode/hash, including ignored additions, without weakening 0.6.0 process cleanup or diagnostics-before-publication ordering. No application-data migration is needed: regenerate snapshots with sync and run handwritten entries in a fresh process with bootstrap first; arbitrary initializer side effects and import ordering cannot safely be rewritten automatically. Old review evidence requires a new full-repository baseline. All 144 targeted tests passed in 99.03 seconds, including real local workers, accepted stale-bytecode negative controls, parent drift, full baseline invalidation, offline revision verification, checkout portability, managed publication and consumer snapshot merge profiles. Ruff, formatter, strict mypy and Markdown checks passed; formal review and exact-candidate gate still run at integration. Native Windows execution is not claimed by this POSIX run. No dependency bounds, pins or runtime dependencies changed. Fresh PyPI/npm discovery exactly matches the complete already-reviewed 0.6.0 candidate metadata: hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, ruff 0.17.1 and markdownlint-cli2 0.23.3. All satisfy declared ranges and Python candidates support 3.14. There are no newer candidates since that audit, so its identical upstream release-note conclusions remain applicable, including Ruff 0.17.1 with no preview/PYI/PERF rules enabled. The normally resolved local environment uses Python 3.14.1, command-local uv 0.13.0, these candidates and installed project metadata 0.7.0. This audit records dependency review and does not itself prove final gate or publication.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

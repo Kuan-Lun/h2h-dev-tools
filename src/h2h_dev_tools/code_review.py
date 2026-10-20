@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
@@ -348,7 +350,7 @@ class Reviewer:
     def __post_init__(self) -> None:
         object.__setattr__(self, "repository", self.repository.resolve())
 
-    def _git(self, *arguments: str) -> str:
+    def _git_bytes(self, *arguments: str) -> bytes:
         result = subprocess.run(
             ("git", *arguments),
             cwd=self.repository,
@@ -357,20 +359,120 @@ class Reviewer:
         )
         if result.returncode:
             raise ReviewError(result.stderr.decode(errors="replace").strip())
-        return result.stdout.decode("utf-8").strip()
+        return result.stdout
 
-    def _policy_digest(self, tree: str) -> str:
-        digest = hashlib.sha256()
-        implementations = [
-            path
-            for path in IMPLEMENTATION_PATHS
-            if self._git("ls-tree", "--name-only", tree, "--", path)
-        ]
+    def _git(self, *arguments: str) -> str:
+        return self._git_bytes(*arguments).decode("utf-8").strip()
+
+    def _parent_policy(
+        self,
+        tree: str,
+        implementation: PurePosixPath,
+        *,
+        require_candidate_match: bool = False,
+    ) -> bytes:
+        # Snapshot reviewers use the repository-owned _shared parent. Managed
+        # owners bootstrap the same child closure as a flat package, so both
+        # derive this dependency from the canonical candidate layout. The owner
+        # pre-reads it; only the reviewer actually loads its initializer.
+        paths = (
+            (PurePosixPath("scripts/_shared/__init__.py"),)
+            if str(implementation) == IMPLEMENTATION_PATHS[1]
+            else ()
+        )
+        loaded = getattr(sys.modules[__name__].__loader__, "_h2h_parent_sources", None)
+        if not isinstance(loaded, dict):
+            raise ReviewError("Review requires its parent source registration")
+        registered = {}
+        for directory, digest in loaded.values():
+            try:
+                relative = Path(directory).relative_to(self.repository)
+            except ValueError as error:
+                raise ReviewError(
+                    "Loaded review parent is outside the repository"
+                ) from error
+            registered[PurePosixPath(relative.as_posix()) / "__init__.py"] = digest
+        if registered and set(registered) != set(paths):
+            raise ReviewError("Loaded review parents differ from the candidate layout")
+        parents = []
+        for path in paths:
+            candidate = self._git_bytes("ls-tree", "-z", tree, "--", str(path))
+            if candidate:
+                metadata, actual_path = candidate.removesuffix(b"\0").split(b"\t")
+                mode, kind, blob = metadata.decode("ascii").split()
+                if (
+                    actual_path != str(path).encode()
+                    or kind != "blob"
+                    or mode not in {"100644", "100755"}
+                ):
+                    raise ReviewError(
+                        f"Candidate review parent is not a regular source: {path}"
+                    )
+                historical: dict[str, str] | None = {"mode": mode, "blob": blob}
+            else:
+                historical = None
+            current_path = self.repository
+            for component in path.parts[:-1]:
+                current_path /= component
+                if not stat.S_ISDIR(current_path.lstat().st_mode):
+                    raise ReviewError(
+                        f"Review parent must have real directories: {path}"
+                    )
+            current_path /= path.name
+            try:
+                info = current_path.lstat()
+            except FileNotFoundError:
+                current = None
+                current_hash = None
+            else:
+                if not stat.S_ISREG(info.st_mode):
+                    raise ReviewError(f"Review parent must be a regular source: {path}")
+                current_hash = _digest(current_path.read_bytes())
+                current = {
+                    "mode": "100755" if info.st_mode & 0o111 else "100644",
+                    "sha256": current_hash,
+                }
+            if registered and registered[path] != current_hash:
+                raise ReviewError(
+                    "Loaded review parent differs from its current source"
+                )
+            if require_candidate_match:
+                expected = (
+                    None
+                    if historical is None
+                    else {
+                        "mode": historical["mode"],
+                        "sha256": _digest(
+                            self._git_bytes("cat-file", "blob", historical["blob"])
+                        ),
+                    }
+                )
+                if current != expected:
+                    raise ReviewError(
+                        "Current review parent differs from the exact candidate"
+                    )
+            parents.append(
+                {
+                    "path": str(path),
+                    "candidate": historical,
+                    "current_dependency": current,
+                }
+            )
+        return json.dumps(parents, sort_keys=True, separators=(",", ":")).encode()
+
+    def _implementation(self, tree: str) -> PurePosixPath:
+        implementations = self._git(
+            "ls-tree", "-r", "--name-only", tree, "--", *IMPLEMENTATION_PATHS
+        ).splitlines()
         if len(implementations) != 1:
             raise ReviewError(
                 "Candidate must contain exactly one shared code review implementation"
             )
-        implementation = PurePosixPath(implementations[0])
+        return PurePosixPath(implementations[0])
+
+    def _policy_digest(self, tree: str) -> str:
+        digest = hashlib.sha256()
+        implementation = self._implementation(tree)
         execution_dependencies = tuple(
             implementation.with_name(name) for name in REVIEW_FILES
         )
@@ -383,6 +485,9 @@ class Reviewer:
         executed_paths["merge_command.py"] = Path(merge_command.__file__)
         executed_paths["process.py"] = Path(process_control.__file__)
         executed_paths["change_scope.py"] = Path(change_scope.__file__)
+        # Historical parent blobs and the current source dependency are distinct.
+        # Repository-relative paths keep owner and qualified reviewer consistent.
+        digest.update(b"review-parents\0" + self._parent_policy(tree, implementation))
         for name, executed_path in executed_paths.items():
             executed_digest = _digest(executed_path.read_bytes())
             digest.update(f"executed:{name}\0{executed_digest}\0".encode())
@@ -424,6 +529,9 @@ class Reviewer:
             "ls-files", "--others", "--exclude-standard"
         ):
             raise ReviewError("Review requires no unstaged or untracked files")
+        self._parent_policy(
+            target.tree, self._implementation(target.tree), require_candidate_match=True
+        )
 
     def _directory(self) -> Path:
         return (

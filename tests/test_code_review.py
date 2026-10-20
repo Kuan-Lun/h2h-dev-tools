@@ -1516,3 +1516,110 @@ def test_cli_does_not_launch_diagnostic_after_unknown_review_cleanup(
     assert raised.value.code == process.TERMINATION_FAILED_EXIT_CODE
     assert raised.value.__cause__ is failure
     assert reports == []
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="The fake Codex executable and online review ownership require POSIX",
+)
+@pytest.mark.parametrize("change", ["edit", "add", "remove", "mode"])
+def test_parent_initializer_change_requires_a_new_repository_review(
+    tmp_path: Path, change: str
+) -> None:
+    repo = _make_review_repository(tmp_path, "snapshot")
+    entry = repo.path / "scripts/review-code.py"
+    entry.write_text(
+        entry.read_text()
+        .replace("package, 'h2h_dev_tools')", "package, '_shared.h2h_dev_tools')")
+        .replace(
+            "from h2h_dev_tools.code_review", "from _shared.h2h_dev_tools.code_review"
+        )
+    )
+    parent = repo.path / "scripts/_shared/__init__.py"
+    if change != "add":
+        parent.write_text("VALUE = 1\n")
+    repo.git("add", "scripts")
+    _assert_passed(repo.review("run", "--index"))
+    baseline_tree = repo.git("write-tree")
+    baseline_receipts = [
+        json.loads(path.read_text())
+        for path in (repo.path / ".git/h2h-review/receipts").glob("*.json")
+    ]
+    (baseline,) = [
+        item for item in baseline_receipts if item["target"]["tree"] == baseline_tree
+    ]
+    assert baseline["scope"] == "repository"
+    repo.git("commit", "-m", "Merge initial full repository review")
+    _next_candidate(repo)
+    if change == "remove":
+        parent.unlink()
+    elif change == "mode":
+        parent.chmod(0o755)
+    else:
+        parent.write_text("VALUE = 2\n")
+    repo.git("add", "scripts/_shared")
+    _assert_passed(repo.review("run", "--index"))
+    receipts = [
+        json.loads(path.read_text())
+        for path in (repo.path / ".git/h2h-review/receipts").glob("*.json")
+    ]
+    (current,) = [
+        item for item in receipts if item["target"]["tree"] == repo.git("write-tree")
+    ]
+    assert current["scope"] == "repository"
+    assert current["target"]["policy_digest"] != baseline["target"]["policy_digest"]
+    _assert_passed(repo.review("verify", "--index"))
+
+
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="The fake Codex executable and online review ownership require POSIX",
+)
+@pytest.mark.parametrize("change", ["edit", "add-ignored", "remove", "mode"])
+def test_offline_revision_verification_rejects_changed_current_parent_dependency(
+    tmp_path: Path, change: str
+) -> None:
+    repo = _make_review_repository(tmp_path, "snapshot")
+    entry = repo.path / "scripts/review-code.py"
+    entry.write_text(
+        entry.read_text()
+        .replace("package, 'h2h_dev_tools')", "package, '_shared.h2h_dev_tools')")
+        .replace(
+            "from h2h_dev_tools.code_review", "from _shared.h2h_dev_tools.code_review"
+        )
+    )
+    parent = repo.path / "scripts/_shared/__init__.py"
+    if change == "add-ignored":
+        (repo.path / ".gitignore").write_text("/scripts/_shared/__init__.py\n")
+    else:
+        parent.write_text("VALUE = 1\n")
+    repo.git("add", ".")
+    revision, _ = _merge_full_baseline(repo)
+    calls = len(repo.calls())
+    if change == "remove":
+        parent.unlink()
+    elif change == "mode":
+        parent.chmod(0o755)
+    else:
+        parent.write_text("VALUE = 2\n")
+    if change == "add-ignored":
+        assert repo.git("status", "--porcelain") == ""
+    _assert_blocked(repo.review("verify", "--revision", revision))
+    result = repo.review("run", "--revision", revision)
+    _assert_blocked(result)
+    if change == "add-ignored":
+        assert "Current review parent differs from the exact candidate" in result.stderr
+    assert len(repo.calls()) == calls
+
+
+def test_parent_policy_fingerprint_is_portable_between_exact_checkouts(
+    tmp_path: Path,
+) -> None:
+    repo = _make_review_repository(tmp_path, "snapshot")
+    (repo.path / "scripts/_shared/__init__.py").write_text("VALUE = 1\n")
+    repo.git("add", "scripts")
+    tree = repo.git("write-tree")
+    original = code_review.Reviewer(repo.path)._policy_digest(tree)
+    copied = tmp_path / "another checkout"
+    shutil.copytree(repo.path, copied)
+    assert code_review.Reviewer(copied)._policy_digest(tree) == original

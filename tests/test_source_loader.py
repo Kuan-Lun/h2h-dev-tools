@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import py_compile
 import subprocess
 import sys
 from pathlib import Path
@@ -139,3 +141,194 @@ print('relative import and CLI complete')
     assert result.returncode == 0, result.stderr
     assert "--candidate" in result.stdout
     assert "relative import and CLI complete" in result.stdout
+
+
+@pytest.mark.parametrize("cache_mode", ["TIMESTAMP", "UNCHECKED_HASH"])
+def test_parent_initializer_uses_source_instead_of_accepted_stale_bytecode(
+    source_repository: Path, cache_mode: str
+) -> None:
+    parent = source_repository / "scripts/_shared/__init__.py"
+    stale = b"raise RuntimeError('STALE PARENT CACHE')\n"
+    current = b"VALUE = 'current'\n".ljust(len(stale), b" ")
+    parent.write_bytes(stale)
+    timestamp = parent.stat().st_mtime_ns
+    cache = py_compile.compile(
+        str(parent),
+        cfile=str(
+            parent.parent
+            / "__pycache__"
+            / f"__init__.{sys.implementation.cache_tag}.pyc"
+        ),
+        doraise=True,
+        invalidation_mode=getattr(py_compile.PycInvalidationMode, cache_mode),
+    )
+    assert cache is not None
+    parent.write_bytes(current)
+    os.utime(parent, ns=(timestamp, timestamp))
+    cached = Path(cache).read_bytes()
+    ordinary = _run(source_repository, "import _shared\n")
+    assert ordinary.returncode != 0 and "STALE PARENT CACHE" in ordinary.stderr
+    result = _run(
+        source_repository,
+        "bootstrap()\nimport _shared\nassert _shared.VALUE == 'current'\n"
+        "first = _shared\nbootstrap()\nassert sys.modules['_shared'] is first\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(cache).read_bytes() == cached
+
+
+@pytest.mark.parametrize("namespace_parent", [False, True])
+def test_bootstrap_rejects_an_earlier_ordinary_parent_import(
+    source_repository: Path, namespace_parent: bool
+) -> None:
+    if namespace_parent:
+        (source_repository / "scripts/_shared/__init__.py").unlink()
+    result = _run(source_repository, "import _shared\nbootstrap()\n")
+    assert result.returncode != 0
+    assert "Package was imported before source bootstrap: _shared" in result.stderr
+
+
+@pytest.mark.parametrize("namespace_parent", [False, True])
+def test_parent_source_identity_is_preserved_and_revalidated(
+    source_repository: Path, namespace_parent: bool
+) -> None:
+    if namespace_parent:
+        (source_repository / "scripts/_shared/__init__.py").unlink()
+    result = _run(
+        source_repository,
+        """
+first = bootstrap()
+parent = sys.modules['_shared']
+assert bootstrap() is first
+assert sys.modules['_shared'] is parent
+(root / 'scripts/_shared/__init__.py').write_text('VALUE = 2\\n')
+bootstrap()
+""",
+    )
+    assert result.returncode != 0
+    assert "Source package changed after bootstrap" in result.stderr
+
+
+def test_parent_initializer_can_import_its_source_registered_child(
+    source_repository: Path,
+) -> None:
+    (source_repository / "scripts/_shared/__init__.py").write_text(
+        "from . import h2h_dev_tools\nCHILD = h2h_dev_tools\n"
+    )
+    result = _run(
+        source_repository,
+        """
+package_module = bootstrap()
+assert sys.modules['_shared'].CHILD is package_module
+assert bootstrap() is package_module
+""",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("when", ["initializer", "after-bootstrap"])
+def test_parent_search_path_drift_is_rejected(
+    source_repository: Path, when: str
+) -> None:
+    if when == "initializer":
+        (source_repository / "scripts/_shared/__init__.py").write_text(
+            "__path__ = []\n"
+        )
+        code = "bootstrap()\n"
+    else:
+        code = "bootstrap()\nsys.modules['_shared'].__path__ = []\nbootstrap()\n"
+    result = _run(source_repository, code)
+    assert result.returncode != 0
+    assert "Parent package path changed after bootstrap" in result.stderr
+
+
+def test_bootstrap_pins_the_parent_directory_instead_of_searching_sys_path(
+    source_repository: Path,
+) -> None:
+    decoy = source_repository / "decoy/_shared"
+    decoy.mkdir(parents=True)
+    (decoy / "__init__.py").write_text("raise RuntimeError('WRONG PARENT SOURCE')\n")
+    result = _run(
+        source_repository,
+        """
+sys.path.insert(0, str(root / 'decoy'))
+bootstrap()
+assert sys.modules['_shared'].__path__ == [str(root / 'scripts/_shared')]
+""",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "kind", ["initializer-link", "initializer-directory", "parent-link"]
+)
+def test_parent_source_types_are_rejected_before_execution(
+    source_repository: Path, kind: str
+) -> None:
+    parent = source_repository / "scripts/_shared"
+    initializer = parent / "__init__.py"
+    if kind == "parent-link":
+        replacement = parent.with_name("moved-parent")
+        parent.rename(replacement)
+        parent.symlink_to(replacement, target_is_directory=True)
+    else:
+        initializer.unlink()
+        if kind == "initializer-directory":
+            initializer.mkdir()
+        else:
+            replacement = source_repository / "other-init.py"
+            replacement.write_text("raise RuntimeError('WRONG PARENT SOURCE')\n")
+            initializer.symlink_to(replacement)
+    result = _run(source_repository, "bootstrap()\n")
+    assert result.returncode != 0
+    assert (
+        "must be a real directory" in result.stderr
+        or "must be a regular file" in result.stderr
+    )
+    assert "RuntimeError: WRONG PARENT SOURCE" not in result.stderr
+
+
+def test_explicit_empty_parent_authority_is_not_an_unpinned_request(
+    source_repository: Path,
+) -> None:
+    result = _run(
+        source_repository,
+        """
+runpy.run_path(str(package / 'source_loader.py'))['load_package'](
+    package, namespace, expected_parents={})
+""",
+    )
+    assert result.returncode != 0
+    assert "Parent packages differ from the controller registration" in result.stderr
+
+
+@pytest.mark.parametrize("outer_initializer", [False, True])
+def test_bootstrap_preserves_each_parent_in_a_mixed_two_level_chain(
+    source_repository: Path, outer_initializer: bool
+) -> None:
+    outer = source_repository / "scripts/__init__.py"
+    inner = source_repository / "scripts/_shared/__init__.py"
+    if outer_initializer:
+        outer.write_text("VALUE = 'outer'\n")
+        inner.unlink()
+    else:
+        inner.write_text("VALUE = 'inner'\n")
+    result = _run(
+        source_repository,
+        """
+namespace = 'scripts._shared.h2h_dev_tools'
+first = bootstrap()
+parents = first.__loader__._h2h_parent_sources
+assert set(parents) == {'scripts', 'scripts._shared'}
+assert parents['scripts'][0] == str(root / 'scripts')
+assert parents['scripts._shared'][0] == str(root / 'scripts/_shared')
+assert sum(digest is None for directory, digest in parents.values()) == 1
+outer, inner = sys.modules['scripts'], sys.modules['scripts._shared']
+assert outer.__path__ == [str(root / 'scripts')]
+assert inner.__path__ == [str(root / 'scripts/_shared')]
+assert bootstrap() is first
+assert sys.modules['scripts'] is outer
+assert sys.modules['scripts._shared'] is inner
+""",
+    )
+    assert result.returncode == 0, result.stderr
