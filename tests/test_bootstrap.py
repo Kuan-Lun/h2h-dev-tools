@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -239,3 +240,38 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
     assert help_result.returncode == 0
     assert "Usage:" in help_result.stdout
     assert not log.exists(), "help must not run installation or repository callbacks"
+
+
+@pytest.mark.parametrize("value", [".githooks\n", "\n", "", "foreign\n"])
+def test_installer_preserves_exact_configured_hook_path_bytes(
+    repository: Path, value: str
+) -> None:
+    git(repository, "config", "core.hooksPath", value)
+    before = (repository / ".git/config").read_bytes()
+    result = invoke("install-git-hooks.sh", repository)
+    assert result.returncode != 0
+    assert "Refusing" in result.stderr
+    assert (repository / ".git/config").read_bytes() == before
+
+
+def test_installer_rejects_config_read_error_without_mutation(
+    repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = (repository / ".git/config").read_bytes()
+    real_git = shutil.which("git")
+    assert real_git is not None
+    binary = tmp_path / "failing-git"
+    binary.mkdir()
+    shim = binary / "git"
+    write_python_executable(
+        shim,
+        "import os, sys\n"
+        "if sys.argv[1:] == ['config', '--get', 'core.hooksPath']:\n"
+        "    raise SystemExit(2)\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+    )
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    result = invoke("install-git-hooks.sh", repository)
+    assert result.returncode != 0
+    assert "Could not inspect" in result.stderr
+    assert (repository / ".git/config").read_bytes() == before

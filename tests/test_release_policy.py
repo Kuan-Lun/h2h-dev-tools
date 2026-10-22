@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import subprocess
 import tomllib
 from pathlib import Path
@@ -13,7 +12,6 @@ import pytest
 
 from h2h_dev_tools import version_policy
 from h2h_dev_tools.dependency_manifest import dependency_manifest
-from h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -620,54 +618,14 @@ def test_index_version_uses_the_original_merge_parent_after_task_advances(
     version_policy._validate(*selected)
 
 
-@pytest.mark.parametrize("environment_ref", ["task", "HEAD", "missing-task"])
-def test_index_without_active_merge_rejects_mutable_task_refs(
+@pytest.mark.parametrize("environment_ref", ["task", "HEAD", "missing-task", "commit"])
+def test_index_without_active_merge_rejects_every_environment_parent(
     repository: Path, monkeypatch: pytest.MonkeyPatch, environment_ref: str
 ) -> None:
+    if environment_ref == "commit":
+        environment_ref = git(repository, "rev-parse", "HEAD")
     monkeypatch.setenv("WORKFLOW_MERGE_TASK_REF", environment_ref)
-    with pytest.raises(ValueError, match=r"immutable.*commit"):
+    with pytest.raises(ValueError, match="pending two-parent merge"):
         version_policy._candidate(
             argparse.Namespace(index=True, base=None, candidate="HEAD")
         )
-
-
-@pytest.mark.skipif(
-    os.name != "posix", reason="Exercises an extensionless POSIX Git hook"
-)
-def test_direct_pre_merge_hook_validates_an_immutable_parent_before_merge_head(
-    repository: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    write_project(repository, "0.1.0")
-    base = commit(repository, "feat: bootstrap development tools")
-    git(repository, "update-ref", "refs/heads/master", base)
-    (repository / "src").mkdir()
-    (repository / "src/tool.py").write_text("value = 1\n")
-    commit(repository, "fix: add compatible behavior")
-    write_project(repository, "0.1.1")
-    task = commit(repository, "chore(release): bump version to 0.1.1")
-    git(repository, "switch", "master")
-    hooks = repository.parent / "hooks"
-    hooks.mkdir()
-    observed = repository.parent / "observed-hook.json"
-    hook = hooks / "pre-merge-commit"
-    write_python_executable(
-        hook,
-        "import argparse, json\nfrom pathlib import Path\n"
-        "from h2h_dev_tools import version_policy\n"
-        "merge_head = Path(version_policy._git('rev-parse', '--git-path', 'MERGE_HEAD'))\n"
-        "assert not merge_head.exists(), 'fixture must exercise the direct hook timing'\n"
-        "selected = version_policy._candidate(argparse.Namespace(index=True))\n"
-        "version_policy._validate(*selected)\n"
-        f"Path({str(observed)!r}).write_text(json.dumps(selected))\n",
-    )
-    git(repository, "config", "core.hooksPath", str(hooks))
-    monkeypatch.setenv("PYTHONPATH", str(_ROOT / "src"))
-    monkeypatch.setenv("WORKFLOW_MERGE_TASK_REF", task)
-    git(repository, "merge", "--no-ff", "--no-edit", "task")
-    selected = json.loads(observed.read_text())
-    assert selected == [
-        base,
-        git(repository, "rev-parse", "HEAD^{tree}"),
-        f"{base}..{task}",
-    ]
-    assert git(repository, "show", "-s", "--format=%P", "HEAD").split() == [base, task]

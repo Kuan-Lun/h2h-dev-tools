@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-22T21:08:16+00:00",
+  "checked_at": "2026-10-22T22:13:30+00:00",
   "manifest_sha256": "aa20257539103591105ade67f7411e0eaff74f1ae5ce1d94a1bd0763f654f9c7",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.7.2",
+  "project_version": "0.8.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -124,7 +124,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed official PyPI/npm metadata and upstream release notes on 2026-10-23 for distlib 0.4.4, packaging 26.3, build 1.6.1, hatchling 1.32.4, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.2, and markdownlint-cli2 0.24.0. All latest stable releases satisfy declared lower bounds; no latest stable is excluded. Python 3.14 is explicitly classified by Python dependencies except pytest-xdist, whose >=3.9 metadata permits it; worker regressions remain required. Node >=22 is compatible with installed Node 24.22.0. Reviewed distlib launcher fixes, build Windows symlink fix, Hatchling plugin fix, mypy native parser, Ruff rule/formatter and Markdown rule updates. This replacement preserves the exact previously tested portable implementation (53 targeted cases passed, 3 native Windows skips) and includes the separately formally merged verification bootstrap fix. The normal implementation commit fast gate passed with current local tools. Native Windows and the new exact-candidate full gate are not claimed by this audit.",
+    "note": "Freshly reviewed official PyPI/npm metadata and upstream release notes on 2026-10-23 for Git release 0.8.0: hatchling 1.32.4, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.2, and markdownlint-cli2 0.24.0. All latest non-yanked stable releases satisfy the declared lower bounds; none is excluded. Python 3.14 is explicitly classified except by pytest-xdist, whose >=3.9 metadata permits it; distlib has no Requires-Python field but explicitly classifies 3.14. markdownlint-cli2 requires Node >=22, compatible with the reported rebuilt Node 24.22.0. Reviewed launcher/archive containment fixes, packaging requirement/marker behavior, Hatchling plugin metadata fixes, the build Windows symlink fix, mypy native-parser and macOS x86_64 wheel changes, Ruff 0.17 rule/formatter changes, and markdownlint 0.42 rule updates. No new upper bound or exclusion was identified. This research did not run tests, gates, installation, or clean registry resolution; exact-candidate and native Windows validation remain separate evidence.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

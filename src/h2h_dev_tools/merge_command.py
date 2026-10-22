@@ -233,6 +233,7 @@ def _execute(
     review: bool,
     recovery: bool,
     receipt: Path,
+    release_workflow: Path | None = None,
 ) -> int:
     from . import process
 
@@ -260,6 +261,19 @@ def _execute(
     # killed before/during teardown. Every started phase must complete cleanup
     # before publishing proof, including classification-only documentation merges.
     _write_cleanup_receipt(receipt)
+    if release_workflow is not None and status == 0:
+        from . import merge_admission
+
+        # The receipt proves process cleanup only, never successful admission
+        # release. Keep the original phase deadline and require exit zero too.
+        if recovery_deadline is None or time.monotonic() >= recovery_deadline:
+            return 1
+        try:
+            merge_admission.release(release_workflow)
+        except merge_admission.AdmissionError, OSError, ValueError, TypeError:
+            # Some terminal unlinks may already have completed. No diagnostic
+            # writer or subprocess may start after this point, even on failure.
+            return 1
     # Reserve 125 for an unproven owner cleanup, never for a hook's own exit code.
     return 1 if status == process.TERMINATION_FAILED_EXIT_CODE else status
 
@@ -294,6 +308,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cleanup-receipt", required=True, type=Path)
     parser.add_argument("--review", action="store_true")
+    parser.add_argument("--release-workflow", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--recovery",
         action="store_true",
@@ -314,6 +329,8 @@ def main() -> int:
         parser.error("review cannot run as failure recovery")
     if arguments.recovery_output_fds and not arguments.recovery:
         parser.error("recovery output descriptors require --recovery")
+    if arguments.release_workflow is not None and not arguments.recovery:
+        parser.error("workflow release requires --recovery")
     with ExitStack() as diagnostics:
         if arguments.recovery_output_fds:
             # Startup errors go to /dev/null. Only the common diagnostic writer
@@ -334,6 +351,7 @@ def main() -> int:
                 review=arguments.review,
                 recovery=arguments.recovery,
                 receipt=arguments.cleanup_receipt,
+                release_workflow=arguments.release_workflow,
             )
         except process.ProcessOwnershipError:
             return process.TERMINATION_FAILED_EXIT_CODE
@@ -356,6 +374,10 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--print-source-files"]:
         print("\n".join(owner_source_files()))
         raise SystemExit(0)
+    if sys.argv[1:2] == ["--workflow-state"]:
+        from .merge_admission import main as workflow_state_main
+
+        raise SystemExit(workflow_state_main(sys.argv[2:]))
     if len(sys.argv) == 4 and sys.argv[1] == "--workflow-diagnostic":
         # FD 3 is the human destination; interpreter/bootstrap errors are null.
         raise SystemExit(_workflow_diagnostic(sys.argv[3], Path(sys.argv[2])))
