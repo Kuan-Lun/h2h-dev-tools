@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,9 @@ main(root)
 """
 
 
+_PASS_REVIEW = "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n"
+
+
 @pytest.fixture(autouse=True)
 def offline_codex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     binary = tmp_path / "fake-review-cli"
@@ -52,7 +57,7 @@ def offline_codex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "    raise SystemExit(0)\n"
         "sys.stdin.read()\n"
         "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n",
+        + _PASS_REVIEW,
     )
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ.get("PATH", ""))
 
@@ -71,12 +76,114 @@ def executable(path: Path, text: str) -> None:
     path.chmod(0o755)
 
 
+def record_workflow_receipts(root: Path, destination: Path) -> None:
+    shell = root / "src/h2h_dev_tools/git-flow-merge.sh"
+    assignment = (
+        '    active_cleanup_receipt="$execution_directory/cleanup-$command_number"\n'
+    )
+    source = shell.read_text()
+    assert source.count(assignment) == 1
+    shell.write_text(
+        source.replace(
+            assignment,
+            assignment
+            + '    printf \'%s\\t%s\\n\' "$active_owner" "$active_cleanup_receipt" >> '
+            + shlex.quote(str(destination))
+            + "\n",
+        )
+    )
+
+
+def owned_fixture_command(
+    root: Path,
+    argv: tuple[str, ...],
+    *,
+    environment: dict[str, str] | None = None,
+    timeout_seconds: float = 90,
+    termination_reserve_seconds: float = 30,
+) -> subprocess.CompletedProcess[str]:
+    """Bound the whole fixture, including nested owners and Git recovery.
+
+    Regular files keep output capture independent of descendants closing pipes.
+    The default reserve leaves room for both ten-second Git recovery stages and
+    nested process teardown; this is a harness ceiling, not a performance oracle.
+    """
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        result = process.run_command(
+            process.ProcessCommand(
+                "Merge workflow fixture", argv, root, environment, stdout, stderr
+            ),
+            hard_deadline=time.monotonic() + timeout_seconds,
+            termination_reserve_seconds=termination_reserve_seconds,
+        )
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(
+            argv,
+            result,
+            stdout.read().decode("utf-8", errors="replace"),
+            stderr.read().decode("utf-8", errors="replace"),
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX nested owner cleanup contract")
+def test_fixture_timeout_closes_nested_owner_and_descendant(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    scopes = tmp_path / "scopes"
+    scopes.mkdir()
+    leaf = tmp_path / "leaf.py"
+    leaf.write_text(
+        "import json, os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "Path('leaf-ready.json').write_text(json.dumps({'pid': os.getpid(), "
+        "'group': os.getpgrp(), 'child': child.pid}))\n"
+        "child.wait()\n"
+    )
+    nested = tmp_path / "nested.py"
+    nested.write_text(
+        "import json, os, runpy, sys\n"
+        "from pathlib import Path\n"
+        f"package = Path({str(_ROOT / 'src/h2h_dev_tools')!r})\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+        "from h2h_dev_tools import process\n"
+        "Path('nested-ready.json').write_text(json.dumps({'pid': os.getpid(), 'group': os.getpgrp()}))\n"
+        "try:\n"
+        "    process.run_command(process.ProcessCommand('Nested fixture', "
+        "(sys.executable, '-I', '-B', 'leaf.py'), Path.cwd()), hard_deadline=None)\n"
+        "finally:\n"
+        "    Path('nested-finished').write_text('closed')\n"
+    )
+    result = owned_fixture_command(
+        tmp_path,
+        (sys.executable, "-I", "-B", str(nested)),
+        environment=os.environ | {"TMPDIR": str(scopes)},
+        timeout_seconds=20,
+        termination_reserve_seconds=10,
+    )
+    assert result.returncode == process.TIMEOUT_EXIT_CODE, result.stdout + result.stderr
+    leaf_identity = json.loads((tmp_path / "leaf-ready.json").read_text())
+    nested_identity = json.loads((tmp_path / "nested-ready.json").read_text())
+    assert leaf_identity["group"] != nested_identity["group"]
+    assert (tmp_path / "nested-finished").read_text() == "closed"
+    for pid in (leaf_identity["pid"], leaf_identity["child"], nested_identity["pid"]):
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    for group in (leaf_identity["group"], nested_identity["group"]):
+        with pytest.raises(ProcessLookupError):
+            os.killpg(group, 0)
+    assert list(scopes.iterdir()) == []
+    assert "owned_tree_empty=True" in capfd.readouterr().out
+
+
 def fixture_repository(
     root: Path,
     *,
     succeeds: bool,
     profile: str = "full",
     ref_format: str = "files",
+    primary_hooks: bool = False,
 ) -> str:
     root.mkdir()
     if ref_format == "files":
@@ -103,6 +210,10 @@ def fixture_repository(
     git(root, "config", "user.email", "merge@example.invalid")
     (root / ".gitignore").write_text(".venv/\n")
     (root / "README.md").write_text("baseline\n")
+    if primary_hooks:
+        (root / ".githooks").mkdir()
+        for name in ("pre-commit", "pre-merge-commit", "commit-msg", "pre-rebase"):
+            executable(root / ".githooks" / name, "#!/bin/sh\nexit 0\n")
     git(root, "add", ".")
     git(root, "commit", "-m", "chore: initialize repository")
     base = git(root, "rev-parse", "HEAD")
@@ -110,7 +221,7 @@ def fixture_repository(
     scripts = root / "scripts"
     scripts.mkdir()
     hooks = root / ".githooks"
-    hooks.mkdir()
+    hooks.mkdir(exist_ok=True)
     for name in (
         "git-flow-merge.sh",
         "detect-primary-branch.sh",
@@ -214,6 +325,13 @@ def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
             "from h2h_dev_tools.code_review", "from _shared.h2h_dev_tools.code_review"
         )
     )
+    gate = root / "scripts/release-gate.py"
+    gate.write_text(
+        gate.read_text()
+        .replace(' / "src/h2h_dev_tools"', ' / "scripts/_shared/h2h_dev_tools"')
+        .replace('package, "h2h_dev_tools"', 'package, "_shared.h2h_dev_tools"')
+        .replace("from h2h_dev_tools.git_index", "from _shared.h2h_dev_tools.git_index")
+    )
     git(root, "add", ".")
     git(root, "commit", "-m", "test: use a real consumer source snapshot")
     task = git(root, "rev-parse", "task")
@@ -243,23 +361,11 @@ def test_consumer_snapshot_merge_exports_its_complete_loading_authority(
         assert not (root / ".git/fixture-gate").exists()
 
 
-@pytest.mark.parametrize("strategy", ["direct", "candidate"])
 def test_merge_uses_captured_commit_when_task_advances_before_git_launch(
-    tmp_path: Path, strategy: str
+    tmp_path: Path,
 ) -> None:
     root = tmp_path / "repository"
-    base = fixture_repository(root, succeeds=True)
-    observed_parent = tmp_path / "observed-parent"
-    if strategy == "direct":
-        # This fixture's real release gate is for candidate-style commits.
-        # Exercise Git's direct hook timing with its own explicit parent input.
-        write_python_executable(
-            root / ".githooks/pre-merge-commit",
-            "import os\nfrom pathlib import Path\n"
-            f"Path({str(observed_parent)!r}).write_text(os.environ['WORKFLOW_MERGE_TASK_REF'])\n",
-        )
-        git(root, "add", ".githooks/pre-merge-commit", ".githooks/pre-merge-commit.py")
-        git(root, "commit", "-m", "test: observe the direct hook parent")
+    base = fixture_repository(root, succeeds=True, primary_hooks=False)
     task = git(root, "rev-parse", "task")
     later = git(root, "commit-tree", "HEAD^{tree}", "-p", task, "-m", "later task")
     binary = tmp_path / "bin"
@@ -280,8 +386,7 @@ def test_merge_uses_captured_commit_when_task_advances_before_git_launch(
             "bash",
             "src/h2h_dev_tools/git-flow-merge.sh",
             str(root),
-            strategy,
-            "scripts/review-merge-candidate.sh" if strategy == "candidate" else "",
+            "scripts/review-merge-candidate.sh",
         ),
         cwd=root,
         env=os.environ
@@ -292,14 +397,17 @@ def test_merge_uses_captured_commit_when_task_advances_before_git_launch(
         timeout=20,
     )
     assert result.returncode != 0, result.stdout + result.stderr
-    assert "Git ref changed during cleanup" in result.stderr
-    assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
+    assert "Merge outcome has unknown ownership" in result.stderr
     assert git(root, "rev-parse", "task") == later
-    if strategy == "direct":
-        assert observed_parent.read_text() == task
-    assert "task" in git(root, "show", "-s", "--format=%s", "master")
-    assert not (root / ".git/MERGE_HEAD").exists()
-    assert git(root, "status", "--porcelain") == ""
+    assert git(root, "branch", "--show-current") == "master"
+    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
+    assert git(root, "rev-parse", "master") == base
+    assert git(root, "rev-parse", "HEAD") == base
+    assert (root / ".git/MERGE_HEAD").read_text() == task + "\n"
+    assert git(root, "write-tree") == git(root, "rev-parse", task + "^{tree}")
+    assert git(root, "diff", "--exit-code") == ""
+    assert not (root / ".git/fixture-review-events").exists()
+    assert not (root / ".git/fixture-gate").exists()
 
 
 def test_successful_merge_preserves_a_task_advanced_during_the_gate(
@@ -392,7 +500,6 @@ def test_full_workflow_preserves_task_root_trailing_newlines(
             "bash",
             str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
             root.name,
-            "candidate",
             "scripts/review-merge-candidate.sh",
         ]
     )
@@ -434,7 +541,9 @@ def test_shared_workflow_preserves_primary_worktree_path_bytes(
     tmp_path: Path, primary_name: str, cleanup_only: bool
 ) -> None:
     primary = tmp_path / primary_name
-    base = fixture_repository(primary, succeeds=True)
+    base = fixture_repository(
+        primary, succeeds=True, primary_hooks=True, profile="documentation"
+    )
     # This test isolates shared discovery and owned Git mutations. Local wrapper
     # path decoding and review/gate policy have their own entrypoint contracts.
     for name in ("pre-commit", "pre-merge-commit", "commit-msg"):
@@ -456,8 +565,7 @@ def test_shared_workflow_preserves_primary_worktree_path_bytes(
             "bash",
             "src/h2h_dev_tools/git-flow-merge.sh",
             str(task),
-            "direct",
-            "",
+            "scripts/review-merge-candidate.sh",
             *(["--cleanup-only"] if cleanup_only else []),
         ),
         cwd=task,
@@ -467,6 +575,7 @@ def test_shared_workflow_preserves_primary_worktree_path_bytes(
         timeout=20,
     )
 
+    result = _retry_retained_linked_task_cleanup(primary, task, result)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not task.exists()
     assert git(primary, "branch", "--show-current") == "master"
@@ -570,38 +679,43 @@ def test_branch_deletion_rechecks_primary_when_task_moves_after_cleanup_checks(
     binary.mkdir()
     real_git = shutil.which("git")
     assert real_git is not None
+    injected = tmp_path / "late-update-injected"
     write_python_executable(
         binary / "git",
         "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
         f"real_git = {real_git!r}\n"
         "if sys.argv[-3:] == ['branch', '-d', 'task']:\n"
         f"    subprocess.run([real_git, '-C', {str(root)!r}, 'update-ref', "
         f"'refs/heads/task', {later!r}, {task!r}], check=True)\n"
         f"    subprocess.run([real_git, '-C', {str(root)!r}, 'update-ref', "
         f"'refs/heads/upstream', {later!r}], check=True)\n"
+        f"    Path({str(injected)!r}).write_text({later!r})\n"
         "os.execv(real_git, [real_git, *sys.argv[1:]])\n",
     )
-    result = subprocess.run(
+    result = owned_fixture_command(
+        root,
         ("scripts/git-flow-merge.sh", *(["--cleanup-only"] if cleanup_only else [])),
-        cwd=root,
-        env=os.environ
+        environment=os.environ
         | {"PATH": str(binary) + os.pathsep + os.environ.get("PATH", "")},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=20,
     )
-    assert result.returncode != 0, result.stdout + result.stderr
+    assert result.returncode not in (
+        0,
+        process.TIMEOUT_EXIT_CODE,
+        process.TERMINATION_FAILED_EXIT_CODE,
+    ), result.stdout + result.stderr
+    assert injected.read_text() == later
     assert "not fully merged" in result.stderr
     assert git(root, "rev-parse", "task") == later
     assert git(root, "config", "--get-regexp", r"^branch\.task\.") == original_config
-    assert git(root, "branch", "--show-current") == (
-        "task" if cleanup_only else "master"
-    )
+    # Never restore a task checkout after its ref changed outside this owner.
+    assert git(root, "branch", "--show-current") == "master"
     assert git(root, "status", "--porcelain") == ""
+    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
+    assert not (root / ".git/MERGE_HEAD").exists()
     if cleanup_only:
         assert git(root, "rev-parse", "master") == task
-        assert git(root, "rev-parse", "HEAD") == later
+        assert git(root, "rev-parse", "HEAD") == task
     else:
         assert git(root, "show", "-s", "--format=%P", "HEAD").split() == [base, task]
 
@@ -772,6 +886,8 @@ def test_linked_merge_cleanup_preserves_reference_hook_input_and_rejection(
         check=False,
         timeout=20,
     )
+    assert not events_path.exists()
+    result = _retry_retained_linked_task_cleanup(primary, task, result)
     assert (result.returncode != 0) is reject, result.stdout + result.stderr
     assert not task.exists()
     assert git(primary, "show", "-s", "--format=%P", "HEAD").split() == [base, task_oid]
@@ -834,8 +950,10 @@ def test_cleanup_retains_task_if_reference_guard_cannot_be_prepared(
     assert git(root, "status", "--porcelain") == ""
 
 
-def test_cleanup_without_reference_transaction_support_retains_task(
+@pytest.mark.parametrize("git_version", ["2.27.0", "2.37.9"])
+def test_cleanup_without_required_git_support_retains_task(
     tmp_path: Path,
+    git_version: str,
 ) -> None:
     root = tmp_path / "repository"
     fixture_repository(root, succeeds=True)
@@ -849,7 +967,7 @@ def test_cleanup_without_reference_transaction_support_retains_task(
         binary / "git",
         "import os, sys\n"
         "if sys.argv[1:] == ['version']:\n"
-        "    print('git version 2.27.0')\n"
+        f"    print('git version {git_version}')\n"
         "    sys.exit(0)\n"
         f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
     )
@@ -864,7 +982,7 @@ def test_cleanup_without_reference_transaction_support_retains_task(
         timeout=20,
     )
     assert result.returncode != 0
-    assert "reference-transaction hooks" in result.stderr
+    assert "Git 2.38 or newer" in result.stderr
     assert git(root, "branch", "--show-current") == "task"
     assert git(root, "rev-parse", "task") == task
     assert git(root, "rev-parse", "master") == task
@@ -1070,7 +1188,7 @@ def test_noop_cleanup_without_python_preserves_the_task(
 
 def test_merge_accepts_windows_style_environment_layout(tmp_path: Path) -> None:
     root = tmp_path / "repository"
-    fixture_repository(root, succeeds=True)
+    fixture_repository(root, succeeds=True, primary_hooks=True, profile="documentation")
     # Exercise interpreter discovery on the host, not Windows process semantics.
     executable(root / ".githooks/pre-merge-commit", "#!/bin/sh\nexit 0\n")
     git(root, "add", ".")
@@ -1084,8 +1202,7 @@ def test_merge_accepts_windows_style_environment_layout(tmp_path: Path) -> None:
             "bash",
             "src/h2h_dev_tools/git-flow-merge.sh",
             str(root),
-            "direct",
-            "",
+            "scripts/review-merge-candidate.sh",
         ),
         cwd=root,
         check=False,
@@ -1372,22 +1489,19 @@ while True:
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX Git hook descendants")
 @pytest.mark.parametrize(
-    ("stage", "strategy"),
-    [
-        ("checkout", "direct"),
-        ("checkout", "candidate"),
-        ("noop", "candidate"),
-        ("restore", "candidate"),
-        ("abort", "candidate"),
-        ("delete", "candidate"),
-    ],
+    "stage",
+    ["checkout", "noop", "restore", "abort", "delete"],
 )
 @pytest.mark.parametrize("mode", ["cancel", "leader-exit"])
 def test_all_mutating_workflow_hooks_are_owned(
-    tmp_path: Path, stage: str, strategy: str, mode: str
+    tmp_path: Path, stage: str, mode: str
 ) -> None:
     root = tmp_path / "repository"
-    fixture_repository(root, succeeds=stage not in {"restore", "abort"})
+    fixture_repository(
+        root,
+        succeeds=stage not in {"restore", "abort"},
+        primary_hooks=False,
+    )
     state = tmp_path / "hook-state"
     state.mkdir()
     hook_name = (
@@ -1425,8 +1539,7 @@ def test_all_mutating_workflow_hooks_are_owned(
                 "bash",
                 "src/h2h_dev_tools/git-flow-merge.sh",
                 str(root),
-                strategy,
-                "scripts/review-merge-candidate.sh" if strategy == "candidate" else "",
+                "scripts/review-merge-candidate.sh",
                 *(["--cleanup-only"] if stage == "noop" else []),
             ),
             cwd=root,
@@ -1467,7 +1580,8 @@ def test_all_mutating_workflow_hooks_are_owned(
             )
             if stage == "abort":
                 assert git(root, "branch", "--show-current") == "master"
-                assert "recovery incomplete" in recorded
+                assert "recovery ownership or cleanup unproven" in recorded
+                assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
             if stage in {"restore", "abort"} and mode == "cancel":
                 assert "command budget expired" in recorded
             if stage in {"checkout", "noop"}:
@@ -1491,12 +1605,13 @@ def test_workflow_stops_mutating_after_unproven_stage_cleanup(
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=stage not in {"abort", "restore"})
     command = {
-        "checkout": ("switch", "master"),
-        "abort": ("merge", "--abort"),
-        "restore": ("switch", "task"),
+        "checkout": ("--workflow-state", "switch-primary"),
+        "abort": ("--workflow-state", "recover-abort"),
+        "restore": ("--workflow-state", "recover-restore"),
         "delete": ("branch", "-d", "task"),
     }[stage]
     events = tmp_path / "commands.jsonl"
+    hits = tmp_path / "injection-hits.jsonl"
     source = root / "src/h2h_dev_tools/process.py"
     source.write_text(
         source.read_text()
@@ -1505,7 +1620,11 @@ def test_workflow_stops_mutating_after_unproven_stage_cleanup(
         + "    import json\n"
         + f"    with open({str(events)!r}, 'a') as events:\n"
         + "        events.write(json.dumps(phase.argv) + '\\n')\n"
-        + f"    if phase.argv[-{len(command)}:] == {command!r}:\n"
+        + f"    target = {command!r}\n"
+        + "    if any(phase.argv[index:index + len(target)] == target\n"
+        + "           for index in range(len(phase.argv) - len(target) + 1)):\n"
+        + f"        with open({str(hits)!r}, 'a') as hits:\n"
+        + "            hits.write(json.dumps(phase.argv) + '\\n')\n"
         + "        raise ProcessOwnershipError('fixture cleanup unproven')\n"
         + "    return _original_run_command(phase, **kwargs)\n"
     )
@@ -1525,7 +1644,14 @@ def test_workflow_stops_mutating_after_unproven_stage_cleanup(
     assert result.returncode != 0, result.stdout + result.stderr
     assert "git-flow-merge: process cleanup unproven" not in result.stderr
     commands = [json.loads(line) for line in events.read_text().splitlines()]
-    assert commands[-1][-len(command) :] == list(command)
+    injected = [json.loads(line) for line in hits.read_text().splitlines()]
+    assert len(injected) == 1
+    assert commands[-1] == injected[0], "No later Git or state action may start"
+    assert any(
+        injected[0][index : index + len(command)] == list(command)
+        for index in range(len(injected[0]) - len(command) + 1)
+    )
+    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
     assert git(root, "rev-parse", "task") == task
     assert git(root, "branch", "--show-current") == (
         "task" if stage == "checkout" else "master"
@@ -1542,7 +1668,9 @@ def test_linked_cleanup_requires_surviving_primary_environment(
     tmp_path: Path, cleanup_only: bool
 ) -> None:
     primary = tmp_path / "primary"
-    base = fixture_repository(primary, succeeds=True)
+    base = fixture_repository(
+        primary, succeeds=True, primary_hooks=True, profile="documentation"
+    )
     executable(primary / ".githooks/pre-merge-commit", "#!/bin/sh\nexit 0\n")
     git(primary, "add", ".")
     git(primary, "commit", "-m", "test: use a shell-only merge gate")
@@ -1561,8 +1689,7 @@ def test_linked_cleanup_requires_surviving_primary_environment(
             "bash",
             "src/h2h_dev_tools/git-flow-merge.sh",
             str(task),
-            "direct",
-            "",
+            "scripts/review-merge-candidate.sh",
             *(["--cleanup-only"] if cleanup_only else []),
         ),
         cwd=task,
@@ -1749,7 +1876,7 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
         "    raise SystemExit(0)\n"
         "sys.stdin.read()\n"
         "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n",
+        + _PASS_REVIEW,
     )
     environment = os.environ | {
         "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
@@ -2017,15 +2144,20 @@ def _assert_interrupted_workflow_cleanup(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises real POSIX process signals")
-@pytest.mark.parametrize("strategy", ["direct", "candidate"])
 @pytest.mark.parametrize("committed", [False, True])
 @pytest.mark.parametrize("handoff_signal", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
 def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
-    tmp_path: Path, strategy: str, committed: bool, handoff_signal: bool, nested: bool
+    tmp_path: Path, committed: bool, handoff_signal: bool, nested: bool
 ) -> None:
     root = tmp_path / "repository"
-    base = fixture_repository(root, succeeds=True)
+    base = fixture_repository(root, succeeds=True, primary_hooks=False)
+    git(root, "switch", "master")
+    (root / "primary-only.txt").write_text("preserved primary-only content\n")
+    git(root, "add", "primary-only.txt")
+    git(root, "commit", "-m", "test: diverge primary before interrupted merge")
+    base = git(root, "rev-parse", "HEAD")
+    git(root, "switch", "task")
     state = tmp_path / "state"
     state.mkdir()
     (root / "scripts/blocking-gate.py").write_text(_BLOCKING_GATE)
@@ -2060,7 +2192,7 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
         f"    exec .venv/bin/python scripts/{'nested' if nested else 'blocking'}-gate.py\n"
         "fi\n"
     )
-    hook = "post-merge" if strategy == "direct" else "post-commit"
+    hook = "post-commit"
     executable(
         root / (f".githooks/{hook}" if committed else "scripts/check-full.sh"),
         blocking_entry,
@@ -2094,10 +2226,7 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
                         "bash",
                         str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
                         str(root),
-                        strategy,
-                        "scripts/review-merge-candidate.sh"
-                        if strategy == "candidate"
-                        else "",
+                        "scripts/review-merge-candidate.sh",
                     ),
                     root,
                     environment=os.environ | {"MERGE_INTERRUPTION_STATE": str(state)},
@@ -2148,6 +2277,21 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
                 assert git(root, "branch", "--show-current") == "task"
                 assert git(root, "rev-parse", "master") == base
             assert git(root, "status", "--porcelain") == ""
+            assert not (root / ".git/h2h-merge-workflow.lock").exists(), output
+            assert (
+                git(root, "show", "master:primary-only.txt")
+                == "preserved primary-only content"
+            )
+            if committed:
+                completed = git(root, "rev-parse", "master")
+                git(root, "switch", "task")
+                retry = owned_fixture_command(
+                    root, ("scripts/git-flow-merge.sh", "--cleanup-only")
+                )
+                assert retry.returncode == 0, retry.stdout + retry.stderr
+                assert git(root, "rev-parse", "master") == completed
+                assert not git(root, "branch", "--list", "task")
+                assert not (root / ".git/h2h-merge-workflow.lock").exists()
         finally:
             if not clean:
                 # Rescue is never a passing oracle. Retain an uncertain ledger;
@@ -2235,6 +2379,8 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
     base = fixture_repository(root, succeeds=False)
     calls = tmp_path / "diagnostic-calls"
     commands = tmp_path / "commands.jsonl"
+    receipts = tmp_path / "receipts.tsv"
+    record_workflow_receipts(root, receipts)
     exports = tmp_path / "exports"
     exports.mkdir()
     source = root / "src/h2h_dev_tools/process.py"
@@ -2284,8 +2430,12 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
     assert (root / ".git/MERGE_HEAD").exists()
     retained = list(exports.glob("h2h-merge-owner.*"))
     assert len(retained) == 1
-    assert (retained[0] / "cleanup-4").read_text() == "owned_tree_empty\n"
-    assert not (retained[0] / "cleanup-5").exists()
+    recorded = [line.split("\t") for line in receipts.read_text().splitlines()]
+    assert [entry[0] for entry in recorded[-2:]] == ["process", "diagnostic"]
+    commit_receipt, diagnostic_receipt = (Path(entry[1]) for entry in recorded[-2:])
+    assert commit_receipt.parent == diagnostic_receipt.parent == retained[0]
+    assert commit_receipt.read_text() == "owned_tree_empty\n"
+    assert not diagnostic_receipt.exists()
 
 
 @pytest.mark.skipif(
@@ -2388,6 +2538,8 @@ def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=False)
     ready = tmp_path / "diagnostic-ready"
+    receipts = tmp_path / "receipts.tsv"
+    record_workflow_receipts(root, receipts)
     exports = tmp_path / "exports"
     exports.mkdir()
     source = root / "src/h2h_dev_tools/process.py"
@@ -2453,7 +2605,11 @@ def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
             assert (root / ".git/MERGE_HEAD").exists()
             retained = list(exports.glob("h2h-merge-owner.*"))
             assert len(retained) == 1
-            assert not (retained[0] / "cleanup-5").exists()
+            recorded = [line.split("\t") for line in receipts.read_text().splitlines()]
+            assert recorded[-1][0] == "diagnostic"
+            diagnostic_receipt = Path(recorded[-1][1])
+            assert diagnostic_receipt.parent == retained[0]
+            assert not diagnostic_receipt.exists()
         finally:
             if not clean:
                 with controller.defer():
@@ -2531,3 +2687,803 @@ def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
             with controller.defer():
                 assert process.terminate_owned_tree(owner, deadline=deadline)
                 assert process.close_owner(owner, deadline=deadline)
+
+
+def _ignored_file_fixture(root: Path) -> None:
+    fixture_repository(root, succeeds=True, primary_hooks=True)
+    # These native Git obstruction cases isolate checkout/merge preservation.
+    # Full review and gate behavior is exercised by the other workflow tests.
+    for name in ("pre-commit", "commit-msg"):
+        executable(root / ".githooks" / name, "#!/bin/sh\nexit 0\n")
+    executable(
+        root / ".githooks/pre-merge-commit",
+        '#!/bin/sh\nprintf "checked\\n" >> "$(git rev-parse --git-path fixture-gate)"\n',
+    )
+    git(root, "add", ".githooks")
+    git(root, "commit", "-m", "test: isolate native Git file preservation")
+
+
+@pytest.mark.parametrize("private_file", [False, True])
+def test_initial_switch_preserves_ignored_private_files(
+    tmp_path: Path, private_file: bool
+) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    protected = root / "private.txt"
+    protected.write_bytes(b"primary tracked bytes\n")
+    git(root, "add", "private.txt")
+    git(root, "commit", "-m", "test: establish tracked primary file")
+    primary = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/heads/master", primary)
+    git(root, "rm", "private.txt")
+    with (root / ".gitignore").open("a") as ignore:
+        ignore.write("private.txt\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-m", "test: stop tracking private file on task")
+    task = git(root, "rev-parse", "HEAD")
+    private_bytes = b"private bytes must survive\x00\xff\n"
+    if private_file:
+        protected.write_bytes(private_bytes)
+        assert git(root, "check-ignore", "private.txt") == "private.txt"
+    assert git(root, "status", "--porcelain") == ""
+
+    result = subprocess.run(
+        (
+            "bash",
+            "src/h2h_dev_tools/git-flow-merge.sh",
+            str(root),
+            "scripts/review-merge-candidate.sh",
+        ),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    if private_file:
+        assert protected.read_bytes() == private_bytes
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "checkout obstruction" in result.stderr
+        assert git(root, "branch", "--show-current") == "task"
+        assert git(root, "rev-parse", "master") == primary
+        assert git(root, "rev-parse", "task") == task
+        assert git(root, "write-tree") == git(root, "rev-parse", "task^{tree}")
+        assert not (root / ".git/fixture-gate").exists()
+        assert not (root / ".git/fixture-review-events").exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert git(root, "branch", "--show-current") == "master"
+        assert git(root, "show", "-s", "--format=%P", "HEAD").split() == [primary, task]
+        assert git(root, "branch", "--list", "task") == ""
+        assert not protected.exists()
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+
+
+@pytest.mark.parametrize("cleanup_only", [False, True])
+@pytest.mark.parametrize("private_file", [False, True])
+def test_noop_cleanup_switch_preserves_ignored_private_files(
+    tmp_path: Path, cleanup_only: bool, private_file: bool
+) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    with (root / ".gitignore").open("a") as ignore:
+        ignore.write("private.txt\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-m", "test: ignore private file on task")
+    task = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/heads/master", task)
+    git(root, "switch", "master")
+    protected = root / "private.txt"
+    tracked_bytes = b"new primary tracked bytes\n"
+    protected.write_bytes(tracked_bytes)
+    git(root, "add", "-f", "private.txt")
+    git(root, "commit", "-m", "test: track previously ignored path on primary")
+    primary = git(root, "rev-parse", "HEAD")
+    git(root, "switch", "task")
+    private_bytes = b"private cleanup bytes\x00\xff\n"
+    if private_file:
+        protected.write_bytes(private_bytes)
+        assert git(root, "check-ignore", "private.txt") == "private.txt"
+    assert git(root, "status", "--porcelain") == ""
+
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", *(["--cleanup-only"] if cleanup_only else [])),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    if private_file:
+        assert protected.read_bytes() == private_bytes
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "checkout obstruction" in result.stderr
+        assert git(root, "branch", "--show-current") == "task"
+        assert git(root, "rev-parse", "task") == task
+        assert git(root, "write-tree") == git(root, "rev-parse", "task^{tree}")
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert protected.read_bytes() == tracked_bytes
+        assert git(root, "branch", "--show-current") == "master"
+        assert git(root, "branch", "--list", "task") == ""
+    assert git(root, "rev-parse", "master") == primary
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/fixture-gate").exists()
+    assert not (root / ".git/fixture-review-events").exists()
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+
+
+@pytest.mark.parametrize("private_file", [False, True])
+def test_merge_preserves_ignored_private_files_in_linked_primary(
+    tmp_path: Path, private_file: bool
+) -> None:
+    primary_root = tmp_path / "primary"
+    root = primary_root
+    _ignored_file_fixture(root)
+    with (root / ".gitignore").open("a") as ignore:
+        ignore.write("private.txt\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-m", "test: establish ignored path on primary")
+    primary = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/heads/master", primary)
+    tracked_bytes = b"new task tracked bytes\n"
+    (root / "private.txt").write_bytes(tracked_bytes)
+    git(root, "add", "-f", "private.txt")
+    git(root, "commit", "-m", "test: track ignored path on task")
+    task = git(root, "rev-parse", "HEAD")
+    git(primary_root, "switch", "master")
+    root = tmp_path / "linked-task"
+    git(primary_root, "worktree", "add", str(root), "task")
+    local_bin = root / ".venv/bin"
+    local_bin.mkdir(parents=True)
+    (local_bin / "python").symlink_to(sys.executable)
+    protected = primary_root / "private.txt"
+    private_bytes = b"private merge bytes\x00\xff\n"
+    if private_file:
+        protected.write_bytes(private_bytes)
+        assert git(primary_root, "check-ignore", "private.txt") == "private.txt"
+    assert git(primary_root, "status", "--porcelain") == ""
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    metadata = Path(
+        git(primary_root, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+
+    result = subprocess.run(
+        (
+            "bash",
+            "src/h2h_dev_tools/git-flow-merge.sh",
+            str(root),
+            "scripts/review-merge-candidate.sh",
+        ),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    if private_file:
+        assert protected.read_bytes() == private_bytes
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "Untracked or ignored" in result.stderr
+        assert git(primary_root, "rev-parse", "master") == primary
+        assert git(primary_root, "rev-parse", "task") == task
+        assert git(primary_root, "write-tree") == git(
+            primary_root, "rev-parse", "master^{tree}"
+        )
+        assert root.exists() and git(root, "branch", "--show-current") == "task"
+        assert not (metadata / "fixture-gate").exists()
+        assert not (common / "fixture-review-events").exists()
+    else:
+        result = _retry_retained_linked_task_cleanup(primary_root, root, result)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert protected.read_bytes() == tracked_bytes
+        assert git(primary_root, "show", "-s", "--format=%P", "HEAD").split() == [
+            primary,
+            task,
+        ]
+        assert git(primary_root, "branch", "--list", "task") == ""
+        assert not root.exists()
+    assert git(primary_root, "branch", "--show-current") == "master"
+    assert git(primary_root, "status", "--porcelain") == ""
+    assert not (metadata / "MERGE_HEAD").exists()
+    assert not (common / "h2h-merge-workflow.lock").exists()
+
+
+def _retry_retained_linked_task_cleanup(
+    primary: Path, task: Path, result: subprocess.CompletedProcess[str]
+) -> subprocess.CompletedProcess[str]:
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "task worktree remains" in result.stderr
+    assert task.is_dir() and (task / ".venv/bin/python").is_symlink()
+    assert git(primary, "branch", "--show-current") == "master"
+    assert git(task, "branch", "--show-current") == "task"
+    assert not (primary / ".git/h2h-merge-workflow.lock").exists()
+    committed = git(primary, "rev-parse", "HEAD")
+    assert {
+        path.relative_to(task / ".venv").as_posix()
+        for path in (task / ".venv").rglob("*")
+    } == {"bin", "bin/python"}
+    # Only this fixture-owned synthetic environment is removed after inspection.
+    # The production workflow must retain arbitrary material, including .venv.
+    shutil.rmtree(task / ".venv")
+    retry = subprocess.run(
+        ("scripts/git-flow-merge.sh", "--cleanup-only", "task"),
+        cwd=primary,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert git(primary, "rev-parse", "HEAD") == committed
+    return retry
+
+
+@pytest.mark.parametrize(
+    "material", ["none", "file", "empty-directory", "symlink", "venv"]
+)
+def test_named_cleanup_uses_primary_environment_and_preserves_all_private_material(
+    tmp_path: Path, material: str
+) -> None:
+    primary = tmp_path / "primary"
+    _ignored_file_fixture(primary)
+    with (primary / ".gitignore").open("a") as ignore:
+        ignore.write("private*\n")
+    git(primary, "add", ".gitignore")
+    git(primary, "commit", "-m", "test: ignored cleanup material")
+    task_oid = git(primary, "rev-parse", "HEAD")
+    git(primary, "update-ref", "refs/heads/master", task_oid)
+    git(primary, "switch", "master")
+    task = tmp_path / "task"
+    git(primary, "worktree", "add", str(task), "task")
+    external = tmp_path / "external"
+    external.write_bytes(b"external must remain\x00\xff")
+    protected = task / "private-material"
+    if material == "file":
+        protected.write_bytes(b"private must remain\x00\xff")
+    elif material == "empty-directory":
+        protected.mkdir()
+    elif material == "symlink":
+        protected.symlink_to(external)
+    elif material == "venv":
+        protected = task / ".venv/personal-notes.txt"
+        protected.parent.mkdir()
+        protected.write_bytes(b"private must remain\x00\xff")
+    assert not (task / ".venv/bin/python").exists()
+    assert git(task, "status", "--porcelain") == ""
+
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", "--cleanup-only", "task"),
+        cwd=primary,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert git(primary, "rev-parse", "HEAD") == task_oid
+    assert git(primary, "branch", "--show-current") == "master"
+    assert external.read_bytes() == b"external must remain\x00\xff"
+    assert not (primary / ".git/h2h-merge-workflow.lock").exists()
+    assert not (primary / ".git/MERGE_HEAD").exists()
+    assert not (primary / ".git/fixture-review-events").exists()
+    assert not (primary / ".git/fixture-gate").exists()
+    if material == "none":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not task.exists()
+        assert git(primary, "branch", "--list", "task") == ""
+    else:
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "task worktree remains" in result.stderr
+        assert git(task, "branch", "--show-current") == "task"
+        assert git(primary, "rev-parse", "task") == task_oid
+        if material == "empty-directory":
+            assert protected.is_dir() and list(protected.iterdir()) == []
+        elif material == "symlink":
+            assert protected.is_symlink() and protected.readlink() == external
+        else:
+            assert protected.read_bytes() == b"private must remain\x00\xff"
+
+
+def test_named_cleanup_deletes_integrated_branch_without_a_worktree(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    _ignored_file_fixture(primary)
+    task_oid = git(primary, "rev-parse", "HEAD")
+    git(primary, "update-ref", "refs/heads/master", task_oid)
+    git(primary, "switch", "master")
+
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", "--cleanup-only", "task"),
+        cwd=primary,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(primary, "rev-parse", "HEAD") == task_oid
+    assert git(primary, "branch", "--list", "task") == ""
+    assert (primary / ".venv/bin/python").is_symlink()
+    assert not (primary / ".git/h2h-merge-workflow.lock").exists()
+    assert not (primary / ".git/MERGE_HEAD").exists()
+    assert not (primary / ".git/fixture-review-events").exists()
+    assert not (primary / ".git/fixture-gate").exists()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "task-caller",
+        "unmerged",
+        "primary-target",
+        "missing-target",
+        "detached",
+        "missing-environment",
+    ],
+)
+def test_named_cleanup_rejects_invalid_caller_or_task_without_mutation(
+    tmp_path: Path, invalid: str
+) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    primary = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/heads/master", primary)
+    if invalid == "unmerged":
+        (root / "README.md").write_text("unmerged task\n")
+        git(root, "add", "README.md")
+        git(root, "commit", "-m", "test: retain unmerged task")
+    task = git(root, "rev-parse", "task")
+    if invalid != "task-caller":
+        git(root, "switch", "master")
+    if invalid == "detached":
+        git(root, "switch", "--detach")
+    if invalid == "missing-environment":
+        shutil.rmtree(root / ".venv")
+    branch = git(root, "branch", "--show-current")
+    head = git(root, "rev-parse", "HEAD")
+    target = {"primary-target": "master", "missing-target": "absent"}.get(
+        invalid, "task"
+    )
+
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh", "--cleanup-only", target),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    diagnostic = {
+        "task-caller": "named cleanup must run from the primary checkout",
+        "unmerged": "task contains commits not present in primary",
+        "primary-target": "primary cannot be the cleanup task",
+        "missing-target": "task branch is not a commit",
+        "detached": "detached HEAD is not supported",
+        "missing-environment": "missing repository-local Python",
+    }[invalid]
+    assert diagnostic in result.stderr
+    assert git(root, "rev-parse", "master") == primary
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "rev-parse", "HEAD") == head
+    assert git(root, "branch", "--show-current") == branch
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert not (root / ".git/MERGE_HEAD").exists()
+
+
+def test_canonical_hook_installation_options_allow_normal_merge(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    # Candidate commits must use the real pending-merge hook delegation.
+    shutil.copy2(_ROOT / ".githooks/pre-commit", root / ".githooks/pre-commit")
+    git(root, "add", ".githooks/pre-commit")
+    git(root, "commit", "-m", "test: use canonical candidate hook delegation")
+    primary = git(root, "rev-parse", "master")
+    task = git(root, "rev-parse", "task")
+    installed = subprocess.run(
+        ("bash", "src/h2h_dev_tools/install-git-hooks.sh", str(root)),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert git(root, "config", "--local", "branch.master.mergeOptions") == "--no-ff"
+    configuration = (root / ".git/config").read_bytes()
+
+    result = subprocess.run(
+        (
+            "bash",
+            "src/h2h_dev_tools/git-flow-merge.sh",
+            str(root),
+            "scripts/review-merge-candidate.sh",
+        ),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(root, "branch", "--show-current") == "master"
+    assert git(root, "show", "-s", "--format=%P", "HEAD").split() == [primary, task]
+    assert git(root, "branch", "--list", "task") == ""
+    assert (root / ".git/config").read_bytes() == configuration
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert (root / ".git/fixture-gate").read_text() == "checked\n"
+    assert (root / ".git/fixture-review-events").read_text() == "run\n"
+
+
+@pytest.mark.parametrize(
+    "path_name",
+    [
+        "README.md",
+        pytest.param(
+            " ",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="Win32 does not support a path component made only of spaces",
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("mutation_stage", ["entry", "checks", "verification"])
+def test_release_gate_preserves_filename_bytes_in_workspace_checks(
+    tmp_path: Path, path_name: str, mutation_stage: str
+) -> None:
+    root = tmp_path / "repository"
+    primary = fixture_repository(root, succeeds=True)
+    (root / path_name).write_text("tracked candidate\n")
+    (root / "scripts/check-version.py").write_text(
+        "from pathlib import Path\n"
+        "Path('.git/version-checked').write_text('checked\\n')\n"
+    )
+    # Isolate the release gate's own checks; real receipt rejection and review
+    # execution remain covered by the adjacent unchanged workflow tests.
+    (root / "scripts/review-code.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "assert sys.argv[1] == 'verify'\n"
+        "counter = Path('.git/workspace-verify-count')\n"
+        "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(count))\n"
+        + (
+            f"if count == 2:\n    Path({path_name!r}).write_text('changed\\n')\n"
+            if mutation_stage == "verification"
+            else ""
+        )
+    )
+    executable(
+        root / "scripts/check-full.sh",
+        "#!/bin/sh\n"
+        "printf 'checked\\n' > .git/fixture-gate\n"
+        + (
+            f"printf 'changed\\n' > {path_name!r}\n"
+            if mutation_stage == "checks"
+            else ""
+        ),
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: exercise gate workspace path bytes")
+    task = git(root, "rev-parse", "HEAD")
+    git(root, "switch", "master")
+    git(root, "merge", "--no-ff", "--no-commit", "task")
+    tree = git(root, "write-tree")
+    if mutation_stage == "entry":
+        (root / path_name).write_text("changed\n")
+
+    result = subprocess.run(
+        (sys.executable, "scripts/release-gate.py"),
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    expected = (
+        "merge candidate has unstaged changes"
+        if mutation_stage == "entry"
+        else "merge candidate changed during the gate"
+    )
+    assert expected in result.stderr
+    assert "Verified full merge candidate" not in result.stdout
+    assert (root / path_name).read_text() == "changed\n"
+    assert (
+        subprocess.check_output(("git", "diff", "--name-only", "-z"), cwd=root)
+        == os.fsencode(path_name) + b"\0"
+    )
+    assert git(root, "rev-parse", "HEAD") == primary
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "rev-parse", "MERGE_HEAD") == task
+    assert git(root, "write-tree") == tree
+    counter = root / ".git/workspace-verify-count"
+    if mutation_stage == "entry":
+        assert not counter.exists()
+        assert not (root / ".git/version-checked").exists()
+        assert not (root / ".git/fixture-gate").exists()
+    else:
+        assert counter.read_text() == ("1" if mutation_stage == "checks" else "2")
+        assert (root / ".git/version-checked").read_text() == "checked\n"
+        assert (root / ".git/fixture-gate").read_text() == "checked\n"
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+@pytest.mark.parametrize("mutation_stage", ["entry", "checks", "verification"])
+def test_release_gate_rejects_index_flags_at_every_candidate_boundary(
+    tmp_path: Path, flag: str, mutation_stage: str
+) -> None:
+    root = tmp_path / "repository"
+    primary = fixture_repository(root, succeeds=True)
+    (root / "README.md").write_text("tracked candidate\n")
+    mutation = (
+        "import subprocess\nfrom pathlib import Path\n"
+        f"subprocess.run(['git', 'update-index', '--{flag}', '--', 'README.md'], check=True)\n"
+        "Path('README.md').write_text('hidden unreviewed change\\n')\n"
+    )
+    (root / "scripts/mutate-index.py").write_text(mutation)
+    (root / "scripts/check-version.py").write_text(
+        "from pathlib import Path\n"
+        "Path('.git/version-checked').write_text('checked\\n')\n"
+    )
+    (root / "scripts/review-code.py").write_text(
+        "import runpy, sys\nfrom pathlib import Path\n"
+        "assert sys.argv[1] == 'verify'\n"
+        "counter = Path('.git/index-verify-count')\n"
+        "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(count))\n"
+        + (
+            "if count == 2:\n    runpy.run_path('scripts/mutate-index.py')\n"
+            if mutation_stage == "verification"
+            else ""
+        )
+    )
+    executable(
+        root / "scripts/check-full.sh",
+        "#!/bin/sh\nprintf 'checked\\n' > .git/fixture-gate\n"
+        + (
+            "exec .venv/bin/python scripts/mutate-index.py\n"
+            if mutation_stage == "checks"
+            else ""
+        ),
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: hide source changes at gate boundaries")
+    task = git(root, "rev-parse", "HEAD")
+    git(root, "switch", "master")
+    git(root, "merge", "--no-ff", "--no-commit", "task")
+    tree = git(root, "write-tree")
+    if mutation_stage == "entry":
+        git(root, "update-index", "--" + flag, "--", "README.md")
+        (root / "README.md").write_text("hidden unreviewed change\n")
+
+    result = owned_fixture_command(root, (sys.executable, "scripts/release-gate.py"))
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "assume-unchanged or skip-worktree" in result.stderr
+    assert "Verified full merge candidate" not in result.stdout
+    assert (root / "README.md").read_text() == "hidden unreviewed change\n"
+    assert (
+        subprocess.check_output(("git", "diff", "--name-only", "-z"), cwd=root) == b""
+    )
+    inventory = subprocess.check_output(
+        ("git", "ls-files", "-v", "-z", "--", "README.md"), cwd=root
+    )
+    assert inventory == (
+        b"h README.md\0" if flag == "assume-unchanged" else b"S README.md\0"
+    )
+    assert git(root, "rev-parse", "HEAD") == primary
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "rev-parse", "MERGE_HEAD") == task
+    assert git(root, "write-tree") == tree
+    counter = root / ".git/index-verify-count"
+    if mutation_stage == "entry":
+        assert not counter.exists()
+        assert not (root / ".git/version-checked").exists()
+        assert not (root / ".git/fixture-gate").exists()
+    else:
+        assert counter.read_text() == ("1" if mutation_stage == "checks" else "2")
+        assert (root / ".git/version-checked").read_text() == "checked\n"
+        assert (root / ".git/fixture-gate").read_text() == "checked\n"
+
+
+@pytest.mark.parametrize("stage", ["candidate", "noop", "cleanup-only"])
+@pytest.mark.parametrize("ignored", [False, True])
+def test_initial_primary_checkout_preserves_private_empty_directory(
+    tmp_path: Path, stage: str, ignored: bool
+) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    protected = root / "reserved"
+    if ignored:
+        with (root / ".gitignore").open("a") as stream:
+            stream.write("reserved\n")
+        git(root, "add", ".gitignore")
+        git(root, "commit", "-m", "test: ignore private directory")
+    if stage in {"noop", "cleanup-only"}:
+        task = git(root, "rev-parse", "HEAD")
+        git(root, "update-ref", "refs/heads/master", task)
+        git(root, "switch", "master")
+    protected.write_text("primary tracked destination\n")
+    git(root, "add", "-f", "reserved")
+    git(root, "commit", "-m", "test: track primary destination")
+    primary = git(root, "rev-parse", "HEAD")
+    if stage in {"noop", "cleanup-only"}:
+        git(root, "switch", "task")
+    else:
+        git(root, "update-ref", "refs/heads/master", primary)
+        git(root, "rm", "reserved")
+        git(root, "commit", "-m", "test: remove destination on task")
+        task = git(root, "rev-parse", "HEAD")
+    protected.mkdir()
+    identity = protected.stat()
+    assert git(root, "status", "--porcelain") == ""
+    config = (root / ".git/config").read_bytes()
+    command: tuple[str, ...]
+    if stage == "candidate":
+        command = (
+            "bash",
+            "src/h2h_dev_tools/git-flow-merge.sh",
+            str(root),
+            "scripts/review-merge-candidate.sh",
+        )
+    else:
+        command = (
+            "scripts/git-flow-merge.sh",
+            *(["--cleanup-only"] if stage == "cleanup-only" else []),
+        )
+    result = owned_fixture_command(root, command)
+    assert result.returncode not in {0, 124, 125}, result.stdout + result.stderr
+    assert "empty-directory obstruction" in result.stderr
+    assert protected.is_dir() and not list(protected.iterdir())
+    after = protected.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        identity.st_dev,
+        identity.st_ino,
+        identity.st_mode,
+    )
+    assert git(root, "branch", "--show-current") == "task"
+    assert git(root, "rev-parse", "task") == task
+    assert git(root, "rev-parse", "master") == primary
+    assert git(root, "write-tree") == git(root, "rev-parse", "task^{tree}")
+    assert git(root, "status", "--porcelain") == ""
+    assert (root / ".git/config").read_bytes() == config
+    for marker in (
+        "MERGE_HEAD",
+        "h2h-merge-workflow.lock",
+        "fixture-gate",
+        "fixture-review-events",
+    ):
+        assert not (root / ".git" / marker).exists()
+
+
+@pytest.mark.parametrize("stage", ["normal", "noop", "cleanup-only"])
+def test_initial_primary_checkout_uses_normal_owner_for_post_checkout_hook(
+    tmp_path: Path, stage: str
+) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    events = tmp_path / "owner-commands.jsonl"
+    marker = tmp_path / "post-checkout-completed"
+    source = root / "src/h2h_dev_tools/process.py"
+    source.write_text(
+        source.read_text()
+        + "\n_original_run_command = run_command\n"
+        + "def run_command(phase, **kwargs):\n"
+        + "    import json\n"
+        + f"    with open({str(events)!r}, 'a') as events:\n"
+        + "        events.write(json.dumps({'argv': phase.argv, "
+        + "'bounded': kwargs.get('hard_deadline') is not None}) + '\\n')\n"
+        + "    return _original_run_command(phase, **kwargs)\n"
+    )
+    write_python_executable(
+        root / ".githooks/post-checkout",
+        f"from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('hook completed')\n",
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: observe normal checkout owner and hook")
+    primary = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/heads/master", primary)
+    if stage == "normal":
+        (root / "task.txt").write_text("new task content\n")
+        git(root, "add", "task.txt")
+        git(root, "commit", "-m", "test: make a nonempty task")
+    task = git(root, "rev-parse", "task")
+    result = owned_fixture_command(
+        root,
+        (
+            "scripts/git-flow-merge.sh",
+            *(["--cleanup-only"] if stage == "cleanup-only" else []),
+        ),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_text() == "hook completed"
+    commands = [json.loads(line) for line in events.read_text().splitlines()]
+    switches = [item for item in commands if "switch-primary" in item["argv"]]
+    assert len(switches) == 1 and switches[0]["bounded"] is False
+    assert git(root, "branch", "--show-current") == "master"
+    if stage == "normal":
+        assert git(root, "show", "-s", "--format=%P", "HEAD").split() == [primary, task]
+    else:
+        assert git(root, "rev-parse", "HEAD") == primary
+    assert not git(root, "branch", "--list", "task")
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert not (root / ".git/MERGE_HEAD").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited hook process group")
+@pytest.mark.parametrize("cleanup_only", [False, True])
+def test_initial_primary_checkout_cleans_hook_child_holding_output_streams(
+    tmp_path: Path, cleanup_only: bool
+) -> None:
+    root = tmp_path / "repository"
+    _ignored_file_fixture(root)
+    pid_path = tmp_path / "hook-child.pid"
+    stopped = tmp_path / "hook-child-stopped"
+    child = (
+        "import os,signal,sys,time\nfrom pathlib import Path\n"
+        "def stop(*args):\n"
+        f"    Path({str(stopped)!r}).write_text('terminated')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        f"Path({str(pid_path)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(120)\n"
+    )
+    write_python_executable(
+        root / ".githooks/post-checkout",
+        f"import subprocess,sys,time\nfrom pathlib import Path\n"
+        "branch=subprocess.check_output(['git','branch','--show-current'],text=True).strip()\n"
+        "if branch == 'master':\n"
+        f"    subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        "    deadline=time.monotonic()+5\n"
+        f"    while not Path({str(pid_path)!r}).exists():\n"
+        "        assert time.monotonic()<deadline\n"
+        "        time.sleep(0.01)\n",
+    )
+    git(root, "add", ".githooks/post-checkout", ".githooks/post-checkout.py")
+    git(root, "commit", "-m", "test: leave inherited hook streams open")
+    primary = git(root, "rev-parse", "HEAD")
+    git(root, "update-ref", "refs/heads/master", primary)
+    if not cleanup_only:
+        (root / "task.txt").write_text("new task content\n")
+        git(root, "add", "task.txt")
+        git(root, "commit", "-m", "test: make a nonempty task")
+    task = git(root, "rev-parse", "task")
+    result = owned_fixture_command(
+        root,
+        ("scripts/git-flow-merge.sh", *(["--cleanup-only"] if cleanup_only else [])),
+        timeout_seconds=45,
+        termination_reserve_seconds=30,
+    )
+    assert result.returncode not in {0, 124, 125}, result.stdout + result.stderr
+    assert "surviving process-tree members" in result.stdout + result.stderr
+    assert stopped.read_text() == "terminated"
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_path.read_text()), 0)
+    assert git(root, "rev-parse", "master") == primary
+    assert git(root, "rev-parse", "task") == task
+    # Cleanup-only has completed no merge and intentionally retains primary;
+    # a normal failed merge workflow restores its captured task entry checkout.
+    assert git(root, "branch", "--show-current") == (
+        "master" if cleanup_only else "task"
+    )
+    assert git(root, "status", "--porcelain") == ""
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert not (root / ".git/fixture-gate").exists()

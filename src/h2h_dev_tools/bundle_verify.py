@@ -18,6 +18,8 @@ BASE_FILES = frozenset({"__init__.py", "bundle_verify.py", "source_loader.py"})
 _MERGE_REVIEW_FILES = frozenset(
     {
         "code_review.py",
+        "git_index.py",
+        "merge_admission.py",
         "process.py",
         "_process_scope.py",
         "_process_diagnostic.py",
@@ -46,6 +48,7 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "primary-branch": frozenset({"primary-branch.sh"}),
     "git-flow": _MERGE_REVIEW_FILES,
     "git-environment": frozenset({"git_environment.py"}),
+    "git-index": frozenset({"git_index.py"}),
     "hooks": frozenset(
         {"primary-branch.sh", "install-git-hooks.sh", "commit-message.sh"}
     ),

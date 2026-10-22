@@ -111,6 +111,12 @@
   強制終止該 owner 或回報整棵樹清空。Lock 等待共用原 deadline，不以延長 grace
   取代 ownership 證據。內層非預期死亡或 ledger 不可驗證時保留 candidate、task
   與 scope，不能把外層 group 清空當作巢狀清理成功。
+- Merge 與 `--cleanup-only` 在採樣可變 refs／worktrees 前取得 Git common metadata
+  的排他 admission，涵蓋整段 workflow、owned cleanup 與 recovery。它協調遵守同一
+  協議的 invocations，不阻止任意外部手動 Git。Recovery 只撤回本次建立且仍精確
+  相符的 candidate；外部漂移、來源不明或 cleanup 未證明時保留 candidate、task
+  與 admission，不自動回收 stale lock。已確認完成的 merge commit 不得 abort；
+  cleanup 已證明時釋放 admission，讓正常 `--cleanup-only` 可以重試。
 - Merge workflow 的 checkout、merge、failure recovery 與 task branch deletion
   統一由 canonical process owner 管理 Git hooks。包括已合併 task 的 cleanup
   都需要 repository-local `.venv`；缺少時先執行 `scripts/rebuild-env.sh`。
@@ -123,6 +129,26 @@
   新 writer 或發布 passing review／cleanup evidence。Shell 在 ownership 建立前的
   stdlib owner 啟動及 closure 探測一律使用 `-I -S -B`，不得執行 site 啟動碼；
   已納入 owner 的實際 Git／review／gate child 保留正常依賴環境。
+- Git 最低版本為 2.38。切換分支使用 Git 原生 ignored-file 保護；merge 由
+  正常 owned stage 執行 `merge-tree --write-tree`，核對 captured task 及實際預計
+  merge tree 的 untracked／ignored obstruction；preview conflict 在真正 merge
+  前拒絕。Preview 與實際 merge 固定 `ort` 並使用相同其餘設定；primary
+  `branch.<primary>.mergeOptions` 只接受空值或 canonical hook installer 設定的
+  單一 exact `--no-ff`，其他自訂、組合或重複值明確拒絕。實際命令另固定空值
+  但不改 persistent config。此 stage 不套 recovery 十秒上限，也不延長既有外層 lifetime；abort／
+  restore 十秒 budget 不變。Recovery 共用目標路徑保護。Linked worktree 移除前拒絕
+  任何 untracked／ignored 材料，包含空目錄、symlink 與 `.venv`，不設刪除白名單。
+  合併已完成但清理受阻時保留 commit、task branch 與 worktree，不回滾。
+  人工檢視並保存或移除殘留材料後，可從 primary checkout 執行
+  `scripts/git-flow-merge.sh --cleanup-only task-branch`，以 primary local `.venv`
+  先取得 admission，再解析 task identity；task worktree 不必另有 `.venv`。
+  原 task checkout 的無 branch 參數入口仍保留。Owner 內的盤點及後續 Git 操作
+  不是原子 filesystem transaction；admission 僅協調合作流程，操作期間須停止
+  外部 writer，不宣稱可隔離不合作程序的競爭寫入。
+- Merge、review 與 release gate 拒絕 index 的 assume-unchanged／skip-worktree
+  標記，不自動清除。清潔檢查使用 NUL 分隔的原始 Git 路徑；不得以字串 strip
+  或換行切割隱藏空白路徑。候選固定為真正 pending two-parent merge；不保留
+  direct merge strategy 或 WORKFLOW_MERGE_TASK_REF 的版本判定 fallback。
 - Primary 禁止 rebase。Hooks 安裝設定 `pull.rebase=false`、primary rebase=false
   與 `pull.ff=only`。No-op cleanup 只在 task tip 已包含於 primary 時進行。
 - 本機 task branch、commit、merge 及安全清理已獲授權。

@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.7.2 is available on your selected
+Use Python 3.14 or newer. When version 0.8.0 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.7.2
+python -m pip install h2h-dev-tools==0.8.0
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.7.2-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.8.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -70,6 +70,7 @@ current-closure checks; none executes a compatibility fallback or downloads a wh
 | `distribution-check` | Installed requirements, RECORD and import-origin validation |
 | `offline-wheel` | Temporary candidate-wheel environment with development dependencies and a local smoke callback |
 | `process` | Owned process trees, deadlines, signal deferral and Windows Job start gates |
+| `git-index` | Reject hidden index entries without changing their flags |
 | `git-environment` | Isolate test children from inherited Git hook repository authority |
 | `pytest` | Fresh source and assertion caches with explicit import roots for pytest and local xdist workers |
 | `formal` | Pinned TLC download and offline host/Docker execution |
@@ -346,17 +347,45 @@ and stable refs; it runs the local candidate review/gate and aborts on failure.
 Primary worktree discovery queries the exact branch with NUL-delimited fields;
 paths containing line breaks are preserved. Repository-local merge, gate and
 hook entries must likewise preserve path bytes when determining the Git root.
-Both merge strategies use the captured task commit, preserving its branch name
-in the merge message. Version checks use the actual `MERGE_HEAD`; before Git
-creates that file for a direct merge hook, `WORKFLOW_MERGE_TASK_REF` must contain
-the full immutable commit OID. Mutable branch names are no longer accepted there.
+Merge always creates a pending two-parent candidate with `--no-ff --no-commit`,
+using the captured task commit and preserving its branch name in the merge message.
+Review and version checks require the actual `MERGE_HEAD`; the direct strategy and
+`WORKFLOW_MERGE_TASK_REF` fallback are removed. When updating the `git-flow`
+snapshot, remove the old `candidate` or `direct` argument from the consumer wrapper:
+
+```bash
+exec bash "$repository_root/scripts/_shared/h2h_dev_tools/git-flow-merge.sh" \
+  "$repository_root" scripts/review-merge-candidate.sh "$@"
+```
+
+The consumer's pre-commit hook must delegate pending merges to its pre-merge gate.
+There is no automatic wrapper conversion because that gate remains repository-owned.
+Merge, review and release gates reject `assume-unchanged` and `skip-worktree`
+index entries before trusting workspace cleanliness. They preserve these flags and
+local contents; inspect and explicitly resolve them before retrying. Cleanliness
+queries use NUL-delimited raw path bytes, including whitespace-only filenames.
+Switches and recovery use Git's `--no-overwrite-ignore` protection. Before a
+merge, the owner checks task and predicted merge destinations for untracked or
+ignored obstructions, including directory/file transitions and paths created by
+directory renames. This requires Git 2.38 or newer: `merge-tree --write-tree`
+previews the captured parents without changing the index or worktree, and a
+conflicting preview stops before the real merge. Both stages use the `ort`
+strategy and the same repository merge configuration. Primary
+`branch.<primary>.mergeOptions` may be empty or the single exact `--no-ff` value
+set by the canonical hook installer. Other custom, combined or repeated values
+are rejected explicitly; resolve them before retrying. The actual merge pins empty
+branch options for that command without changing persistent configuration. Git's no-overwrite
+option alone does not protect every `--no-ff` merge implementation. Planning is
+a normal owned stage under the existing outer lifetime; failure recovery keeps
+its separate ten-second limits.
+
 Already-integrated tasks use checked cleanup without another merge or gate.
 Cleanup rechecks that the original task tip remains unchanged and is contained in
 primary before removing a linked worktree. Branch deletion uses primary's checked
 out HEAD as its ancestry authority, independent of the task's configured upstream.
 A temporary `reference-transaction` hook rechecks the actual task tip while Git
 holds its deletion lock, forwarding every event and its unchanged input to the
-existing hook. This requires Git 2.28 or newer. A task advanced during review or
+existing hook. A task advanced during review or
 cleanup is retained, and cleanup failure never rolls back an already successful
 merge.
 Workflow commands that change Git state use repository-local Python to own their
@@ -366,10 +395,19 @@ their local `.venv` before merging or cleaning up an already-merged task. Run
 the repository's `scripts/rebuild-env.sh` once if it does not exist; branch
 detection and bootstrap still work without it. Linked-worktree cleanup also
 requires the primary checkout's `.venv`, so removing the task worktree cannot
-remove the interpreter needed to finish cleanup. `--cleanup-only` remains
-available to retry cleanup after
-a successful merge without repeating review. Existing application data does not
-need conversion.
+remove the interpreter needed to finish cleanup. Worktree removal refuses any
+untracked or ignored material, including empty directories, symlinks and `.venv`;
+there is no environment or ignore-pattern deletion allowlist. A successful merge
+therefore retains a linked task containing its local environment and reports
+cleanup as incomplete. It preserves the merge commit, task branch and worktree.
+Inspect and save or remove the retained material yourself, then run
+`scripts/git-flow-merge.sh --cleanup-only task-branch` from the primary checkout.
+This named form uses primary's local `.venv` and does not require one in the task
+worktree; it acquires admission before resolving the task refs and worktree.
+If the task worktree was already removed, it still checks ancestry and safely
+deletes the unchanged task branch. The original task-checkout `--cleanup-only`
+form remains available. Neither form repeats review for an integrated task.
+Existing application data does not need conversion.
 This contract does not cover custom helpers used by separate read-only Git
 queries, such as an external filesystem monitor, or deliberately detached
 processes outside the owned POSIX group.
@@ -398,6 +436,40 @@ Preflight messages before an owner exists retain normal stdio behavior; no Git
 mutation or owned child has started at that point.
 A failed abort prevents the recovery checkout; recovery never rolls back an
 already completed merge.
+
+Every merge or `--cleanup-only` workflow first acquires an atomic admission
+in Git common metadata (`h2h-merge-workflow.lock`), before sampling mutable refs
+or worktrees. This excludes cooperating workflows across linked worktrees,
+including repeated invocations for the same task. The copied bootstrap retains
+its source authority through task worktree removal. Recovery captures the owned
+merge's exact refs, index, worktree and operation state before later checks;
+it aborts only that unchanged pending candidate. `AUTO_MERGE` without the owned
+`MERGE_HEAD` is insufficient evidence and is retained. Recovery checks tracked,
+untracked and ignored obstructions before restoring primary contents.
+Incomplete or inconsistent intermediate-state evidence is retained for inspection.
+Snapshot reads and abort share the
+existing ten-second recovery deadline, including cleanup. An exact committed
+merge is never rolled back; after proven process cleanup, admission is released
+so `--cleanup-only` can retry remaining task cleanup.
+
+The owner performs obstruction and complete removal-inventory checks before the
+native Git mutation under the same workflow admission. These checks do not form
+an atomic filesystem transaction with Git: an unrelated process can create a
+file after the check. Stop external writers before merge or cleanup; admission
+coordinates participating workflows and does not isolate arbitrary filesystem
+writers. Git's own tracked-change and ordinary untracked-file protections remain
+active, and removal never uses `--force`.
+
+Admission is not a lock against manual Git commands. Observable external drift,
+unknown recovery ownership, unproven process cleanup or abrupt owner death
+retains the candidate, task and admission; there is no automatic stale reclaim.
+Before manually removing retained admission, verify its `owner.json` identity,
+the recorded workflow state in the retained `h2h-merge-owner.*` directory,
+all owned processes and nested cleanup obligations, and the actual primary,
+index and pending operation. Preserve unknown or externally modified state;
+resolve it explicitly before retrying. Partial admission initialization is
+removed only when this invocation proved it created that directory; failed
+cleanup retains the barrier. This local coordination is not tamper protection.
 
 The `code-review` component owns the reviewer implementation; each repository's
 `scripts/review-code.py` calls `code_review.main(repository_root)`, and its merge

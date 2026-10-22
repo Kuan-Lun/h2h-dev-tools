@@ -3,18 +3,38 @@
 
 from __future__ import annotations
 
+import runpy
 import subprocess
 import sys
+from pathlib import Path
+
+
+def git_bytes(*arguments: str) -> bytes:
+    return subprocess.run(("git", *arguments), check=True, capture_output=True).stdout
 
 
 def git(*arguments: str) -> str:
-    return subprocess.run(
-        ("git", *arguments), check=True, capture_output=True, text=True
-    ).stdout.strip()
+    return git_bytes(*arguments).decode("ascii").strip()
+
+
+def assert_index_visible() -> None:
+    package = Path(__file__).resolve().parents[1] / "src/h2h_dev_tools"
+    runpy.run_path(str(package / "source_loader.py"))["load_package"](
+        package, "h2h_dev_tools"
+    )
+    from h2h_dev_tools.git_index import assert_index_visible as verify
+
+    verify(git_bytes)
 
 
 def candidate() -> tuple[str, str, str]:
+    assert_index_visible()
     return git("rev-parse", "HEAD"), git("rev-parse", "MERGE_HEAD"), git("write-tree")
+
+
+def assert_candidate_unchanged(expected: tuple[str, str, str]) -> None:
+    if candidate() != expected or git_bytes("diff", "--name-only", "-z"):
+        raise ValueError("merge candidate changed during the gate")
 
 
 def verify_review(tree: str) -> None:
@@ -33,7 +53,7 @@ def verify_review(tree: str) -> None:
 
 def main() -> None:
     before = candidate()
-    if git("diff", "--name-only"):
+    if git_bytes("diff", "--name-only", "-z"):
         raise ValueError("merge candidate has unstaged changes")
     subprocess.run((sys.executable, "scripts/check-version.py", "--index"), check=True)
     profile = subprocess.run(
@@ -51,10 +71,10 @@ def main() -> None:
     else:
         raise ValueError(f"unrecognized candidate profile: {profile}")
     subprocess.run(command, check=True)
-    if candidate() != before or git("diff", "--name-only"):
-        raise ValueError("merge candidate changed during the gate")
+    assert_candidate_unchanged(before)
     if profile == "full":
         verify_review(before[2])
+        assert_candidate_unchanged(before)
     print(f"Verified {profile} merge candidate {before[2]}")
 
 

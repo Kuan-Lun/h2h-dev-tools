@@ -768,3 +768,27 @@ def test_previous_wheel_upgrade_adds_new_base_helper(
         verify_bundle(consumer)
     assert bundle.sync_bundle(consumer, previous_wheel=wheel)
     assert "source_loader.py" in verify_bundle(consumer)["files"]
+
+
+@pytest.mark.parametrize("component", ["git-flow", "code-review", "git-index"])
+def test_git_index_guard_is_in_the_verified_component_payload(
+    tmp_path: Path, component: str
+) -> None:
+    consumer = tmp_path
+    configure(consumer, [component])
+    assert bundle.sync_bundle(consumer)
+    manifest = verify_bundle(consumer)
+    assert "git_index.py" in manifest["files"]
+    if component != "git-index":
+        assert "merge_admission.py" in manifest["files"]
+    else:
+        assert set(manifest["files"]) == {
+            "__init__.py",
+            "bundle_verify.py",
+            "source_loader.py",
+            "git_index.py",
+        }
+    guard = consumer / BUNDLE_DIRECTORY / "git_index.py"
+    guard.write_bytes(guard.read_bytes() + b"\n# unverified local edit\n")
+    with pytest.raises(BundleError, match="modified"):
+        verify_bundle(consumer)

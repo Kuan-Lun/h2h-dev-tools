@@ -72,6 +72,17 @@ if mode == "change-tree":
     Path("feature.py").write_text("value = 2\n", encoding="utf-8")
     subprocess.run(["git", "add", "feature.py"], check=True)
 
+if mode == "change-worktree":
+    Path(os.environ["FAKE_CODEX_DRIFT_PATH"]).write_text(
+        "Unreviewed local changes.\n", encoding="utf-8"
+    )
+if mode == "hide-index-change":
+    subprocess.run(
+        ["git", "update-index", os.environ["FAKE_CODEX_INDEX_FLAG"], "feature.py"],
+        check=True,
+    )
+    Path("feature.py").write_text("value = 'unreviewed'\n", encoding="utf-8")
+
 output = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
 if mode == "missing":
     raise SystemExit(0)
@@ -372,15 +383,80 @@ def test_review_fails_closed_without_a_complete_clean_result(
     assert len(repo.calls()) == 1
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["ordinary.txt", " ", "\t", "\n"],
+    ids=["ordinary", "space", "tab", "newline"],
+)
 @pytest.mark.parametrize("untracked", [False, True])
 def test_review_rejects_dirty_worktrees_before_invoking_codex(
-    review_repository: ReviewRepository, untracked: bool
+    review_repository: ReviewRepository, untracked: bool, name: str
 ) -> None:
     repo = review_repository
-    name = "untracked.txt" if untracked else "primary.txt"
+    if not untracked:
+        (repo.path / name).write_text("Reviewed contents.\n", encoding="utf-8")
+        repo.git("add", "--", name)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
     (repo.path / name).write_text("Unreviewed local changes.\n", encoding="utf-8")
-    _assert_blocked(repo.review("run", "--index"))
+    result = repo.review("run", "--index")
+    _assert_blocked(result)
+    assert "no unstaged or untracked files" in result.stderr
     assert repo.calls() == []
+    assert reviewer._target(index=True) == target
+    assert not reviewer._receipt_path(target).exists()
+
+
+def test_review_accepts_a_clean_candidate_with_whitespace_paths(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    for name in (" ", "\t", "\n"):
+        (repo.path / name).write_text("Reviewed contents.\n", encoding="utf-8")
+        repo.git("add", "--", name)
+    assert (
+        subprocess.check_output(
+            ("git", "diff", "--name-only", "-z"), cwd=repo.path, env=repo.environment
+        )
+        == b""
+    )
+    _assert_passed(repo.review("run", "--index"))
+    _assert_passed(repo.review("verify", "--index"))
+    assert len(repo.calls()) == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["ordinary.txt", " ", "\t", "\n"],
+    ids=["ordinary", "space", "tab", "newline"],
+)
+@pytest.mark.parametrize("untracked", [False, True])
+def test_review_rejects_worktree_drift_before_publishing_a_receipt(
+    review_repository: ReviewRepository, untracked: bool, name: str
+) -> None:
+    repo = review_repository
+    if not untracked:
+        (repo.path / name).write_text("Reviewed contents.\n", encoding="utf-8")
+        repo.git("add", "--", name)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    repo.environment["FAKE_CODEX_DRIFT_PATH"] = name
+    result = repo.review("run", "--index", mode="change-worktree")
+    _assert_blocked(result)
+    assert "no unstaged or untracked files" in result.stderr
+    assert len(repo.calls()) == 1
+    assert (repo.path / name).read_text() == "Unreviewed local changes.\n"
+    assert reviewer._target(index=True) == target
+    assert not reviewer._receipt_path(target).exists()
+    command = (
+        ("ls-files", "--others", "--exclude-standard", "-z")
+        if untracked
+        else ("diff", "--name-only", "-z")
+    )
+    assert (
+        subprocess.check_output(("git", *command), cwd=repo.path, env=repo.environment)
+        == name.encode() + b"\0"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1623,3 +1699,52 @@ def test_parent_policy_fingerprint_is_portable_between_exact_checkouts(
     copied = tmp_path / "another checkout"
     shutil.copytree(repo.path, copied)
     assert code_review.Reviewer(copied)._policy_digest(tree) == original
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+@pytest.mark.parametrize("command", ["run", "verify"])
+@pytest.mark.parametrize("changed", [False, True])
+def test_review_rejects_hidden_index_entries_before_using_evidence(
+    review_repository: ReviewRepository, flag: str, command: str, changed: bool
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    if command == "verify":
+        _assert_passed(repo.review("run", "--index"))
+    calls = repo.calls()
+    repo.git("update-index", flag, "feature.py")
+    if changed:
+        (repo.path / "feature.py").write_text("value = 'unreviewed'\n")
+    assert repo.git("diff", "--name-only") == ""
+    before = repo.git("ls-files", "-v", "--", "feature.py")
+    result = repo.review(command, "--index")
+    _assert_blocked(result)
+    assert "index" in result.stderr.lower()
+    assert repo.calls() == calls
+    assert repo.git("ls-files", "-v", "--", "feature.py") == before
+    assert repo.git("write-tree") == target.tree
+    assert (
+        tuple(repo.git("rev-parse", "HEAD", "MERGE_HEAD").splitlines())
+        == target.parents
+    )
+    if command == "run":
+        assert not reviewer._receipt_path(target).exists()
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_review_rejects_index_visibility_drift_before_publishing(
+    review_repository: ReviewRepository, flag: str
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    repo.environment["FAKE_CODEX_INDEX_FLAG"] = flag
+    result = repo.review("run", "--index", mode="hide-index-change")
+    _assert_blocked(result)
+    assert "index" in result.stderr.lower()
+    assert len(repo.calls()) == 1
+    assert repo.git("diff", "--name-only") == ""
+    assert (repo.path / "feature.py").read_text() == "value = 'unreviewed'\n"
+    assert repo.git("write-tree") == target.tree
+    assert not reviewer._receipt_path(target).exists()

@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from . import bundle_verify, change_scope, merge_command
+from . import bundle_verify, change_scope, git_index, merge_command
 from . import process as process_control
 
 PROFILE = "h2h-code-review-v2"
@@ -485,6 +485,7 @@ class Reviewer:
         executed_paths["merge_command.py"] = Path(merge_command.__file__)
         executed_paths["process.py"] = Path(process_control.__file__)
         executed_paths["change_scope.py"] = Path(change_scope.__file__)
+        executed_paths["git_index.py"] = Path(git_index.__file__)
         # Historical parent blobs and the current source dependency are distinct.
         # Repository-relative paths keep owner and qualified reviewer consistent.
         digest.update(b"review-parents\0" + self._parent_policy(tree, implementation))
@@ -496,6 +497,7 @@ class Reviewer:
     def _target(self, *, index: bool, revision: str = "HEAD") -> Target:
         parents: tuple[str, ...]
         if index:
+            self._assert_index_visible()
             unresolved = self._git("ls-files", "--unmerged")
             if unresolved:
                 raise ReviewError("Resolve merge conflicts before requesting a review")
@@ -522,11 +524,18 @@ class Reviewer:
             tree = self._git("rev-parse", f"{commit}^{{tree}}")
         return Target(tree, parents, self._policy_digest(tree))
 
+    def _assert_index_visible(self) -> None:
+        try:
+            git_index.assert_index_visible(self._git_bytes)
+        except git_index.GitIndexError as error:
+            raise ReviewError(str(error)) from error
+
     def _assert_workspace(self, target: Target) -> None:
+        self._assert_index_visible()
         if self._git("write-tree") != target.tree:
             raise ReviewError("Check out the exact candidate before running its review")
-        if self._git("diff", "--name-only") or self._git(
-            "ls-files", "--others", "--exclude-standard"
+        if self._git_bytes("diff", "--name-only", "-z") or self._git_bytes(
+            "ls-files", "--others", "--exclude-standard", "-z"
         ):
             raise ReviewError("Review requires no unstaged or untracked files")
         self._parent_policy(
