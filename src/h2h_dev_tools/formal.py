@@ -75,21 +75,19 @@ def fetch_tlc(lock: TlcLock, output_directory: Path) -> Path:
     destination = output_directory / lock.filename
     if destination.is_file() and sha256(destination) == lock.sha256:
         return destination
-    with tempfile.NamedTemporaryFile(
-        dir=output_directory, prefix=".tlc-", delete=False
-    ) as temporary:
-        temporary_path = Path(temporary.name)
-        try:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_directory, prefix=".tlc-", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
             with urllib.request.urlopen(lock.url, timeout=60) as response:
                 shutil.copyfileobj(response, temporary)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
-    try:
         verify_jar(temporary_path, lock.sha256)
         os.replace(temporary_path, destination)
     finally:
-        temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     return destination
 
 
