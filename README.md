@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.7.0 is available on your selected
+Use Python 3.14 or newer. When version 0.7.1 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.7.0
+python -m pip install h2h-dev-tools==0.7.1
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.7.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.7.1-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
