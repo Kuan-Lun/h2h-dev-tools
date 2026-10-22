@@ -33,22 +33,31 @@ def single(directory: Path, pattern: str) -> Path:
     return found[0]
 
 
-def provide_packaging(site: Path) -> None:
-    """Supply only the installed packaging distribution to the offline resolver."""
-    dependency = importlib.metadata.distribution("packaging")
+def provide_dependency(site: Path, name: str) -> None:
+    """Copy the complete inventory of one explicitly selected distribution."""
+    dependency = importlib.metadata.distribution(name)
     files = dependency.files
     if files is None:
-        raise ValueError("packaging has no installed-file inventory")
+        raise ValueError(f"{name} has no installed-file inventory")
     for relative in files:
-        if relative.parts[0] not in {
-            "packaging",
-            f"packaging-{dependency.version}.dist-info",
-        }:
-            raise ValueError(f"unexpected packaging distribution member: {relative}")
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.parts
+            or relative.parts[0] not in {name, f"{name}-{dependency.version}.dist-info"}
+        ):
+            raise ValueError(f"unexpected {name} distribution member: {relative}")
         source = Path(str(dependency.locate_file(relative)))
         destination = site / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
+
+
+def provide_runtime_dependencies(site: Path, platform: str) -> None:
+    """Supply only the installed distributions needed by this platform's wheel."""
+    provide_dependency(site, "packaging")
+    if platform == "win32":
+        provide_dependency(site, "distlib")
 
 
 def main() -> None:
@@ -86,7 +95,7 @@ def main() -> None:
                 cwd=scratch,
             )
         )
-        provide_packaging(site)
+        provide_runtime_dependencies(site, sys.platform)
         run(
             str(python),
             "-I",

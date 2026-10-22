@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from h2h_dev_tools import bundle, bundle_verify, merge_command, process
+from h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
 _REVIEWER = """import runpy
@@ -42,9 +43,8 @@ main(root)
 def offline_codex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     binary = tmp_path / "fake-review-cli"
     binary.mkdir()
-    executable(
+    write_python_executable(
         binary / "codex",
-        f"#!{sys.executable}\n"
         "import json, sys\n"
         "from pathlib import Path\n"
         "if sys.argv[1:] == ['--version']:\n"
@@ -253,13 +253,12 @@ def test_merge_uses_captured_commit_when_task_advances_before_git_launch(
     if strategy == "direct":
         # This fixture's real release gate is for candidate-style commits.
         # Exercise Git's direct hook timing with its own explicit parent input.
-        executable(
+        write_python_executable(
             root / ".githooks/pre-merge-commit",
-            f"#!{sys.executable}\n"
             "import os\nfrom pathlib import Path\n"
             f"Path({str(observed_parent)!r}).write_text(os.environ['WORKFLOW_MERGE_TASK_REF'])\n",
         )
-        git(root, "add", ".githooks/pre-merge-commit")
+        git(root, "add", ".githooks/pre-merge-commit", ".githooks/pre-merge-commit.py")
         git(root, "commit", "-m", "test: observe the direct hook parent")
     task = git(root, "rev-parse", "task")
     later = git(root, "commit-tree", "HEAD^{tree}", "-p", task, "-m", "later task")
@@ -267,9 +266,8 @@ def test_merge_uses_captured_commit_when_task_advances_before_git_launch(
     binary.mkdir()
     real_git = shutil.which("git")
     assert real_git is not None
-    executable(
+    write_python_executable(
         binary / "git",
-        f"#!{sys.executable}\n"
         "import os, subprocess, sys\n"
         f"real_git = {real_git!r}\narguments = sys.argv[1:]\n"
         "if 'merge' in arguments and '--no-ff' in arguments:\n"
@@ -311,9 +309,8 @@ def test_successful_merge_preserves_a_task_advanced_during_the_gate(
     base = fixture_repository(primary, succeeds=True)
     state = tmp_path / "state"
     state.mkdir()
-    executable(
+    write_python_executable(
         primary / "scripts/check-full.sh",
-        f"#!{sys.executable}\n"
         "import time\nfrom pathlib import Path\n"
         f"state = Path({str(state)!r})\n"
         "(state / 'ready').touch()\n"
@@ -512,9 +509,9 @@ def test_worktree_query_failure_or_malformed_records_preserve_task(
         "duplicate-primary": b"refs/heads/master\0/path\0\n" * 2,
         "empty": b"",
     }
-    executable(
+    write_python_executable(
         binary / "git",
-        f"#!{sys.executable}\nimport os, subprocess, sys\n"
+        f"import os, subprocess, sys\n"
         f"real_git = {real_git!r}\narguments = sys.argv[1:]\n"
         "if arguments[:1] == ['for-each-ref']:\n"
         + (
@@ -573,9 +570,8 @@ def test_branch_deletion_rechecks_primary_when_task_moves_after_cleanup_checks(
     binary.mkdir()
     real_git = shutil.which("git")
     assert real_git is not None
-    executable(
+    write_python_executable(
         binary / "git",
-        f"#!{sys.executable}\n"
         "import os, subprocess, sys\n"
         f"real_git = {real_git!r}\n"
         "if sys.argv[-3:] == ['branch', '-d', 'task']:\n"
@@ -623,9 +619,8 @@ def test_branch_deletion_checks_the_locked_ref_after_git_reads_a_stale_tip(
     state.mkdir()
     hooks = state / "original-hooks"
     hooks.mkdir()
-    executable(
+    write_python_executable(
         hooks / "reference-transaction",
-        f"#!{sys.executable}\n"
         "import json, sys, time\nfrom pathlib import Path\n"
         f"state = Path({str(state)!r})\n"
         "rows = sys.stdin.read()\n"
@@ -643,9 +638,8 @@ def test_branch_deletion_checks_the_locked_ref_after_git_reads_a_stale_tip(
     binary.mkdir()
     real_git = shutil.which("git")
     assert real_git is not None
-    executable(
+    write_python_executable(
         binary / "git",
-        f"#!{sys.executable}\n"
         "import os, sys, time\nfrom pathlib import Path\n"
         f"real_git = {real_git!r}\nstate = Path({str(state)!r})\n"
         "arguments = sys.argv[1:]\n"
@@ -748,9 +742,8 @@ def test_linked_merge_cleanup_preserves_reference_hook_input_and_rejection(
     primary = tmp_path / "primary"
     base = fixture_repository(primary, succeeds=True)
     events_path = tmp_path / "hook-events"
-    executable(
+    write_python_executable(
         primary / ".githooks/reference-transaction",
-        f"#!{sys.executable}\n"
         "import json, sys\n"
         "rows = sys.stdin.read()\n"
         "deleting = any(row.split()[1:] == ['0' * len(row.split()[0]), "
@@ -816,14 +809,14 @@ def test_cleanup_retains_task_if_reference_guard_cannot_be_prepared(
         assert real_cat is not None
         # Fail only the guard's heredoc write, not an earlier owner's receipt
         # read. Every checkout now verifies that receipt before cleanup starts.
-        failing_command = (
-            f"#!{sys.executable}\nimport os, sys\n"
+        write_python_executable(
+            binary / failed_command,
+            "import os, sys\n"
             f"if len(sys.argv) == 1:\n    raise SystemExit({status})\n"
-            f"os.execv({real_cat!r}, [{real_cat!r}, *sys.argv[1:]])\n"
+            f"os.execv({real_cat!r}, [{real_cat!r}, *sys.argv[1:]])\n",
         )
     else:
-        failing_command = f"#!/bin/sh\nexit {status}\n"
-    executable(binary / failed_command, failing_command)
+        executable(binary / failed_command, f"#!/bin/sh\nexit {status}\n")
     result = subprocess.run(
         ("scripts/git-flow-merge.sh", "--cleanup-only"),
         cwd=root,
@@ -852,9 +845,8 @@ def test_cleanup_without_reference_transaction_support_retains_task(
     binary.mkdir()
     real_git = shutil.which("git")
     assert real_git is not None
-    executable(
+    write_python_executable(
         binary / "git",
-        f"#!{sys.executable}\n"
         "import os, sys\n"
         "if sys.argv[1:] == ['version']:\n"
         "    print('git version 2.27.0')\n"
@@ -1343,7 +1335,7 @@ if not location:
     raise SystemExit(0)
 state = Path(location)
 stage = os.environ["WORKFLOW_HOOK_STAGE"]
-hook = Path(sys.argv[0]).name
+hook = hook_name
 if hook == "post-checkout":
     branch = subprocess.check_output(["git", "branch", "--show-current"], text=True).strip()
     applies = (stage == "checkout" and branch == "master") or (stage == "restore" and branch == "task")
@@ -1403,16 +1395,16 @@ def test_all_mutating_workflow_hooks_are_owned(
         if stage in {"checkout", "noop", "restore"}
         else "reference-transaction"
     )
-    hook_text = f"#!{sys.executable}\n" + _WORKFLOW_HOOK
+    hook_text = f"hook_name = {hook_name!r}\n" + _WORKFLOW_HOOK
     # Checkout invokes the hook from the destination tree. Keep the identical
     # real hook in both branches, inactive unless this invocation opts in.
-    executable(root / ".githooks" / hook_name, hook_text)
+    write_python_executable(root / ".githooks" / hook_name, hook_text)
     git(root, "add", ".")
     git(root, "commit", "-m", "test: install workflow hook")
     task = git(root, "rev-parse", "task")
     git(root, "switch", "master")
     (root / ".githooks").mkdir(exist_ok=True)
-    executable(root / ".githooks" / hook_name, hook_text)
+    write_python_executable(root / ".githooks" / hook_name, hook_text)
     git(root, "add", ".")
     git(root, "commit", "-m", "test: install primary checkout hook")
     if stage == "noop":
@@ -1650,9 +1642,8 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
     task = git(root, "rev-parse", "HEAD")
     binary = tmp_path / "bin"
     binary.mkdir()
-    executable(
+    write_python_executable(
         binary / "codex",
-        f"#!{sys.executable}\n"
         "import json, os, subprocess, sys, time\n"
         "from pathlib import Path\n"
         "assert not any(name.startswith('H2H_REVIEW_') for name in os.environ)\n"
@@ -1749,9 +1740,8 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
     state.mkdir()
     binary = tmp_path / "bin"
     binary.mkdir()
-    executable(
+    write_python_executable(
         binary / "codex",
-        f"#!{sys.executable}\n"
         "import json, os, sys\n"
         "from pathlib import Path\n"
         "if sys.argv[1:] == ['--version']:\n"
@@ -1925,9 +1915,9 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
     (root / "scripts/blocking-review.py").write_text(_BLOCKING_GATE)
     piped_output = interruption.startswith(("closed-pipe", "backpressure"))
     if piped_output:
-        executable(
+        write_python_executable(
             root / ".githooks/post-checkout",
-            f"#!{sys.executable}\nimport os\nfrom pathlib import Path\n"
+            "import os\nfrom pathlib import Path\n"
             "state = os.environ.get('MERGE_INTERRUPTION_STATE')\n"
             "if state and Path(state, 'ready').exists():\n"
             "    print('recovery diagnostic' * (16 * 1024), flush=True)\n"
@@ -1941,9 +1931,8 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
         )
     binary = tmp_path / "bin"
     binary.mkdir()
-    executable(
+    write_python_executable(
         binary / "codex",
-        f"#!{sys.executable}\n"
         "import os, runpy, sys\n"
         "from pathlib import Path\n"
         "stage = os.environ['MERGE_REVIEW_STAGE']\n"
