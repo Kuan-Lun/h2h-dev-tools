@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-10-22T20:42:12+00:00",
-  "manifest_sha256": "258b6d678af33ea36dfd3970c92f620d02cb631edd1a7531757ad1b7a278d537",
+  "checked_at": "2026-10-22T21:08:16+00:00",
+  "manifest_sha256": "aa20257539103591105ade67f7411e0eaff74f1ae5ce1d94a1bd0763f654f9c7",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.7.1",
+  "project_version": "0.7.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -22,6 +22,17 @@
       "registry_url": "https://pypi.org/project/hatchling/",
       "release_notes": "https://hatch.pypa.io/dev/history/hatchling/",
       "url": "https://pypi.org/project/hatchling/"
+    },
+    {
+      "declared": "distlib>=0.4.4; sys_platform == 'win32'",
+      "group": "runtime",
+      "latest": "0.4.4",
+      "latest_satisfies": true,
+      "name": "distlib",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/distlib/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/distlib/"
     },
     {
       "declared": "packaging>=26.0",
@@ -44,6 +55,17 @@
       "registry_url": "https://pypi.org/project/build/",
       "release_notes": "https://build.pypa.io/en/stable/changelog.html",
       "url": "https://pypi.org/project/build/"
+    },
+    {
+      "declared": "distlib>=0.4.4",
+      "group": "optional:dev",
+      "latest": "0.4.4",
+      "latest_satisfies": true,
+      "name": "distlib",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/distlib/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/distlib/"
     },
     {
       "declared": "hatchling>=1.32.0",
@@ -102,7 +124,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, development and Node declarations and the current upstream release notes/metadata, including candidates outside existing bounds. Hatchling 1.32.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.2 and markdownlint-cli2 0.24.0 remain within their declared bounds. The existing rebuild script resolved normally on CPython 3.14.8; both implementation commits passed repository-local Ruff/formatter/strict mypy and Markdown checks with the current tools. All 38 formal-download and CI-bootstrap regression tests passed through the canonical source runner, covering closed Windows download handles, original I/O/cancellation errors, complete dependency-name tokens and bootstrap without importing packaging. Reviewed upstream Python support metadata; pytest-xdist permits Python 3.14 but its classifiers end at 3.13, so metadata acceptance is not upstream execution evidence. Node 24.22.0 meets markdownlint-cli2 0.24.0 requirements. No dependency bounds changed. Native Windows execution is not available on this macOS host; its handle semantics are covered by explicit regressions and retained Windows CI. Formal review and the full candidate gate remain separately required; no publication or deployment is asserted.",
+    "note": "Reviewed official PyPI/npm metadata and upstream release notes on 2026-10-23 for distlib 0.4.4, packaging 26.3, build 1.6.1, hatchling 1.32.4, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, Ruff 0.17.2, and markdownlint-cli2 0.24.0. All latest stable releases satisfy declared lower bounds; no latest stable is excluded. Python 3.14 is explicitly classified by Python dependencies except pytest-xdist, whose >=3.9 metadata permits it; worker regressions remain required. Node >=22 is compatible with installed Node 24.22.0. Reviewed distlib launcher fixes, build Windows symlink fix, Hatchling plugin fix, mypy native parser, Ruff rule/formatter and Markdown rule updates. This replacement preserves the exact previously tested portable implementation (53 targeted cases passed, 3 native Windows skips) and includes the separately formally merged verification bootstrap fix. The normal implementation commit fast gate passed with current local tools. Native Windows and the new exact-candidate full gate are not claimed by this audit.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from h2h_dev_tools.executable_fixture import write_python_executable
+
 _RESOURCES = Path(__file__).resolve().parents[1] / "src/h2h_dev_tools"
 
 
@@ -152,8 +154,9 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
     log = tmp_path / "commands.jsonl"
     for name in ("uv", "npm"):
         path = tools / name
-        path.write_text(
-            "#!/usr/bin/env python3\nimport json, os, sys\n"
+        write_python_executable(
+            path,
+            "import json, os, sys\n"
             "from pathlib import Path\n"
             "with open(os.environ['BOOTSTRAP_LOG'], 'a') as stream:\n"
             "    stream.write(json.dumps(sys.argv) + '\\n')\n"
@@ -169,9 +172,8 @@ def test_bootstrap_works_without_python_environment_and_passes_explicit_sources(
             "if sys.argv[1:3] == ['pip', 'compile']:\n"
             "    requirements = Path(sys.argv[5])\n"
             "    Path(os.environ['BOOTSTRAP_LOG'] + '.requirements').write_text(\n"
-            "        requirements.read_text())\n"
+            "        requirements.read_text())\n",
         )
-        path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("BOOTSTRAP_LOG", str(log))
     source = tmp_path / "candidate source"

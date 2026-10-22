@@ -198,8 +198,9 @@
   環境，因 `-I`／`-E` 會忽略它。每次 invocation 使用新程序；不負責卸載
   已匯入 modules。不得保留無參數 `main()` 或自動推測 package 的相容路徑。
   已安裝 wheel 的隔離 smoke 保留正常 import，不套用 checkout loader。
-- Wheel smoke 僅複製已安裝 `packaging` distribution 供離線 resolver，禁止借用
-  editable source 或整個 development site。此結果不代表 registry-backed clean
+- Wheel smoke 僅複製已安裝 `packaging` distribution，以及 Windows 所需的
+  `distlib` distribution 供離線 resolver；逐一核對完整 inventory 的套件與 metadata
+  目錄，禁止借用 editable source 或整個 development site。此結果不代表 registry-backed clean
   dependency resolution；需要該證據時另以明確 wheels／index 執行並分別回報。
 - 新功能涵蓋正常、邊界、錯誤路徑；bug fix 加 regression test。Git 測試使用
   disposable local repositories；不連 production、live account 或外部 network。

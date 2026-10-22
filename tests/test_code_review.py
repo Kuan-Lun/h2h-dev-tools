@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from h2h_dev_tools import bundle, bundle_verify, code_review, merge_command, process
+from h2h_dev_tools.executable_fixture import write_python_executable
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -188,8 +189,7 @@ def _make_review_repository(tmp_path: Path, layout: str = "source") -> ReviewRep
     executable_directory = tmp_path / "bin"
     executable_directory.mkdir()
     executable = executable_directory / "codex"
-    executable.write_text(f"#!{sys.executable}\n{FAKE_CODEX}", encoding="utf-8")
-    executable.chmod(0o755)
+    write_python_executable(executable, FAKE_CODEX)
     environment["PATH"] = (
         str(executable_directory) + os.pathsep + environment.get("PATH", "")
     )

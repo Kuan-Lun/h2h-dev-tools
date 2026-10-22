@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,7 @@ import pytest
 
 from h2h_dev_tools import version_policy
 from h2h_dev_tools.dependency_manifest import dependency_manifest
+from h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -630,6 +631,9 @@ def test_index_without_active_merge_rejects_mutable_task_refs(
         )
 
 
+@pytest.mark.skipif(
+    os.name != "posix", reason="Exercises an extensionless POSIX Git hook"
+)
 def test_direct_pre_merge_hook_validates_an_immutable_parent_before_merge_head(
     repository: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -646,17 +650,16 @@ def test_direct_pre_merge_hook_validates_an_immutable_parent_before_merge_head(
     hooks.mkdir()
     observed = repository.parent / "observed-hook.json"
     hook = hooks / "pre-merge-commit"
-    hook.write_text(
-        f"#!{sys.executable}\n"
+    write_python_executable(
+        hook,
         "import argparse, json\nfrom pathlib import Path\n"
         "from h2h_dev_tools import version_policy\n"
         "merge_head = Path(version_policy._git('rev-parse', '--git-path', 'MERGE_HEAD'))\n"
         "assert not merge_head.exists(), 'fixture must exercise the direct hook timing'\n"
         "selected = version_policy._candidate(argparse.Namespace(index=True))\n"
         "version_policy._validate(*selected)\n"
-        f"Path({str(observed)!r}).write_text(json.dumps(selected))\n"
+        f"Path({str(observed)!r}).write_text(json.dumps(selected))\n",
     )
-    hook.chmod(0o755)
     git(repository, "config", "core.hooksPath", str(hooks))
     monkeypatch.setenv("PYTHONPATH", str(_ROOT / "src"))
     monkeypatch.setenv("WORKFLOW_MERGE_TASK_REF", task)

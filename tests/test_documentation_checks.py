@@ -11,6 +11,7 @@ import pytest
 
 from h2h_dev_tools import documentation
 from h2h_dev_tools.change_scope import ChangeScopeError
+from h2h_dev_tools.executable_fixture import write_python_executable
 
 ROOT = Path(__file__).resolve().parents[1]
 SCOPE = ROOT / "scripts" / "check_change_scope.py"
@@ -52,18 +53,9 @@ class DocumentationRepository:
     def lint_stub(self, body: str) -> Path:
         tools = self.root / "node_modules" / ".bin"
         tools.mkdir(parents=True)
-        script = tools / "lint_stub.py"
-        script.write_text(body, encoding="utf-8")
-        if os.name == "nt":
-            executable = tools / "markdownlint-cli2.cmd"
-            executable.write_text(
-                f'@"{sys.executable}" "{script}"\r\n', encoding="utf-8"
-            )
-        else:
-            executable = tools / "markdownlint-cli2"
-            executable.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
-            executable.chmod(0o755)
-        return executable
+        return write_python_executable(
+            tools / "markdownlint-cli2", body, windows_cmd=True
+        )
 
 
 @pytest.fixture

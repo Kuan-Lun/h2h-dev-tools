@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "h2h-dev-tools"
-version = "0.7.1"
+version = "0.7.2"
 description = "Shared development tools and reproducible repository snapshots for H2H projects"
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
-dependencies = ["packaging>=26.0"]
+dependencies = ["distlib>=0.4.4; sys_platform == 'win32'", "packaging>=26.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -25,6 +25,7 @@ h2h-dev-tools = "h2h_dev_tools.__main__:main"
 [project.optional-dependencies]
 dev = [
     "build>=1.5.0",
+    "distlib>=0.4.4",
     "hatchling>=1.32.0",
     "mypy>=2.3.1",
     "pytest>=9.1.1",

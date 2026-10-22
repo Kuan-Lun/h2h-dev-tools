@@ -9,11 +9,15 @@ on:
       - src/h2h_dev_tools/git_environment.py
       - src/h2h_dev_tools/source_loader.py
       - src/h2h_dev_tools/pytest_source.py
+      - src/h2h_dev_tools/executable_fixture.py
       - scripts/run-pytest.py
+      - scripts/build-and-verify-distributions.py
       - tests/test_process*.py
       - tests/test_git_environment.py
       - tests/test_pytest_source_entry.py
       - tests/test_pytest_source.py
+      - tests/test_executable_fixture.py
+      - tests/test_build_distributions.py
       - pyproject.toml
       - .github/workflows/windows-process.yml
   workflow_dispatch:
@@ -40,4 +44,5 @@ jobs:
           tests/test_process.py tests/test_process_integration.py
           tests/test_process_diagnostic_windows.py
           tests/test_git_environment.py tests/test_pytest_source_entry.py
-          tests/test_pytest_source.py
+          tests/test_pytest_source.py tests/test_executable_fixture.py
+          tests/test_build_distributions.py

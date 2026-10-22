@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from h2h_dev_tools.executable_fixture import write_python_executable
+
 _ROOT = Path(__file__).resolve().parents[1]
 _SELECTORS = (
     "tests/test_release_policy.py::test_compatible_tool_release_has_one_dedicated_version_transition",
@@ -45,14 +47,12 @@ def test_disposable_git_fixtures_ignore_host_signing_configuration(
     _checkout(checkout)
     marker = tmp_path / "unexpected-signing"
     signer = tmp_path / "fake-gpg"
-    signer.write_text(
-        f"#!{sys.executable}\n"
+    write_python_executable(
+        signer,
         "from pathlib import Path\n"
         f"Path({str(marker)!r}).write_text('host signing configuration was used')\n"
         "raise SystemExit(1)\n",
-        encoding="utf-8",
     )
-    signer.chmod(0o755)
     # This adversarial child starts from an explicit Git configuration; only the
     # selected authority is poisoned. The surrounding pytest/gate is untouched.
     environment = {
