@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from h2h_dev_tools.ci_dependencies import main
+from h2h_dev_tools.ci_dependencies import _package_name, main, requirements_for
 
 _INSTALLER = Path(__file__).parents[1] / "scripts" / "install-ci-dependencies.py"
 
@@ -170,4 +170,101 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         "install",
         "--upgrade",
         "pytest>=99",
+    ]
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        " pytest>=9",
+        "\tpytest>=9",
+        " \tPyTest [extra] (>=9,!=9.1) ; python_version >= '3.14'",
+        "\tPyTest @ https://example.invalid/pytest.whl ; python_version >= '3.14'",
+        " PyTest ",
+        " a",
+        " Some.Name_with--Segments[extra]>=1",
+    ],
+)
+def test_ci_requirement_name_matches_packaging_grammar(requirement: str) -> None:
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    assert _package_name(requirement) == canonicalize_name(
+        Requirement(requirement).name
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "-pytest",
+        "pytest-",
+        "pytest.",
+        "pytest_",
+        "pytest$extra",
+        "pytestΩ",
+        "pytest other",
+        " \t",
+    ],
+)
+def test_ci_requirement_name_rejects_invalid_token_boundaries(invalid: str) -> None:
+    with pytest.raises(ValueError, match="Invalid dependency name"):
+        _package_name(invalid)
+
+
+def test_ci_whitespace_declaration_does_not_block_other_selected_packages(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "pyproject.toml"
+    requirement = " \tpytest[extra]>=9; python_version >= '3.14'"
+    manifest.write_text(
+        "[project]\ndependencies = " + json.dumps([requirement, "build>=1"])
+    )
+    assert requirements_for(manifest, ["build", "PyTest"], pytest_plugins=False) == [
+        "build>=1",
+        requirement,
+    ]
+
+
+def test_ci_requirement_bootstrap_does_not_import_packaging(tmp_path: Path) -> None:
+    installer = _fixture_installer(
+        tmp_path, '[project]\ndependencies = [" packaging>=26.0", "build>=1"]\n'
+    )
+    shutil.copytree(
+        _INSTALLER.parents[1] / "src/h2h_dev_tools",
+        installer.parents[1] / "src/h2h_dev_tools",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            "import builtins, json, runpy, subprocess, sys\n"
+            "original_import = builtins.__import__\n"
+            "def guarded(name, *args, **kwargs):\n"
+            "    if name == 'packaging' or name.startswith('packaging.'): raise AssertionError('bootstrap dependency cycle')\n"
+            "    return original_import(name, *args, **kwargs)\n"
+            "builtins.__import__ = guarded\n"
+            "subprocess.run = lambda command, **kwargs: print(json.dumps(command))\n"
+            "sys.argv = [sys.argv[1], 'packaging', 'build']\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n",
+            str(installer),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        " packaging>=26.0",
+        "build>=1",
     ]
