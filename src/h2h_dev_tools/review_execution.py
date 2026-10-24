@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import math
 import os
@@ -28,7 +29,7 @@ class ExecutionError(RuntimeError):
 
 
 class GitCommandError(ExecutionError):
-    """Git rejected a query after its whole process tree was cleaned."""
+    """A query was rejected before admission or after proven process cleanup."""
 
 
 def remaining() -> float | None:
@@ -101,6 +102,25 @@ def git_output(
         reserve = (
             CLEANUP_RESERVE if budget is None else min(CLEANUP_RESERVE, budget / 2)
         )
+        if os.name == "posix":
+            # Capture files are already open. Nested POSIX closure additionally
+            # holds its own lock, the parent's lock, and a token/obligation read:
+            # three descriptors at once, exceeding Popen's two-FD error pipe.
+            # Reject pressure BEFORE registering an owner. This is a capacity
+            # probe, not a reservation; later ownership failures stay unproven.
+            try:
+                with (
+                    Path(os.devnull).open("rb"),
+                    Path(os.devnull).open("rb"),
+                    Path(os.devnull).open("rb"),
+                ):
+                    pass
+            except OSError as error:
+                if error.errno not in {errno.EMFILE, errno.ENFILE}:
+                    raise
+                raise GitCommandError(
+                    "Git query lacks file descriptors for owned cleanup"
+                ) from error
         try:
             with redirect_stdout(diagnostics), redirect_stderr(diagnostics):
                 status = process.run_command(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import IO
 
 import pytest
 
@@ -18,6 +20,62 @@ from h2h_dev_tools import process, review_execution
 from h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX owner cleanup FD capacity")
+@pytest.mark.parametrize("unavailable", [errno.EMFILE, errno.ENFILE])
+@pytest.mark.parametrize("failed_descriptor", [1, 2, 3])
+def test_owned_git_capacity_probe_rejects_before_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unavailable: int,
+    failed_descriptor: int,
+) -> None:
+    opened: list[IO[bytes]] = []
+    captures: list[IO[bytes]] = []
+    attempted = 0
+    admitted = False
+    open_path = Path.open
+    temporary_file = tempfile.TemporaryFile
+
+    def capture() -> IO[bytes]:
+        stream = temporary_file()
+        captures.append(stream)
+        return stream
+
+    def probe(path: Path, mode: str) -> IO[bytes]:
+        nonlocal attempted
+        assert path == Path(os.devnull) and mode == "rb"
+        assert len(captures) == 2 and all(not stream.closed for stream in captures)
+        attempted += 1
+        if attempted == failed_descriptor:
+            raise OSError(unavailable, "synthetic descriptor pressure")
+        stream = open_path(path, "rb")
+        opened.append(stream)
+        return stream
+
+    def launch(
+        phase: process.ProcessCommand,
+        *,
+        hard_deadline: float | None,
+        termination_reserve_seconds: float,
+    ) -> int:
+        nonlocal admitted
+        admitted = True
+        raise AssertionError("A failed capacity probe must not admit a Git owner")
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", capture)
+    monkeypatch.setattr(Path, "open", probe)
+    monkeypatch.setattr(process, "run_command", launch)
+    with pytest.raises(
+        review_execution.GitCommandError, match="file descriptors for owned cleanup"
+    ) as caught:
+        review_execution.git_output(tmp_path, "status")
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.__cause__.errno == unavailable
+    assert attempted == failed_descriptor and len(opened) == failed_descriptor - 1
+    assert not admitted
+    assert all(stream.closed for stream in [*opened, *captures])
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX fsmonitor descendant")
@@ -204,6 +262,14 @@ def test_owned_git_capture_never_accepts_an_ownership_failure(
 ) -> None:
     failure = process.ProcessOwnershipError("injected query cleanup failure")
     failure.cleanup_proven = proven
+    probes: list[IO[bytes]] = []
+    open_path = Path.open
+
+    def probe(path: Path, mode: str) -> IO[bytes]:
+        assert path == Path(os.devnull) and mode == "rb"
+        stream = open_path(path, "rb")
+        probes.append(stream)
+        return stream
 
     def fail(
         phase: process.ProcessCommand,
@@ -211,8 +277,13 @@ def test_owned_git_capture_never_accepts_an_ownership_failure(
         hard_deadline: float | None,
         termination_reserve_seconds: float,
     ) -> int:
+        # A successful probe does not grant any later cleanup proof. A race or
+        # other ownership failure after admission must retain its exact status.
+        assert len(probes) == (3 if os.name == "posix" else 0)
+        assert all(stream.closed for stream in probes)
         raise failure
 
+    monkeypatch.setattr(Path, "open", probe)
     monkeypatch.setattr(process, "run_command", fail)
     if proven:
         with pytest.raises(
