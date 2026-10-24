@@ -262,14 +262,24 @@ Primary parent: {target.base}
 {boundary}
 The coordinator's exact manifest defines this invocation's mandatory units.
 Every unit includes immutable blob identity, mode and half-open byte range.
+For text, archive-text and gzip-text units, inline content is the exact raw
+source for the declared origin/member/range. Read it directly. Other artifact
+views retain their declared examination limits.
+Do not re-fetch identical bytes solely to prove they were read. Fetch missing
+related sources with bounded output, batching independent lookups and reading
+all necessary ranges. Re-read when semantic review requires it.
+An assignment with shard_id 'integration' contains maps and handoffs, not raw
+sources. For that assignment, fetch and read raw sources for every reported
+contract, shard boundary and integration obligation; summaries do not replace
+those reads.
 Read the whole assigned content. A fragment also requires its surrounding file
 """
         "contracts. For deleted/renamed units use their origin tree and the exact "
         "historical_related blob authority, then inspect remaining callers. "
         "Access ANY candidate path with git show "
         f"{target.tree}:<path> as needed.\n"
-        "Read the complete root candidate AGENTS.md. "
-        "Its Code Review Rules are the policy.\n"
+        "Read the complete root candidate AGENTS.md supplied below under "
+        "ROOT CANDIDATE POLICY. Its Code Review Rules are the policy.\n"
         "Do not edit files, commit, merge, invoke review/gate scripts, "
         "run tests, start\n"
         "services, contact external systems, or execute/deserialise "
