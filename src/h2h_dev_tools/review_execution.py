@@ -9,11 +9,12 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 from . import process
 
@@ -247,7 +248,23 @@ def run_invocations(
     next_index = 0
     execution_deadline = deadline - CLEANUP_RESERVE
     collection_ownership_error: process.ProcessOwnershipError | None = None
-    with process.controlled_termination_signals() as controller:
+    cleanup_ready = Event()
+    cleanup_items: tuple[_Active, ...] = ()
+    cleanup_deadline = deadline
+    cleanup_workers: list[Future[tuple[bool, list[str]]]] = []
+
+    def clean_slot(index: int) -> tuple[bool, list[str]]:
+        cleanup_ready.wait()
+        if index >= len(cleanup_items):
+            return True, []
+        return _cleanup_invocation(cleanup_items[index], deadline=cleanup_deadline)
+
+    with (
+        process.controlled_termination_signals() as controller,
+        ThreadPoolExecutor(
+            max_workers=CONCURRENCY, thread_name_prefix="h2h-review-cleanup"
+        ) as cleanup,
+    ):
 
         def collect_completed() -> None:
             """Validate every exited owner before admitting further work."""
@@ -308,6 +325,19 @@ def run_invocations(
 
         try:
             with within_deadline(execution_deadline):
+                # These jobs remain blocked until final cleanup. Consequently
+                # each submission must start a worker, and all four workers
+                # exist before any child is admitted. No later submit can fail
+                # after enqueuing cleanup for an owner whose handoff is unknown.
+                for index in range(CONCURRENCY):
+                    remaining()
+                    try:
+                        with controller.defer():
+                            cleanup_workers.append(cleanup.submit(clean_slot, index))
+                    except RuntimeError as error:
+                        raise ExecutionError(
+                            "Cannot prepare review cleanup workers before admission"
+                        ) from error
                 while next_index < len(invocations) or active:
                     remaining()
                     collect_completed()
@@ -364,23 +394,25 @@ def run_invocations(
                         )
         finally:
             with controller.defer():
-                failed_cleanup = False
                 cleanup_deadline = min(deadline, time.monotonic() + CLEANUP_RESERVE)
                 # A busy scope must not spend the other owners' signal/proof
                 # budget. Each worker owns one process/scope/stream set; parent
                 # ledger changes still use the canonical filesystem locks. The
                 # main thread retains signal handling and joins every worker.
-                with ThreadPoolExecutor(
-                    max_workers=CONCURRENCY, thread_name_prefix="h2h-review-cleanup"
-                ) as cleanup:
-                    results = list(
-                        cleanup.map(
-                            lambda item: _cleanup_invocation(
-                                item, deadline=cleanup_deadline
-                            ),
-                            active.values(),
+                cleanup_items = tuple(active.values())
+                cleanup_ready.set()
+                # On partial startup failure an enqueued job may have no
+                # returned Future. There are no children yet, so it is a no-op;
+                # the executor still joins every thread after this trigger.
+                results = []
+                for worker in cleanup_workers:
+                    try:
+                        results.append(worker.result())
+                    except BaseException as error:
+                        # Keep collecting the other independent owners' proofs.
+                        results.append(
+                            (False, [f"Review cleanup worker failed: {error}"])
                         )
-                    )
                 failed_cleanup = any(not empty for empty, _messages in results)
                 if failed_cleanup:
                     details = "; ".join(

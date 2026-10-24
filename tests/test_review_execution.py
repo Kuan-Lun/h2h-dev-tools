@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -47,6 +48,179 @@ def _empty(owners: list[process.OwnedProcess]) -> None:
         assert owner.posix_scope is not None
         assert owner.posix_scope.proven_empty
         assert not owner.posix_scope.capability.directory.exists()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "first-start",
+        "partial-start",
+        "success",
+        "deadline",
+        "worker-error",
+        "sigint",
+        "sigterm",
+    ],
+)
+def test_cleanup_capacity_precedes_child_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    deadline = time.monotonic() + 8
+    owners: list[process.OwnedProcess] = []
+    threads: list[threading.Thread] = []
+    thread_start_owner_counts: list[int] = []
+    cleaned: list[tuple[process.OwnedProcess, float]] = []
+    thread_start = threading.Thread.start
+    launch = process.start_owned_process
+    cleanup = execution._cleanup_invocation
+    terminate = process.terminate_owned_tree
+    close = process.close_owner
+    release = tmp_path / "release"
+    fail_at = {"first-start": 1, "partial-start": 3}.get(outcome)
+    signum = {"sigint": signal.SIGINT, "sigterm": signal.SIGTERM}.get(outcome)
+    validated: list[str] = []
+
+    def start_thread(thread: threading.Thread) -> None:
+        if thread.name.startswith("h2h-review-cleanup"):
+            # Exercise the real executor's enqueue-before-Thread.start path.
+            # A partial failure leaves work queued on already started workers.
+            threads.append(thread)
+            thread_start_owner_counts.append(len(owners))
+            if len(threads) == fail_at:
+                raise RuntimeError("synthetic native thread capacity exhausted")
+        thread_start(thread)
+
+    def start(
+        phase: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        assert signal_controller is not None
+        # Keep the fixture's rescue record protected even if interruption lands
+        # as the real owned launcher returns, before the scheduler handoff.
+        with signal_controller.defer():
+            owner = launch(
+                phase, deadline=deadline, signal_controller=signal_controller
+            )
+            owners.append(owner)
+            if signum is not None:
+                os.kill(os.getpid(), signum)
+            if len(owners) == execution.CONCURRENCY and outcome == "success":
+                release.touch()
+        return owner
+
+    def clean(item: execution._Active, *, deadline: float) -> tuple[bool, list[str]]:
+        cleaned.append((item.owned, deadline))
+        result = cleanup(item, deadline=deadline)
+        if outcome == "worker-error" and item.owned is owners[0]:
+            # The scheduler cannot infer proof from a worker that failed to
+            # return it, even though this fixture has actually cleaned its owner.
+            raise RuntimeError("synthetic lost cleanup result")
+        return result
+
+    code = "import time; time.sleep(60)"
+    if outcome == "success":
+        code = (
+            "from pathlib import Path\nimport time\n"
+            f"while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+        )
+    invocations = [
+        _invocation(tmp_path, str(index), code)
+        for index in range(execution.CONCURRENCY)
+    ]
+    with process.controlled_termination_signals() as controller:
+        try:
+            with monkeypatch.context() as boundary:
+                boundary.setattr(threading.Thread, "start", start_thread)
+                boundary.setattr(process, "start_owned_process", start)
+                boundary.setattr(execution, "_cleanup_invocation", clean)
+                failure: BaseException | None = None
+                results: list[dict[str, object]] | None = None
+                try:
+                    results = execution.run_invocations(
+                        tmp_path,
+                        invocations,
+                        deadline=deadline,
+                        validate=lambda item: validated.append(item.id),
+                    )
+                except BaseException as error:
+                    failure = error
+
+            # All assertions precede the failure-only canonical fixture rescue.
+            assert all(not thread.is_alive() for thread in threads)
+            assert time.monotonic() < deadline
+            if fail_at is not None:
+                assert isinstance(failure, execution.ExecutionError)
+                assert "before admission" in str(failure)
+                assert isinstance(failure.__cause__, RuntimeError)
+                assert len(threads) == fail_at
+                assert (
+                    sum(thread.ident is not None for thread in threads) == fail_at - 1
+                )
+                assert owners == [] and cleaned == []
+                assert not any(item.directory.exists() for item in invocations)
+            else:
+                assert len(threads) == execution.CONCURRENCY
+                assert len(owners) == (
+                    1 if signum is not None else execution.CONCURRENCY
+                )
+                _empty(owners)
+                if outcome == "success":
+                    assert failure is None
+                    assert results is not None and len(results) == execution.CONCURRENCY
+                    assert sorted(validated) == [item.id for item in invocations]
+                    assert cleaned == []
+                else:
+                    assert results is None and validated == []
+                    assert sorted(owner.process.pid for owner, _ in cleaned) == sorted(
+                        owner.process.pid for owner in owners
+                    )
+                    if signum is not None:
+                        expected = (
+                            KeyboardInterrupt
+                            if signum == signal.SIGINT
+                            else process.RunnerSignalInterrupt
+                        )
+                        assert isinstance(failure, expected)
+                        assert all(bound <= deadline for _, bound in cleaned)
+                    else:
+                        # Execution expiry consumes only its original slice;
+                        # every reserved worker receives the SAME final bound.
+                        assert {bound for _, bound in cleaned} == {deadline}
+                        if outcome == "worker-error":
+                            assert isinstance(failure, process.ProcessOwnershipError)
+                            assert not failure.cleanup_proven
+                            assert "synthetic lost cleanup result" in str(failure)
+                        else:
+                            assert isinstance(failure, execution.ExecutionError)
+                            assert "deadline" in str(failure)
+            assert thread_start_owner_counts == [0] * len(threads), (
+                "Cleanup must not need a new thread after admission"
+            )
+        finally:
+            # No raw group kill or extended deadline can supply test success.
+            # Even an interrupted assertion must release fixture-owned scopes.
+            failure_in_flight = sys.exception()
+            with controller.defer():
+                for owner in owners:
+                    scope = owner.posix_scope
+                    if scope is not None and scope.capability.directory.exists():
+                        try:
+                            messages: list[str] = []
+                            empty = terminate(
+                                owner, deadline=deadline, diagnostic=messages.append
+                            )
+                            closed = close(
+                                owner, deadline=deadline, diagnostic=messages.append
+                            )
+                            assert empty and closed, messages
+                        except BaseException as rescue_error:
+                            if failure_in_flight is None:
+                                raise
+                            failure_in_flight.add_note(
+                                f"Cleanup capacity fixture rescue failed: {rescue_error}"
+                            )
 
 
 def test_each_admission_rechecks_deadline_after_previous_spawn(
