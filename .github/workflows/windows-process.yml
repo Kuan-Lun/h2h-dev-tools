@@ -7,6 +7,7 @@ on:
       - src/h2h_dev_tools/_process_diagnostic.py
       - src/h2h_dev_tools/_process_scope.py
       - src/h2h_dev_tools/git_environment.py
+      - src/h2h_dev_tools/merge_admission.py
       - src/h2h_dev_tools/source_loader.py
       - src/h2h_dev_tools/pytest_source.py
       - src/h2h_dev_tools/executable_fixture.py
@@ -14,6 +15,7 @@ on:
       - scripts/build-and-verify-distributions.py
       - tests/test_process*.py
       - tests/test_git_environment.py
+      - tests/test_merge_paths.py
       - tests/test_pytest_source_entry.py
       - tests/test_pytest_source.py
       - tests/test_executable_fixture.py
@@ -44,5 +46,6 @@ jobs:
           tests/test_process.py tests/test_process_integration.py
           tests/test_process_diagnostic_windows.py
           tests/test_git_environment.py tests/test_pytest_source_entry.py
+          tests/test_merge_paths.py
           tests/test_pytest_source.py tests/test_executable_fixture.py
           tests/test_build_distributions.py

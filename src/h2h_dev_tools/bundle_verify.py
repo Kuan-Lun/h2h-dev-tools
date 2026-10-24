@@ -19,13 +19,17 @@ _MERGE_REVIEW_FILES = frozenset(
     {
         "code_review.py",
         "git_index.py",
-        "merge_admission.py",
+        "review_plan.py",
+        "review_coverage.py",
+        "review_execution.py",
+        "review_worker.py",
         "process.py",
         "_process_scope.py",
         "_process_diagnostic.py",
         "change_scope.py",
         "review-merge-candidate.sh",
         "merge_command.py",
+        "merge_admission.py",
         "git-flow-merge.sh",
         "primary-branch.sh",
     }
@@ -35,6 +39,9 @@ COMPONENT_FILES: dict[str, frozenset[str]] = {
     "change-scope": frozenset({"change_scope.py"}),
     "code-review": _MERGE_REVIEW_FILES,
     "test-support": frozenset({"executable_fixture.py"}),
+    "review-test-support": frozenset(
+        {"review_test_response.py", "review_test_support.py"}
+    ),
     "documentation": frozenset({"documentation.py", "change_scope.py"}),
     "dependencies": frozenset({"dependency_manifest.py", "ci_dependencies.py"}),
     "dependency-audit": frozenset({"dependency_manifest.py", "dependency_audit.py"}),

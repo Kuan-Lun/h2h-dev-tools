@@ -1475,3 +1475,27 @@ def test_unmerged_gitlink_stage_is_not_an_unchanged_checkout(
         )
     assert git(root, "ls-files", "--stage") == index
     assert (root / "module/source.txt").read_text() == "committed module source\n"
+
+
+@pytest.mark.parametrize("stage", ["candidate", "conflict"])
+def test_capture_exports_only_a_mergeable_owned_tree(
+    tmp_path: Path, stage: str
+) -> None:
+    root, state, primary = divergent_candidate(tmp_path, stage=stage)
+    document = json.loads(state.read_text())
+    document["phase"] = "merging"
+    state.write_text(json.dumps(document))
+    assert admission.main(["capture", "--state", str(state)]) == 0
+    tree_file = state.with_suffix(".tree")
+    if stage == "candidate":
+        assert tree_file.read_text().strip() == git(root, "write-tree")
+        tree_file.unlink()
+    else:
+        assert not tree_file.exists()
+        assert json.loads(state.read_text())["candidate"]["tree"] is None
+    admission.recover_abort(state)
+    assert not tree_file.exists()
+    assert git(root, "rev-parse", "HEAD") == primary
+    assert not (root / ".git/MERGE_HEAD").exists()
+    admission.recover_restore(state)
+    admission.release(state)

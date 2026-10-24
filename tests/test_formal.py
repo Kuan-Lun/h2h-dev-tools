@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import os
 import shutil
 import tempfile
 import urllib.request
 from collections.abc import Callable
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
@@ -226,3 +227,93 @@ def test_verification_is_offline_and_only_runs_selected_finite_profile(
             tmp_path, jar, profile="Small", runtime=runtime, expected_version="1.7.4"
         )
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("runtime", ["docker", "auto"])
+@pytest.mark.parametrize("location", ["checkout", "jar"])
+@pytest.mark.parametrize(
+    "directory_name",
+    [
+        pytest.param("plain", id="plain"),
+        pytest.param("with space", id="space"),
+        pytest.param("with,comma", id="comma"),
+        pytest.param('with"quote', id="quote"),
+        pytest.param("with\nnewline", id="newline"),
+        pytest.param('mixed, "quote"\nline', id="mixed"),
+    ],
+)
+def test_docker_mount_preserves_each_source_as_one_csv_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: formal.TlaRuntime,
+    location: str,
+    directory_name: str,
+) -> None:
+    if os.name == "nt" and any(c in directory_name for c in '\n"'):
+        pytest.skip("These literal pathname characters require a POSIX filesystem")
+    repository = tmp_path / (directory_name if location == "checkout" else "repo")
+    _, jar = toolchain(repository)
+    if location == "jar":
+        destination = tmp_path / directory_name / "tlc.jar"
+        destination.parent.mkdir()
+        jar = jar.replace(destination)
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr(formal, "host_java_available", lambda: False)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/fixture/docker")
+    monkeypatch.setattr(
+        formal, "_run", lambda command, *, cwd: calls.append((command, cwd))
+    )
+
+    formal.verify_tla(
+        repository, jar, profile="Small", runtime=runtime, expected_version="1.7.4"
+    )
+
+    assert len(calls) == 1
+    command, cwd = calls[0]
+    assert cwd == repository.resolve()
+    mounts = [command[i + 1] for i, value in enumerate(command) if value == "--mount"]
+    assert len(mounts) == 2
+    for mount, source, target in zip(
+        mounts,
+        (repository.resolve(), jar.resolve()),
+        ("/workspace", "/tools/tla2tools.jar"),
+        strict=True,
+    ):
+        assert list(csv.reader(StringIO(mount, newline=""), strict=True)) == [
+            ["type=bind", f"src={source}", f"dst={target}", "readonly"]
+        ]
+        if any(character in str(source) for character in ',"\r\n'):
+            # Go's encoding/csv rejects bare quotes in unquoted fields, unlike
+            # Python's reader. Such a source must be an explicitly quoted field.
+            assert '"src=' in mount
+    assert command == [
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network",
+        "none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=512m",
+        "--mount",
+        mounts[0],
+        "--mount",
+        mounts[1],
+        "--workdir",
+        "/workspace/verification/tla",
+        f"example:17@sha256:{'a' * 64}",
+        "java",
+        "-XX:+UseParallelGC",
+        "-Xmx4g",
+        "-cp",
+        "/tools/tla2tools.jar",
+        "tlc2.TLC",
+        "-workers",
+        "auto",
+        "-metadir",
+        "/tmp/tlc/ExampleSmall",
+        "-config",
+        "ExampleSmall.cfg",
+        "Example.tla",
+    ]

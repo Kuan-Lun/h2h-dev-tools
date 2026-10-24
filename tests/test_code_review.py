@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import runpy
+import shlex
 import shutil
 import signal
 import subprocess
@@ -18,12 +19,23 @@ from typing import Any
 
 import pytest
 
-from h2h_dev_tools import bundle, bundle_verify, code_review, merge_command, process
+from h2h_dev_tools import (
+    bundle,
+    bundle_verify,
+    code_review,
+    merge_command,
+    process,
+    review_execution,
+    review_plan,
+    review_test_support,
+)
 from h2h_dev_tools.executable_fixture import write_python_executable
 
 ROOT = Path(__file__).resolve().parents[1]
 
-FAKE_CODEX = r'''
+FAKE_CODEX = (
+    review_test_support.synthetic_review_response_source()
+    + r'''
 import json
 import os
 import subprocess
@@ -36,8 +48,9 @@ if sys.argv[1:] == ["--version"]:
     raise SystemExit(0)
 
 state = Path(os.environ["FAKE_CODEX_STATE"])
+prompt = sys.stdin.read()
 with (state / "calls.jsonl").open("a", encoding="utf-8") as stream:
-    stream.write(json.dumps({"args": sys.argv[1:], "prompt": sys.stdin.read()}) + "\n")
+    stream.write(json.dumps({"args": sys.argv[1:], "prompt": prompt}) + "\n")
 
 mode = os.environ.get("FAKE_CODEX_MODE", "pass")
 if mode in {"hold-pass", "hold-failure"}:
@@ -90,7 +103,11 @@ if mode == "malformed":
     output.write_text("not JSON", encoding="utf-8")
     raise SystemExit(0)
 
-result = {"verdict": "pass", "summary": "Reviewed the candidate.", "findings": []}
+result = synthetic_review_response(prompt)
+if mode == "integration-finding" and result['shard_id'] == 'integration':
+    mode = 'p2'
+if mode == 'missing-unit' and result['unit_reviews']:
+    result['unit_reviews'].pop()
 if mode in {"p0", "p1", "p2", "contradictory"}:
     result["verdict"] = "pass" if mode == "contradictory" else "changes_requested"
     result["findings"] = [{
@@ -109,9 +126,10 @@ elif mode == "unknown-verdict":
     result["verdict"] = "approved"
 elif mode == "missing-findings":
     del result["findings"]
-output.write_text(json.dumps(result), encoding="utf-8")
+output.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 print(json.dumps({"type": "turn.completed"}))
 '''
+)
 
 
 @dataclass(frozen=True)
@@ -636,6 +654,7 @@ def test_standalone_review_preserves_result_after_diagnostic_reader_closes(
     with _held_review(repo, mode) as owner:
         assert owner.stdout is not None
         assert owner.stdout.readline().startswith("Reviewing repository scope:")
+        assert "aggregate deadline" in owner.stdout.readline()
         assert owner.stdout.readline().startswith("Review logs:")
         assert not receipt.exists(), "Codex must still be held before publication"
         stream = getattr(owner, stream_name)
@@ -724,7 +743,7 @@ def test_review_timeout_terminates_the_codex_descendant(
     child_pid: int | None = None
     try:
         started = time.monotonic()
-        result = repo.review("run", "--index", "--timeout-seconds", "1", mode="timeout")
+        result = repo.review("run", "--index", "--timeout-seconds", "8", mode="timeout")
         elapsed = time.monotonic() - started
         pid_path = repo.state / "child-pid"
         assert pid_path.exists(), "The timeout oracle must exercise a real descendant"
@@ -744,15 +763,15 @@ def test_review_timeout_terminates_the_codex_descendant(
                 pass
 
 
-def test_standalone_success_cleans_a_descendant_before_publishing_evidence(
+def test_standalone_surviving_descendant_blocks_publication_even_after_cleanup(
     review_repository: ReviewRepository,
 ) -> None:
     repo = review_repository
     try:
-        _assert_passed(repo.review("run", "--index", mode="passing-child"))
+        _assert_blocked(repo.review("run", "--index", mode="passing-child"))
         assert (repo.state / "child-pid").exists()
         assert _child_released_lock(repo.state)
-        _assert_passed(repo.review("verify", "--index"))
+        _assert_blocked(repo.review("verify", "--index"))
     finally:
         pid_path = repo.state / "child-pid"
         if pid_path.exists() and not _child_released_lock(repo.state):
@@ -772,16 +791,18 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     original_killpg = os.killpg
     review_processes: list[subprocess.Popen[bytes]] = []
     owners: list[process.OwnedProcess] = []
-    original_stop = code_review._stop
+    original_stop = process.terminate_owned_tree
 
-    def remember_owner(owner: process.OwnedProcess) -> None:
+    def remember_owner(
+        owner: process.OwnedProcess, *, deadline: float, **kwargs: Any
+    ) -> bool:
         if owner.process in review_processes:
             owners.append(owner)
-        original_stop(owner)
+        return original_stop(owner, deadline=deadline, **kwargs)
 
     def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
         child = original_popen(*args, **kwargs)
-        if list(args[0][:2]) == ["codex", "exec"]:
+        if "review_worker.py" in str(args[0]) and "exec" in args[0]:
             review_processes.append(child)
         return child
 
@@ -796,12 +817,12 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
     monkeypatch.setattr(subprocess, "Popen", launch)
     monkeypatch.setattr(os, "killpg", group_signal)
-    monkeypatch.setattr(code_review, "_stop", remember_owner)
+    monkeypatch.setattr(process, "terminate_owned_tree", remember_owner)
     try:
         started = time.monotonic()
         with pytest.raises(process.ProcessOwnershipError, match=r"cleanup.*proven"):
             reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
-        assert time.monotonic() - started < 8
+        assert time.monotonic() - started < 10
         assert len(review_processes) == 1
         assert review_processes[0].poll() == 0
         assert not reviewer._receipt_path(target).exists()
@@ -812,8 +833,9 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
         # Never release a parent obligation using the mocked cleanup result.
         monkeypatch.setattr(os, "killpg", original_killpg)
         for owner in owners:
-            assert process.terminate_owned_tree(owner, deadline=time.monotonic() + 5)
-            assert process.close_owner(owner, deadline=time.monotonic() + 5)
+            cleanup_deadline = time.monotonic() + 5
+            assert original_stop(owner, deadline=cleanup_deadline)
+            assert process.close_owner(owner, deadline=cleanup_deadline)
 
 
 @pytest.mark.parametrize("implementation_name", code_review.REVIEW_FILES)
@@ -860,20 +882,73 @@ def test_review_closure_changes_follow_the_exported_component_contract(
     assert len(repo.calls()) == 1
 
 
-def test_review_fingerprints_the_loaded_bundle_verifier(
+def test_review_rejects_a_relocated_loaded_bundle_verifier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _make_review_repository(tmp_path)
     reviewer = code_review.Reviewer(repo.path)
     tree = repo.git("write-tree")
-    original = reviewer._policy_digest(tree)
+    reviewer._policy_digest(tree)
     loaded = tmp_path / "loaded_bundle_verify.py"
     loaded.write_bytes(Path(bundle_verify.__file__).read_bytes())
     monkeypatch.setattr(bundle_verify, "__file__", str(loaded))
-    assert reviewer._policy_digest(tree) == original
-    with loaded.open("a", encoding="utf-8") as stream:
-        stream.write("\n# Loaded dependency differs from the adjacent source file.\n")
-    assert reviewer._policy_digest(tree) != original
+    with pytest.raises(
+        code_review.ReviewError, match="differs from its source registration"
+    ):
+        reviewer._policy_digest(tree)
+
+
+def _write_fixture_receipt(
+    reviewer: code_review.Reviewer, target: code_review.Target, state: Path
+) -> None:
+    plan = review_plan.build_plan(
+        reviewer.repository,
+        target.document(),
+        code_review.Coverage().document(),
+        deadline=time.monotonic() + 30,
+    )
+    stages = []
+    identifiers = [f"shard-{i:04d}" for i in range(len(plan.shards))]
+    if len(plan.shards) > 1:
+        identifiers.append("integration")
+    for index, identifier in enumerate(identifiers):
+        units = [] if identifier == "integration" else plan.shards[index]
+        result = {
+            "verdict": "pass",
+            "summary": "Synthetic offline verification fixture.",
+            "findings": [],
+            "plan_digest": plan.fingerprint,
+            "shard_id": identifier,
+            "unit_reviews": [
+                {"unit_id": key, "method": "Synthetic method.", "related_paths": []}
+                for key in units
+            ],
+            "integration_reviews": [
+                {
+                    "obligation": obligation,
+                    "analysis": "Synthetic integration method.",
+                    "source_paths": ["AGENTS.md"],
+                }
+                for obligation in review_plan.INTEGRATION_OBLIGATIONS
+            ]
+            if identifier == "integration" or len(plan.shards) == 1
+            else [],
+            "contracts": [],
+        }
+        stages.append(
+            {
+                "id": identifier,
+                "review": result,
+                "review_sha256": review_plan.digest(review_plan.canonical(result)),
+                "owned_tree_empty": True,
+            }
+        )
+    execution = {
+        "plan": plan.document(),
+        "plan_digest": plan.fingerprint,
+        "stages": stages,
+    }
+    reviewer._write_receipt(target, result, "fixture", None, state, execution=execution)
 
 
 def test_reviewer_instances_keep_roots_and_evidence_separate(tmp_path: Path) -> None:
@@ -890,8 +965,7 @@ def test_reviewer_instances_keep_roots_and_evidence_separate(tmp_path: Path) -> 
     assert first.repository != second.repository
     assert first._directory() == first_repo.path / ".git/h2h-review"
     assert second._directory() == second_repo.path / ".git/h2h-review"
-    result = {"verdict": "pass", "summary": "Fixture review.", "findings": []}
-    first._write_receipt(first_target, result, "fixture", None, first_repo.state)
+    _write_fixture_receipt(first, first_target, first_repo.state)
     assert first._verify(first_target).exists()
     with pytest.raises(code_review.ReviewError, match="No valid code review"):
         second._verify(second_target)
@@ -903,8 +977,7 @@ def test_windows_offline_verification_does_not_require_codex_or_posix_locks(
     repo = _make_review_repository(tmp_path)
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
-    result = {"verdict": "pass", "summary": "Fixture review.", "findings": []}
-    reviewer._write_receipt(target, result, "fixture", None, repo.state)
+    _write_fixture_receipt(reviewer, target, repo.state)
     monkeypatch.setattr(code_review, "os", SimpleNamespace(name="nt"))
     with reviewer._review_lock(target, exclusive=False):
         assert reviewer._verify(target).exists()
@@ -1021,7 +1094,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
     signal_number = int(getattr(signal, signal_name))
     previous_handler = signal.getsignal(signal_number)
     original_popen = subprocess.Popen
-    original_stop = code_review._stop
+    original_stop = process.terminate_owned_tree
     owned: list[subprocess.Popen[bytes]] = []
     cleanup_started: list[int] = []
 
@@ -1030,7 +1103,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
 
     def launch_then_signal(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
         command = args[0]
-        if list(command[:2]) != ["codex", "exec"]:
+        if "review_worker.py" not in str(command) or "exec" not in command:
             return original_popen(*args, **kwargs)
         child = original_popen(
             (sys.executable, "-c", REVIEW_PROCESS_TREE, str(repo.state)), **kwargs
@@ -1046,24 +1119,25 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
             os.kill(os.getpid(), signal_number)
         return child
 
-    def stop_with_repeated_signals(owner: process.OwnedProcess) -> None:
+    def stop_with_repeated_signals(
+        owner: process.OwnedProcess, *, deadline: float, **kwargs: Any
+    ) -> bool:
         child = owner.process
         if child not in owned:
-            original_stop(owner)
-            return
+            return original_stop(owner, deadline=deadline, **kwargs)
         cleanup_started.append(child.pid)
         os.kill(os.getpid(), signal_number)
         os.kill(os.getpid(), signal_number)
-        original_stop(owner)
+        return original_stop(owner, deadline=deadline, **kwargs)
 
     monkeypatch.setenv("PATH", repo.environment["PATH"])
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
     monkeypatch.setattr(subprocess, "Popen", launch_then_signal)
-    monkeypatch.setattr(code_review, "_stop", stop_with_repeated_signals)
+    monkeypatch.setattr(process, "terminate_owned_tree", stop_with_repeated_signals)
     signal.signal(signal_number, unprotected_signal)
     try:
         with pytest.raises(code_review.ReviewError, match="interrupted by signal"):
-            reviewer._run(target, index=True, revision="HEAD", timeout=1, model=None)
+            reviewer._run(target, index=True, revision="HEAD", timeout=8, model=None)
         assert len(owned) == 1
         child = owned[0]
         assert cleanup_started == [child.pid]
@@ -1114,12 +1188,15 @@ def test_first_review_covers_existing_repository_and_verifies_before_merge(
     _assert_passed(repo.review("run", "--index"))
     prompt = str(repo.calls()[-1]["prompt"])
     assert "Review scope: full repository." in prompt
-    assert "including ALL tracked source" in prompt
+    assert "includes ALL tracked source" in prompt
     assert "even when they predate this task" in prompt
+    assert "For EACH unit_reviews entry, related_paths MUST include EVERY" in prompt
+    assert "Repeat shared paths in every applicable unit entry" in prompt
+    assert "Read those sources before attesting" in prompt
     assert "defects introduced by this complete change" not in prompt
     _, receipt = _candidate_receipt(repo)
-    assert receipt["schema_version"] == 2
-    assert receipt["target"]["profile"] == "h2h-code-review-v2"
+    assert receipt["schema_version"] == 3
+    assert receipt["target"]["profile"] == "h2h-code-review-v3"
     assert receipt["scope"] == "repository"
     assert receipt["baseline"] is None
     _assert_passed(repo.review("verify", "--index", mode="nonzero"))
@@ -1255,6 +1332,51 @@ def test_only_proven_documentation_can_bridge_unreviewed_primary_commits(
     if document_only:
         assert receipt["baseline"]["commit"] == baseline_commit
     _assert_passed(repo.review("verify", "--index"))
+
+
+@pytest.mark.parametrize("failure_kind", ["git", "deadline", "ownership"])
+def test_baseline_classifier_only_falls_back_for_clean_git_query_failure(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    repo.commit_file("README.md", "# Intervening historical document\n")
+    historical_blob = repo.git("rev-parse", "HEAD:README.md")
+    _next_candidate(repo)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    original = review_execution.git_output
+    injected = []
+    unknown = process.ProcessOwnershipError("historical Git cleanup is unknown")
+
+    def read(root: Path, *arguments: str, deadline: float | None = None) -> bytes:
+        if arguments == ("cat-file", "blob", historical_blob):
+            injected.append(arguments)
+            if failure_kind == "ownership":
+                raise unknown
+            if failure_kind == "deadline":
+                raise review_execution.ExecutionError("historical query deadline")
+            # A real, fully owned Git nonzero result can invalidate an old
+            # documentation bridge without making the current tree incomplete.
+            return original(root, "cat-file", "blob", "0" * 40, deadline=deadline)
+        return original(root, *arguments, deadline=deadline)
+
+    monkeypatch.setattr(review_execution, "git_output", read)
+    if failure_kind == "git":
+        with reviewer._select_coverage(target, force_repository=False) as coverage:
+            assert coverage == code_review.Coverage("repository")
+    elif failure_kind == "deadline":
+        with pytest.raises(review_execution.ExecutionError, match="historical query"):
+            with reviewer._select_coverage(target, force_repository=False):
+                pytest.fail("An expired query cannot become a new full review")
+    else:
+        with pytest.raises(process.ProcessOwnershipError) as caught:
+            with reviewer._select_coverage(target, force_repository=False):
+                pytest.fail("Unknown cleanup cannot become a new full review")
+        assert caught.value is unknown
+    assert injected == [("cat-file", "blob", historical_blob)]
 
 
 @pytest.mark.parametrize(
@@ -1470,29 +1592,34 @@ def test_external_review_owner_requires_the_direct_process_group_leader(
     assert code_review._external_process_owner()
 
 
-def test_review_fingerprints_the_loaded_external_owner(
+def test_review_rejects_a_relocated_loaded_external_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _make_review_repository(tmp_path)
     reviewer = code_review.Reviewer(repo.path)
     tree = repo.git("write-tree")
-    original = reviewer._policy_digest(tree)
+    reviewer._policy_digest(tree)
     loaded = tmp_path / "loaded_merge_command.py"
     loaded.write_bytes(Path(merge_command.__file__).read_bytes())
     monkeypatch.setattr(merge_command, "__file__", str(loaded))
-    assert reviewer._policy_digest(tree) == original
-    with loaded.open("a", encoding="utf-8") as stream:
-        stream.write("\n# The actual external owner import differs.\n")
-    assert reviewer._policy_digest(tree) != original
+    with pytest.raises(
+        code_review.ReviewError, match="differs from its source registration"
+    ):
+        reviewer._policy_digest(tree)
 
 
-@pytest.mark.parametrize("change", ["candidate", "baseline"])
+@pytest.mark.parametrize(
+    "change", ["candidate", "baseline", "unstaged-space", "untracked-space"]
+)
 def test_managed_receipt_revalidates_candidate_and_coverage_before_publication(
     review_repository: ReviewRepository, change: str
 ) -> None:
     repo = review_repository
     _baseline, baseline_path = _merge_full_baseline(repo)
     _next_candidate(repo)
+    if change == "unstaged-space":
+        (repo.path / " ").write_text("Reviewed contents.\n")
+        repo.git("add", "--", " ")
     _assert_passed(repo.review("run", "--index"))
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
@@ -1502,11 +1629,13 @@ def test_managed_receipt_revalidates_candidate_and_coverage_before_publication(
     if change == "candidate":
         (repo.path / "feature.py").write_text("value = 100\n")
         repo.git("add", "feature.py")
-    else:
+    elif change == "baseline":
         baseline_path.unlink()
+    else:
+        (repo.path / " ").write_text("Unreviewed local changes.\n")
     with (
         reviewer._review_lock(target, exclusive=True),
-        pytest.raises(code_review.ReviewError, match=r"candidate|coverage"),
+        pytest.raises(code_review.ReviewError, match=r"candidate|coverage|no unstaged"),
     ):
         reviewer._publish_managed_receipt(target, pending)
     assert not receipt.exists()
@@ -1522,10 +1651,10 @@ def test_result_diagnostic_failure_cannot_publish_standalone_evidence(
     original = process.report_diagnostic
     failure = process.ProcessOwnershipError("diagnostic cleanup unproven")
 
-    def report(message: str, *, standard_output: bool = False) -> None:
+    def report(message: str, **options: Any) -> None:
         if "Review result ready; writing" in message:
             raise failure
-        original(message, standard_output=standard_output)
+        original(message, **options)
 
     monkeypatch.setenv("PATH", repo.environment["PATH"])
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
@@ -1561,12 +1690,15 @@ def test_owner_diagnostic_failure_precedes_managed_evidence_publication(
         original(message, **options)
 
     monkeypatch.setattr(process, "report_diagnostic", report)
-    with pytest.raises(process.ProcessOwnershipError) as raised:
+    with (
+        pytest.raises(process.ProcessOwnershipError) as raised,
         merge_command._review(
             repo.path,
             (sys.executable, "scripts/review-code.py", "run", "--index"),
             dict(repo.environment),
-        )
+        ),
+    ):
+        pytest.fail("Diagnostic failure must precede publication")
     assert raised.value is failure
     assert not reviewer._receipt_path(target).exists()
     assert len(repo.calls()) == 1
@@ -1580,12 +1712,16 @@ def test_cli_does_not_launch_diagnostic_after_unknown_review_cleanup(
     reports: list[str] = []
 
     def fail_review(*args: Any, **kwargs: Any) -> None:
+        # Pre-admission Git queries own their normal in-memory diagnostics.
+        # Start the trap exactly when cleanup becomes unknown.
+        monkeypatch.setattr(
+            process,
+            "report_diagnostic",
+            lambda message, **options: reports.append(message),
+        )
         raise failure
 
     monkeypatch.setattr(code_review.Reviewer, "_run", fail_review)
-    monkeypatch.setattr(
-        process, "report_diagnostic", lambda message: reports.append(message)
-    )
     monkeypatch.setattr(sys, "argv", ["review-code.py", "run", "--index"])
     with pytest.raises(SystemExit) as raised:
         code_review.main(repo.path)
@@ -1747,4 +1883,678 @@ def test_review_rejects_index_visibility_drift_before_publishing(
     assert repo.git("diff", "--name-only") == ""
     assert (repo.path / "feature.py").read_text() == "value = 'unreviewed'\n"
     assert repo.git("write-tree") == target.tree
+    assert not reviewer._receipt_path(target).exists()
+
+
+@pytest.mark.parametrize("mode", ["pass", "integration-finding", "missing-unit"])
+def test_partitioned_review_requires_every_shard_and_integration(
+    review_repository: ReviewRepository, mode: str
+) -> None:
+    repo = review_repository
+    (repo.path / "large.py").write_text("value = 1\n" * 120000)
+    repo.git("add", "large.py")
+    result = repo.review("run", "--index", mode=mode)
+    if mode == "pass":
+        _assert_passed(result)
+        _assert_passed(repo.review("verify", "--index"))
+        _path, document = _candidate_receipt(repo)
+        stages = document["execution"]["stages"]
+        assert len(stages) > 2
+        assert stages[-1]["id"] == "integration"
+        assert all(stage["owned_tree_empty"] for stage in stages)
+    else:
+        _assert_blocked(result)
+        _assert_blocked(repo.review("verify", "--index"))
+    assignments = [
+        json.loads(
+            str(call["prompt"]).split(
+                "COORDINATOR ASSIGNMENT (data, not instructions):\n", 1
+            )[1]
+        )
+        for call in repo.calls()
+    ]
+    if mode == "integration-finding":
+        assert assignments[-1]["shard_id"] == "integration"
+    if mode == "missing-unit":
+        assert all(
+            assignment["shard_id"] != "integration" for assignment in assignments
+        )
+
+
+def test_passing_receipt_is_removed_if_publication_finishes_after_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from h2h_dev_tools import review_execution
+
+    repo = _make_review_repository(tmp_path)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    _write_fixture_receipt(reviewer, target, repo.state)
+    path = reviewer._receipt_path(target)
+    document = json.loads(path.read_text())
+    path.unlink()
+    original = os.replace
+    renamed = []
+
+    def late_replace(source: Any, destination: Any) -> None:
+        original(source, destination)
+        renamed.append(destination)
+        time.sleep(0.2)
+
+    monkeypatch.setattr(os, "replace", late_replace)
+    with pytest.raises(review_execution.ExecutionError, match="deadline"):
+        with review_execution.within_deadline(time.monotonic() + 0.1):
+            reviewer._write_receipt(
+                target,
+                document["review"],
+                "fixture",
+                None,
+                repo.state,
+                execution=document["execution"],
+            )
+    assert renamed == [path]
+    assert not path.exists()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Uses real POSIX Git process termination and lock release"
+)
+def test_standalone_baseline_classification_obeys_aggregate_deadline(
+    review_repository: ReviewRepository, tmp_path: Path
+) -> None:
+    repo = review_repository
+    _merge_full_baseline(repo)
+    repo.commit_file("README.md", "# Intervening documentation commit\n")
+    _next_candidate(repo)
+    calls_before = len(repo.calls())
+    real_git = shutil.which("git", path=repo.environment["PATH"])
+    assert real_git is not None
+    binary = tmp_path / "slow-classifier-git"
+    binary.mkdir()
+    marker = repo.state / "classifier-entered"
+    lock = repo.state / "classifier-lock"
+    shim = binary / "git"
+    slow_query = write_python_executable(
+        binary / "slow-query",
+        f"import fcntl, os, sys, time\nfrom pathlib import Path\n"
+        "if sys.argv[1:3] == ['diff', '--raw']:\n"
+        f"    stream = Path({str(lock)!r}).open('w')\n"
+        "    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)\n"
+        f"    Path({str(marker)!r}).touch()\n"
+        "    time.sleep(5)\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+    )
+    # Only the classifier query has injected latency. A Python shim around
+    # every unrelated Git read would consume the short aggregate work budget
+    # before this test reaches its intended deadline boundary.
+    shim.write_text(
+        '#!/bin/sh\nif [ "$1" = diff ] && [ "$2" = --raw ]; then\n'
+        f'    exec {shlex.quote(str(slow_query))} "$@"\n'
+        "fi\n"
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    shim.chmod(0o755)
+    started = time.monotonic()
+    result = subprocess.run(
+        (
+            sys.executable,
+            "scripts/review-code.py",
+            "run",
+            "--index",
+            "--timeout-seconds",
+            "8",
+        ),
+        cwd=repo.path,
+        env=repo.environment
+        | {"PATH": str(binary) + os.pathsep + repo.environment["PATH"]},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    elapsed = time.monotonic() - started
+    assert marker.exists(), result.stdout + result.stderr
+    assert result.returncode != 0
+    assert elapsed < 4, f"Classifier exceeded the review work deadline: {elapsed}s"
+    assert len(repo.calls()) == calls_before
+    import fcntl
+
+    with lock.open() as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "staged",
+        "unstaged",
+        "untracked",
+        "unstaged-space",
+        "untracked-space",
+        "parent",
+        "revision",
+    ],
+)
+def test_offline_verify_rechecks_authority_after_evidence_validation(
+    review_repository: ReviewRepository, drift: str
+) -> None:
+    repo = review_repository
+    if drift == "unstaged-space":
+        (repo.path / " ").write_text("Reviewed contents.\n")
+        repo.git("add", "--", " ")
+    drift_path = (
+        " "
+        if drift.endswith("-space")
+        else "unknown.py"
+        if drift == "untracked"
+        else "feature.py"
+    )
+    alternate = repo.git("rev-parse", "task/example")
+    entry = repo.path / "scripts/review-code.py"
+    entry.write_text(
+        entry.read_text().replace(
+            "main(root)\n",
+            "from h2h_dev_tools import code_review\n"
+            "import subprocess\n"
+            "original_verify = code_review.Reviewer._verify\n"
+            "def verify_then_drift(self, target):\n"
+            "    result = original_verify(self, target)\n"
+            "    if (root / '.git/drift-after-validation').exists():\n"
+            + (
+                f"        subprocess.run(['git', 'update-ref', 'HEAD', {alternate!r}], cwd=root, check=True)\n"
+                if drift in {"parent", "revision"}
+                else (
+                    f"        (root / {drift_path!r}).write_text('value = 2\\n')\n"
+                    + (
+                        "        subprocess.run(['git', 'add', 'feature.py'], cwd=root, check=True)\n"
+                        if drift == "staged"
+                        else ""
+                    )
+                )
+            )
+            + "    return result\n"
+            "code_review.Reviewer._verify = verify_then_drift\n"
+            "main(root)\n",
+        )
+    )
+    repo.git("add", "scripts/review-code.py")
+    _assert_passed(repo.review("run", "--index"))
+    expected_tree = repo.git("write-tree")
+    if drift == "revision":
+        repo.git("commit", "-m", "Merge exact reviewed fixture")
+    (repo.path / ".git/drift-after-validation").touch()
+    calls = len(repo.calls())
+    result = repo.review(
+        "verify",
+        *(["--revision", "HEAD"] if drift == "revision" else ["--index"]),
+        "--expected-tree",
+        expected_tree,
+    )
+    _assert_blocked(result)
+    assert len(repo.calls()) == calls, "Offline verification must not call Codex"
+
+
+@pytest.mark.parametrize("boundary", ["write-return", "ancestor-exit", "run-return"])
+def test_standalone_completion_failure_revokes_published_receipt(
+    review_repository: ReviewRepository, boundary: str
+) -> None:
+    repo = review_repository
+    marker = repo.state / "publication-reached"
+    injection = (
+        "import time\nfrom contextlib import contextmanager\n"
+        "from h2h_dev_tools import code_review, process\n"
+        "clock = time.monotonic\noffset = 0\n"
+        "time.monotonic = lambda: clock() + offset\n"
+        f"marker = Path({str(marker)!r})\n"
+        "def expire():\n    global offset\n    marker.touch()\n    offset = 1000\n"
+    )
+    if boundary == "write-return":
+        injection += (
+            "original = code_review.Reviewer._write_receipt\n"
+            "def write(self, *args, **kwargs):\n"
+            "    original(self, *args, **kwargs)\n"
+            "    expire()\n"
+            "code_review.Reviewer._write_receipt = write\n"
+        )
+    elif boundary == "ancestor-exit":
+        injection += (
+            "original = code_review.Reviewer._select_coverage\n"
+            "@contextmanager\ndef coverage(self, target, **kwargs):\n"
+            "    with original(self, target, **kwargs) as value: yield value\n"
+            "    if self._receipt_path(target).exists(): expire()\n"
+            "code_review.Reviewer._select_coverage = coverage\n"
+        )
+    else:
+        injection += (
+            "original = code_review.Reviewer._run\n"
+            "def run(self, *args, **kwargs):\n"
+            "    original(self, *args, **kwargs)\n    expire()\n"
+            "code_review.Reviewer._run = run\n"
+        )
+    entry = repo.path / "scripts/review-code.py"
+    entry.write_text(
+        entry.read_text().replace("main(root)\n", injection + "main(root)\n")
+    )
+    repo.git("add", "scripts/review-code.py")
+    result = repo.review("run", "--index", "--timeout-seconds", "60")
+    assert marker.exists(), result.stdout + result.stderr
+    _assert_blocked(result)
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+    _assert_blocked(repo.review("verify", "--index"))
+
+
+@pytest.mark.parametrize(
+    "boundary", ["publish-return", "pending-cleanup", "cleanup-proof"]
+)
+def test_managed_completion_failure_revokes_published_receipt(
+    review_repository: ReviewRepository, boundary: str, tmp_path: Path
+) -> None:
+    repo = review_repository
+    classifier = repo.path / "scripts/check_change_scope.py"
+    classifier.write_text("print('full')\n")
+    repo.git("add", "scripts/check_change_scope.py")
+    marker = repo.state / "publication-reached"
+    cleanup = tmp_path / "owner-cleanup"
+    package = (repo.path / repo.implementation).parent
+    script = (
+        "import runpy, time\nfrom pathlib import Path\n"
+        f"package = Path({str(package)!r})\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+        "from h2h_dev_tools import code_review, merge_command\n"
+        "clock = time.monotonic\noffset = 0\n"
+        "time.monotonic = lambda: clock() + offset\n"
+        f"marker = Path({str(marker)!r})\n"
+        "def expire():\n    global offset\n    marker.touch()\n    offset = 1000\n"
+    )
+    if boundary == "publish-return":
+        script += (
+            "original = code_review.Reviewer._publish_managed_receipt\n"
+            "def publish(self, *args):\n"
+            "    result = original(self, *args)\n    expire()\n    return result\n"
+            "code_review.Reviewer._publish_managed_receipt = publish\n"
+        )
+    elif boundary == "pending-cleanup":
+        script += (
+            "original = merge_command.tempfile.TemporaryDirectory\n"
+            "class PendingDirectory(original):\n"
+            "    def cleanup(self):\n"
+            "        super().cleanup()\n"
+            "        if Path(self.name).name.startswith('pending-'): expire()\n"
+            "merge_command.tempfile.TemporaryDirectory = PendingDirectory\n"
+        )
+    else:
+        script += (
+            "original = Path.replace\n"
+            "def replace(self, destination):\n"
+            f"    if Path(destination) == Path({str(cleanup)!r}):\n"
+            "        marker.touch()\n        raise OSError('injected cleanup proof failure')\n"
+            "    return original(self, destination)\n"
+            "Path.replace = replace\n"
+        )
+    script += "raise SystemExit(merge_command.main())\n"
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            "--review",
+            "--cleanup-receipt",
+            str(cleanup),
+            str(repo.path),
+            "--",
+            sys.executable,
+            "scripts/review-code.py",
+            "run",
+            "--index",
+            "--timeout-seconds",
+            "60",
+        ),
+        cwd=repo.path,
+        env=repo.environment | {"H2H_CODE_REVIEW_TIMEOUT_SECONDS": "60"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert marker.exists(), result.stdout + result.stderr
+    assert repo.calls(), result.stdout + result.stderr
+    _assert_blocked(result)
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+    _assert_blocked(repo.review("verify", "--index"))
+
+
+@pytest.mark.parametrize("boundary", ["write-return", "run-return"])
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM", "SIGHUP"])
+def test_standalone_publication_signal_revokes_receipt(
+    review_repository: ReviewRepository, boundary: str, signal_name: str
+) -> None:
+    repo = review_repository
+    marker = repo.state / "signal-after-publication"
+    injection = (
+        "import os, signal\n"
+        "from h2h_dev_tools import code_review, process\n"
+        f"marker = Path({str(marker)!r})\n"
+        "def interrupt():\n"
+        "    marker.touch()\n"
+        f"    os.kill(os.getpid(), signal.{signal_name})\n"
+    )
+    if boundary == "write-return":
+        injection += (
+            "original = code_review.Reviewer._write_receipt\n"
+            "def write(self, *args, **kwargs):\n"
+            "    original(self, *args, **kwargs)\n"
+            "    interrupt()\n"
+            "code_review.Reviewer._write_receipt = write\n"
+        )
+    else:
+        injection += (
+            "original = code_review.Reviewer._run\n"
+            "def run(self, *args, **kwargs):\n"
+            "    original(self, *args, **kwargs)\n"
+            "    interrupt()\n"
+            "code_review.Reviewer._run = run\n"
+        )
+    entry = repo.path / "scripts/review-code.py"
+    source = entry.read_text()
+    assert source.count("main(root)\n") == 1
+    entry.write_text(source.replace("main(root)\n", injection + "main(root)\n"))
+    repo.git("add", "scripts/review-code.py")
+    result = repo.review("run", "--index", "--timeout-seconds", "60")
+    assert marker.exists(), result.stdout + result.stderr
+    assert repo.calls(), "The real owned reviewer must finish before interruption"
+    _assert_blocked(result)
+    # This is a real signal after atomic publication, not an injected exception.
+    # Offline verification must reject the failed invocation after its lock exits.
+    _assert_blocked(repo.review("verify", "--index"))
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Real POSIX signals during publication")
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM", "SIGHUP"])
+@pytest.mark.parametrize(
+    "boundary", ["publish-return", "pending-cleanup", "cleanup-proof"]
+)
+def test_managed_publication_signal_revokes_receipt(
+    review_repository: ReviewRepository, signal_name: str, boundary: str, tmp_path: Path
+) -> None:
+    repo = review_repository
+    classifier = repo.path / "scripts/check_change_scope.py"
+    classifier.write_text("print('full')\n")
+    repo.git("add", "scripts/check_change_scope.py")
+    marker = repo.state / "publication-signal"
+    cleanup = tmp_path / "owner-cleanup"
+    package = (repo.path / repo.implementation).parent
+    script = (
+        "import os, runpy, signal\nfrom pathlib import Path\n"
+        f"package = Path({str(package)!r})\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+        "from h2h_dev_tools import code_review, merge_command\n"
+        f"marker = Path({str(marker)!r})\n"
+        "def interrupt():\n"
+        "    if not marker.exists():\n"
+        "        marker.touch()\n"
+        f"        os.kill(os.getpid(), signal.{signal_name})\n"
+    )
+    if boundary == "publish-return":
+        script += (
+            "original = code_review.Reviewer._publish_managed_receipt\n"
+            "def publish(self, *args):\n"
+            "    result = original(self, *args)\n    interrupt()\n    return result\n"
+            "code_review.Reviewer._publish_managed_receipt = publish\n"
+        )
+    elif boundary == "pending-cleanup":
+        script += (
+            "original = merge_command.tempfile.TemporaryDirectory\n"
+            "class PendingDirectory(original):\n"
+            "    def cleanup(self):\n"
+            "        super().cleanup()\n"
+            "        if Path(self.name).name.startswith('pending-'): interrupt()\n"
+            "merge_command.tempfile.TemporaryDirectory = PendingDirectory\n"
+        )
+    else:
+        script += (
+            "original = Path.replace\n"
+            "def replace(self, destination):\n"
+            "    result = original(self, destination)\n"
+            f"    if Path(destination) == Path({str(cleanup)!r}): interrupt()\n"
+            "    return result\n"
+            "Path.replace = replace\n"
+        )
+    script += "raise SystemExit(merge_command.main())\n"
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            "--review",
+            "--cleanup-receipt",
+            str(cleanup),
+            str(repo.path),
+            "--",
+            sys.executable,
+            "scripts/review-code.py",
+            "run",
+            "--index",
+            "--timeout-seconds",
+            "60",
+        ),
+        cwd=repo.path,
+        env=repo.environment | {"H2H_CODE_REVIEW_TIMEOUT_SECONDS": "60"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    assert marker.exists(), result.stdout + result.stderr
+    assert repo.calls(), result.stdout + result.stderr
+    assert result.returncode != 0
+    reviewer = code_review.Reviewer(repo.path)
+    receipt = reviewer._receipt_path(reviewer._target(index=True))
+    verification = repo.review("verify", "--index")
+    # Record the real consequence before the negative assertion: OLD SIGTERM/HUP
+    # kills the owner with a passing receipt that the unchanged verifier accepts.
+    (repo.state / "signal-proof.json").write_text(
+        json.dumps(
+            {
+                "signal": signal_name,
+                "boundary": boundary,
+                "returncode": result.returncode,
+                "receipt_exists": receipt.exists(),
+                "verify_returncode": verification.returncode,
+                "cleanup_receipt_exists": cleanup.exists(),
+            }
+        )
+    )
+    assert not receipt.exists(), result.stdout + result.stderr
+    _assert_blocked(verification)
+    assert result.returncode == 128 + int(getattr(signal, signal_name))
+    assert cleanup.read_text() == "owned_tree_empty\n"
+
+
+def test_managed_admission_diagnostic_cleanup_failure_exits_125(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    failure = process.ProcessOwnershipError(
+        "Diagnostic writer cleanup could not be proven"
+    )
+    calls: list[tuple[bool, float | None]] = []
+    original_deadline = time.monotonic() + 100.0
+
+    def fail_diagnostic(
+        message: str, *, standard_output: bool = False, deadline: float | None = None
+    ) -> None:
+        assert message.startswith("Managed publication reserve:")
+        calls.append((standard_output, deadline))
+        raise failure
+
+    monkeypatch.setattr(
+        sys, "argv", ["review-code.py", "run", "--index", "--timeout-seconds", "100"]
+    )
+    monkeypatch.setenv("H2H_REVIEW_DEADLINE", str(original_deadline))
+    monkeypatch.setattr(code_review, "_external_process_owner", lambda: True)
+    monkeypatch.setattr(process, "report_diagnostic", fail_diagnostic)
+    with pytest.raises(SystemExit) as raised:
+        code_review.main(tmp_path)
+    assert raised.value.code == process.TERMINATION_FAILED_EXIT_CODE == 125
+    assert raised.value.__cause__ is failure
+    assert calls == [(True, original_deadline - 5.0)]
+
+
+@pytest.mark.parametrize(
+    "change", [None, "code_review.py", "bundle_verify.py", "primary-branch.sh"]
+)
+@pytest.mark.parametrize("command", ["run", "verify"])
+def test_review_rejects_source_changed_after_import_before_first_capture(
+    review_repository: ReviewRepository, change: str | None, command: str
+) -> None:
+    repo = review_repository
+    package = (repo.path / repo.implementation).parent
+    namespace = (
+        "_shared.h2h_dev_tools" if "_shared" in package.parts else "h2h_dev_tools"
+    )
+    entry = repo.path / "scripts/review-code.py"
+    entry.write_text(
+        "import hashlib, importlib, json, os, runpy, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "sys.dont_write_bytecode = True\n"
+        "root = Path(__file__).resolve().parents[1]\n"
+        "sys.path.insert(0, str(root / 'scripts'))\n"
+        f"package = root / {str(package.relative_to(repo.path))!r}\n"
+        f"namespace = {namespace!r}\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, namespace)\n"
+        "review = importlib.import_module(namespace + '.code_review')\n"
+        "verifier = importlib.import_module(namespace + '.bundle_verify')\n"
+        "change = os.environ.get('FIXTURE_SOURCE_CHANGE')\n"
+        "if change:\n"
+        "    registered = review.__loader__._h2h_source_registration[2]\n"
+        "    source = package / change\n"
+        "    before = registered[change]\n"
+        "    source.write_bytes(source.read_bytes() + b'\\n# New candidate source after import.\\n')\n"
+        "    after = hashlib.sha256(source.read_bytes()).hexdigest()\n"
+        "    assert before != after\n"
+        "    assert review.__loader__._h2h_source_registration[2][change] == before\n"
+        "    manifest_path = package / 'manifest.json'\n"
+        "    if manifest_path.exists():\n"
+        "        manifest = json.loads(manifest_path.read_text())\n"
+        "        manifest['files'][change] = after\n"
+        "        manifest['payload_sha256'] = verifier.payload_digest(manifest['files'])\n"
+        "        manifest_path.write_text(json.dumps(manifest))\n"
+        "        verifier.verify_bundle(root)\n"
+        "    subprocess.run(['git', 'add', str(package)], cwd=root, check=True)\n"
+        "    state = Path(os.environ['FAKE_CODEX_STATE'])\n"
+        "    (state / 'loaded-before-capture.json').write_text(json.dumps({'loaded': before, 'staged': after}))\n"
+        "if sys.argv[1] == 'verify' and os.environ.get('FIXTURE_PREPARE_RECEIPT'):\n"
+        "    environment = {key: value for key, value in os.environ.items() if not key.startswith('FIXTURE_')}\n"
+        "    fresh = subprocess.run([sys.executable, str(__file__), 'run', '--index'], cwd=root, env=environment, capture_output=True, text=True, timeout=15)\n"
+        "    assert fresh.returncode == 0, fresh.stdout + fresh.stderr\n"
+        "review.main(root)\n",
+        encoding="utf-8",
+    )
+    repo.git("add", "scripts/review-code.py")
+    environment = dict(repo.environment)
+    if change is not None:
+        environment["FIXTURE_SOURCE_CHANGE"] = change
+    if command == "verify":
+        environment["FIXTURE_PREPARE_RECEIPT"] = "1"
+    result = subprocess.run(
+        (sys.executable, str(entry), command, "--index"),
+        cwd=repo.path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    fresh_verify = repo.review("verify", "--index")
+    (repo.state / "source-authority-result.json").write_text(
+        json.dumps(
+            {
+                "command": command,
+                "change": change,
+                "loaded_process": {
+                    "exit": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                },
+                "fresh_verify": {
+                    "exit": fresh_verify.returncode,
+                    "stdout": fresh_verify.stdout,
+                    "stderr": fresh_verify.stderr,
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if change is None:
+        _assert_passed(result)
+        _assert_passed(fresh_verify)
+    else:
+        observation = json.loads(
+            (repo.state / "loaded-before-capture.json").read_text()
+        )
+        assert observation["loaded"] != observation["staged"]
+        _assert_blocked(result)
+        assert "Review source changed after bootstrap:" in result.stderr
+        assert "differs from the controller registration" in result.stderr
+        if command == "run":
+            assert not repo.calls()
+            _assert_blocked(fresh_verify)
+            assert not list((repo.path / ".git/h2h-review/receipts").glob("*.json"))
+            # A fresh process can review the updated candidate normally.
+            _assert_passed(repo.review("run", "--index"))
+        _assert_passed(repo.review("verify", "--index"))
+
+
+def test_review_requires_the_actual_source_loader_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_review_repository(tmp_path)
+    reviewer = code_review.Reviewer(repo.path)
+    monkeypatch.setattr(code_review, "__loader__", None)
+    with pytest.raises(code_review.ReviewError, match="source loader registration"):
+        reviewer._policy_digest(repo.git("write-tree"))
+
+
+@pytest.mark.parametrize("reserve", [6.0, 30.0], ids=["standalone", "managed"])
+def test_planning_obeys_the_active_phase_deadline(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    reserve: float,
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    started = time.monotonic()
+    cutoff = started + 900 - reserve
+    observed: list[float] = []
+
+    def stop_planning(*args: Any, deadline: float, **kwargs: Any) -> None:
+        observed.append(deadline)
+        raise review_plan.PlanError("Stop at the planning boundary")
+
+    monkeypatch.setattr(review_plan, "build_plan", stop_planning)
+    with (
+        pytest.raises(review_plan.PlanError, match="planning boundary"),
+        review_execution.within_deadline(cutoff),
+    ):
+        reviewer._run(
+            target,
+            index=True,
+            revision="HEAD",
+            timeout=900,
+            model=None,
+            started=started,
+        )
+    assert observed == [cutoff]
+    assert not repo.calls(), "Planning must be bounded before Codex admission"
     assert not reviewer._receipt_path(target).exists()

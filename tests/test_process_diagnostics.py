@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -383,51 +385,54 @@ def test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
 
     try:
         with process.controlled_termination_signals() as controller:
-            with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "terminal diagnostic scope probe",
-                        (
-                            sys.executable,
-                            "-I",
-                            "-B",
-                            "-c",
-                            _SCOPED_ACTOR,
-                            str(Path(process.__file__).resolve().parent),
-                            str(tmp_path),
+            try:
+                with controller.defer():
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "terminal diagnostic scope probe",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                _SCOPED_ACTOR,
+                                str(Path(process.__file__).resolve().parent),
+                                str(tmp_path),
+                            ),
+                            tmp_path,
+                            stdout=write_fd,
+                            stderr=write_fd,
                         ),
-                        tmp_path,
-                        stdout=write_fd,
-                        stderr=write_fd,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                while not (tmp_path / "admitted.json").exists():
+                    assert owner.process.poll() is None
+                    assert time.monotonic() < deadline - 3
+                    time.sleep(0.001)
+                with monkeypatch.context() as boundary:
+                    # Exercise the post-grace branch directly; no production grace
+                    # or total deadline is increased to make the test pass.
+                    boundary.setattr(process, "TERMINATION_GRACE_SECONDS", 0)
+                    boundary.setattr(os, "killpg", observe_killpg)
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                assert process.close_owner(owner, deadline=deadline)
+                owner = None
+                admitted = json.loads((tmp_path / "admitted.json").read_text())
+                reaped = json.loads((tmp_path / "reaped.json").read_text())
+                (tmp_path / "force-kill-observations.json").write_text(
+                    json.dumps(kill_observations)
                 )
-            while not (tmp_path / "admitted.json").exists():
-                assert owner.process.poll() is None
-                assert time.monotonic() < deadline - 3
-                time.sleep(0.001)
-            with monkeypatch.context() as boundary:
-                # Exercise the post-grace branch directly; no production grace
-                # or total deadline is increased to make the test pass.
-                boundary.setattr(process, "TERMINATION_GRACE_SECONDS", 0)
-                boundary.setattr(os, "killpg", observe_killpg)
-                assert process.terminate_owned_tree(owner, deadline=deadline)
-            assert process.close_owner(owner, deadline=deadline)
-            owner = None
-        admitted = json.loads((tmp_path / "admitted.json").read_text())
-        reaped = json.loads((tmp_path / "reaped.json").read_text())
-        (tmp_path / "force-kill-observations.json").write_text(
-            json.dumps(kill_observations)
-        )
-        assert admitted["pending"] is True, admitted
-        assert admitted["group"] == admitted["caller_group"]
-        assert reaped == {"pid": admitted["pid"], "reaped": True}
-        assert kill_observations == [True]
+                assert admitted["pending"] is True, admitted
+                assert admitted["group"] == admitted["caller_group"]
+                assert reaped == {"pid": admitted["pid"], "reaped": True}
+                assert kill_observations == [True]
+            finally:
+                with controller.defer():
+                    if owner is not None:
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert process.close_owner(owner, deadline=deadline)
     finally:
-        if owner is not None:
-            assert process.terminate_owned_tree(owner, deadline=deadline)
-            assert process.close_owner(owner, deadline=deadline)
         os.close(read_fd)
         os.close(write_fd)
 
@@ -628,3 +633,171 @@ def test_registered_unlaunched_diagnostic_closes_with_original_deadline(
                 real_close(scope, deadline=deadline)
         parent.proven_empty = True
         real_close(parent, deadline=deadline)
+
+
+@pytest.mark.parametrize("failure", ["launch", "body"])
+@pytest.mark.parametrize("signal_number", [signal.SIGINT, signal.SIGTERM])
+def test_terminal_writer_fixture_cleans_before_restoring_signal_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    signal_number: int,
+) -> None:
+    start = process.start_owned_process
+    terminate = process.terminate_owned_tree
+    close = process.close_owner
+    pipe = os.pipe
+    owners: list[tuple[process.OwnedProcess, float]] = []
+    closed: list[tuple[process.OwnedProcess, float, bool]] = []
+    pipes: list[tuple[int, int]] = []
+    cleanup_signals: list[int] = []
+    body_failed = False
+    checked = False
+
+    def record_pipe() -> tuple[int, int]:
+        descriptors = pipe()
+        if not pipes:
+            pipes.append(descriptors)
+        return descriptors
+
+    def start_and_interrupt(
+        command: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        assert signal_controller is not None
+        assert signal_controller.defer_depth > 0
+        owner = start(command, deadline=deadline, signal_controller=signal_controller)
+        owners.append((owner, deadline))
+        if failure == "launch":
+            os.kill(os.getpid(), signal_number)
+        return owner
+
+    def interrupt_cleanup(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        nonlocal body_failed
+        if failure == "body" and not body_failed:
+            body_failed = True
+            raise RuntimeError("fixture body failed before cleanup")
+        cleanup_signals.append(signal_number)
+        os.kill(os.getpid(), signal_number)
+        return terminate(owner, deadline=deadline, diagnostic=diagnostic)
+
+    def record_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        result = close(owner, deadline=deadline, diagnostic=diagnostic)
+        closed.append((owner, deadline, result))
+        return result
+
+    # If the fixture restores handlers too early, the second real signal reaches
+    # this controller instead of terminating pytest. It still interrupts the
+    # fixture cleanup, so only its own close can satisfy the oracle below.
+    with process.controlled_termination_signals() as controller:
+        try:
+            with monkeypatch.context() as boundary:
+                boundary.setattr(os, "pipe", record_pipe)
+                boundary.setattr(process, "start_owned_process", start_and_interrupt)
+                boundary.setattr(process, "terminate_owned_tree", interrupt_cleanup)
+                boundary.setattr(process, "close_owner", record_close)
+                with pytest.raises(
+                    (KeyboardInterrupt, process.RunnerSignalInterrupt)
+                ) as caught:
+                    test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
+                        tmp_path, monkeypatch
+                    )
+            assert len(owners) == 1
+            owner, deadline = owners[0]
+            assert owner.posix_scope is not None
+            (tmp_path / "fixture-cleanup-before-rescue.json").write_text(
+                json.dumps(
+                    {
+                        "failure": failure,
+                        "signal": signal_number,
+                        "pid": owner.process.pid,
+                        "original_deadline": deadline,
+                        "closed": [(bound, result) for _, bound, result in closed],
+                        "scope_removed": not owner.posix_scope.capability.directory.exists(),
+                        "returncode": owner.process.returncode,
+                        "cleanup_signals": cleanup_signals,
+                    }
+                )
+            )
+            assert closed == [(owner, deadline, True)]
+            assert not owner.posix_scope.capability.directory.exists()
+            assert cleanup_signals == [signal_number]
+            if signal_number == signal.SIGINT:
+                assert isinstance(caught.value, KeyboardInterrupt)
+            else:
+                assert isinstance(caught.value, process.RunnerSignalInterrupt)
+                assert caught.value.signal_number == signal_number
+            with pytest.raises(ProcessLookupError):
+                os.killpg(owner.process.pid, 0)
+            assert len(pipes) == 1
+            for descriptor in pipes[0]:
+                with pytest.raises(OSError) as descriptor_error:
+                    os.fstat(descriptor)
+                assert descriptor_error.value.errno == errno.EBADF
+            checked = True
+        finally:
+            if not checked:
+                # Failure-only rescue follows the fixture's recorded outcome;
+                # it cannot manufacture its close evidence or extend its bound.
+                with controller.defer():
+                    for owner, deadline in owners:
+                        if (owner, deadline, True) not in closed:
+                            assert terminate(owner, deadline=deadline)
+                            assert close(owner, deadline=deadline)
+                    for descriptors in pipes:
+                        for descriptor in descriptors:
+                            try:
+                                os.close(descriptor)
+                            except OSError as error:
+                                assert error.errno == errno.EBADF
+
+
+def test_terminal_writer_fixture_closes_pipe_when_signal_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipe = os.pipe
+    pipes: list[tuple[int, int]] = []
+    setup_error = RuntimeError("signal controller entry failed")
+
+    def record_pipe() -> tuple[int, int]:
+        descriptors = pipe()
+        pipes.append(descriptors)
+        return descriptors
+
+    def refuse_handler(number: int, handler: Any) -> None:
+        raise setup_error
+
+    try:
+        with monkeypatch.context() as boundary:
+            boundary.setattr(os, "pipe", record_pipe)
+            boundary.setattr(signal, "signal", refuse_handler)
+            with pytest.raises(RuntimeError) as caught:
+                test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
+                    tmp_path, monkeypatch
+                )
+        assert caught.value is setup_error
+        assert len(pipes) == 1
+        for descriptor in pipes[0]:
+            with pytest.raises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            assert descriptor_error.value.errno == errno.EBADF
+    finally:
+        # Inspect EBADF before rescue; handler entry failed before any launch.
+        for descriptors in pipes:
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    assert error.errno == errno.EBADF

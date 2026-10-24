@@ -27,6 +27,84 @@ COMMAND = implementation.ProcessCommand(
 )
 
 
+@pytest.mark.parametrize("terminated", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.usefixtures("memory_diagnostics")
+def test_scope_probe_error_retains_cause_and_complete_cleanup_proof(
+    monkeypatch: pytest.MonkeyPatch, terminated: bool, closed: bool
+) -> None:
+    from h2h_dev_tools._process_scope import ScopeError
+
+    scope_error = ScopeError("Process scope lock deadline")
+    scope = Mock()
+    scope.close_admission.side_effect = scope_error
+    child = Mock(pid=4312, returncode=0)
+    child.wait.return_value = 0
+    owner = runner.OwnedProcess(child, posix_scope=scope)
+    terminate = Mock(return_value=terminated)
+    close = Mock(return_value=closed)
+    monkeypatch.setattr(runner, "start_owned_process", Mock(return_value=owner))
+    monkeypatch.setattr(runner, "terminate_owned_tree", terminate)
+    monkeypatch.setattr(runner, "close_owner", close)
+    monkeypatch.setattr(runner.time, "monotonic", Mock(return_value=100.0))
+    monkeypatch.setattr(runner.os, "killpg", Mock(), raising=False)
+
+    with pytest.raises(runner.ProcessOwnershipError) as caught:
+        runner.run_command(COMMAND, hard_deadline=110.0)
+
+    assert caught.value.__cause__ is scope_error
+    assert caught.value.cleanup_proven is (terminated and closed)
+    scope.close_admission.assert_called_once_with(deadline=110.0)
+    terminate.assert_called_once_with(owner, deadline=110.0, diagnostic=ANY)
+    close.assert_called_once_with(owner, deadline=110.0, diagnostic=ANY)
+
+
+@pytest.mark.parametrize("operation", ["wait", "terminate"])
+def test_unverifiable_scope_is_typed_unproven_without_losing_cause(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from h2h_dev_tools._process_scope import ScopeError
+
+    scope_error = ScopeError("Process scope identity changed")
+    scope = Mock(proven_empty=False)
+    scope.close_admission.side_effect = scope_error
+    owner = runner.OwnedProcess(Mock(pid=4312), posix_scope=scope)
+    monkeypatch.setattr(runner.os, "killpg", Mock(), raising=False)
+    with pytest.raises(runner.ProcessOwnershipError) as caught:
+        if operation == "wait":
+            runner.wait_for_owned_tree_exit(owner, deadline=110.0, poll_deadline=100.25)
+        else:
+            runner.terminate_owned_tree(owner, deadline=110.0)
+    assert caught.value.__cause__ is scope_error
+    assert caught.value.cleanup_proven is False
+    assert scope.proven_empty is False
+    scope.close_admission.assert_called_once_with(deadline=110.0)
+
+
+@pytest.mark.parametrize("poll_deadline", [100.25, 120.0])
+def test_short_group_observation_never_replaces_or_extends_cleanup_deadline(
+    monkeypatch: pytest.MonkeyPatch, poll_deadline: float
+) -> None:
+    clock = 100.0
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    child = Mock(pid=4312)
+    scope = Mock()
+    owner = runner.OwnedProcess(child, posix_scope=scope)
+    monkeypatch.setattr(runner.os, "killpg", Mock(), raising=False)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    assert not runner.wait_for_owned_tree_exit(
+        owner, deadline=110.0, poll_deadline=poll_deadline
+    )
+    assert clock == min(110.0, poll_deadline)
+    scope.close_admission.assert_called_once_with(deadline=110.0)
+    scope.has_pending.assert_not_called()
+
+
 @pytest.fixture(autouse=True)
 def require_explicit_process_launch_double(
     monkeypatch: pytest.MonkeyPatch,
@@ -256,7 +334,7 @@ def test_phase_wait_subtracts_ownership_overhead_from_absolute_deadline(
     assert runner.run_command(COMMAND, hard_deadline=110.0) == 0
     process.wait.assert_called_once_with(timeout=1.0)
     start.assert_called_once_with(COMMAND, deadline=110.0, signal_controller=ANY)
-    wait_for_tree.assert_called_once_with(owner, deadline=103.75)
+    wait_for_tree.assert_called_once_with(owner, deadline=110.0, poll_deadline=103.75)
     if job is not None:
         job.close.assert_called_once_with()
 

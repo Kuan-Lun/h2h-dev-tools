@@ -9,12 +9,19 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from h2h_dev_tools import bundle, bundle_verify, merge_command, process
+from h2h_dev_tools import (
+    bundle,
+    bundle_verify,
+    merge_command,
+    process,
+    review_test_support,
+)
 from h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +48,13 @@ main(root)
 """
 
 
-_PASS_REVIEW = "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n"
+_PASS_REVIEW = (
+    review_test_support.synthetic_review_response_source()
+    + """
+result = synthetic_review_response(prompt)
+output.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+"""
+)
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +68,7 @@ def offline_codex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "if sys.argv[1:] == ['--version']:\n"
         "    print('codex-cli merge-fixture')\n"
         "    raise SystemExit(0)\n"
-        "sys.stdin.read()\n"
+        "prompt = sys.stdin.read()\n"
         "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
         + _PASS_REVIEW,
     )
@@ -1533,27 +1546,41 @@ def test_all_mutating_workflow_hooks_are_owned(
         )
     primary = git(root, "rev-parse", "master")
     git(root, "switch", "task")
-    with (state / "output").open("w") as output:
-        wrapper = subprocess.Popen(
-            (
-                "bash",
-                "src/h2h_dev_tools/git-flow-merge.sh",
-                str(root),
-                "scripts/review-merge-candidate.sh",
-                *(["--cleanup-only"] if stage == "noop" else []),
-            ),
-            cwd=root,
-            env=os.environ
-            | {
-                "WORKFLOW_HOOK_STATE": str(state),
-                "WORKFLOW_HOOK_STAGE": "checkout" if stage == "noop" else stage,
-                "WORKFLOW_HOOK_MODE": mode,
-            },
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    cleanup_deadline = time.monotonic() + 40
+    with (
+        process.controlled_termination_signals() as controller,
+        (state / "output").open("wb") as output,
+    ):
+        owner: process.OwnedProcess | None = None
+        clean = False
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "workflow hook interruption fixture",
+                        (
+                            "bash",
+                            "src/h2h_dev_tools/git-flow-merge.sh",
+                            str(root),
+                            "scripts/review-merge-candidate.sh",
+                            *(["--cleanup-only"] if stage == "noop" else []),
+                        ),
+                        root,
+                        environment=os.environ
+                        | {
+                            "WORKFLOW_HOOK_STATE": str(state),
+                            "WORKFLOW_HOOK_STAGE": "checkout"
+                            if stage == "noop"
+                            else stage,
+                            "WORKFLOW_HOOK_MODE": mode,
+                        },
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                    ),
+                    deadline=cleanup_deadline,
+                    signal_controller=controller,
+                )
+            wrapper = owner.process
             deadline = time.monotonic() + 20
             while not (state / "ready").exists():
                 assert wrapper.poll() is None, (state / "output").read_text()
@@ -1566,6 +1593,14 @@ def test_all_mutating_workflow_hooks_are_owned(
             assert wrapper.returncode != 0, recorded
             if mode == "cancel" and stage in {"checkout", "noop", "delete"}:
                 assert wrapper.returncode == 143, recorded
+            # Wrapper exit and released locks cannot discharge nested obligations.
+            # The canonical outer owner must prove cleanup before fixture rescue.
+            _assert_interrupted_workflow_cleanup(
+                owner, (state / "output").read_text(), deadline=cleanup_deadline
+            )
+            with pytest.raises(ProcessLookupError):
+                os.killpg(int((state / "group").read_text()), 0)
+            clean = True
             _assert_gate_lock_released(state / "child-lock")
             if stage == "delete":
                 assert git(root, "show", "-s", "--format=%P", "master").split() == [
@@ -1587,15 +1622,16 @@ def test_all_mutating_workflow_hooks_are_owned(
             if stage in {"checkout", "noop"}:
                 assert not (root / ".git/fixture-gate").exists()
         finally:
-            groups = {wrapper.pid}
-            if (state / "group").exists():
-                groups.add(int((state / "group").read_text()))
-            for group in groups:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            wrapper.wait(timeout=5)
+            if owner is not None and not clean:
+                # Rescue cannot turn unknown cleanup into a passing assertion.
+                with controller.defer():
+                    empty = process.terminate_owned_tree(
+                        owner, deadline=cleanup_deadline
+                    )
+                    closed = process.close_owner(owner, deadline=cleanup_deadline)
+                    assert empty and closed, "Fixture cleanup remains unproven"
+            if owner is not None and owner.process.stdout is not None:
+                owner.process.stdout.close()
 
 
 @pytest.mark.parametrize("stage", ["checkout", "abort", "restore", "delete"])
@@ -1777,10 +1813,10 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
         "if sys.argv[1:] == ['--version']:\n"
         "    print('codex-cli managed-review-fixture')\n"
         "    raise SystemExit(0)\n"
-        "sys.stdin.read()\n"
+        "prompt = sys.stdin.read()\n"
         "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "output.write_text(json.dumps(dict(verdict='pass', summary='Reviewed.', findings=[])))\n"
-        f"if {surviving_child!r}:\n"
+        + _PASS_REVIEW
+        + f"if {surviving_child!r}:\n"
         "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
         "    Path(os.environ['REVIEW_GROUP_FILE']).write_text(str(os.getpgrp()))\n",
     )
@@ -1846,21 +1882,28 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
     (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
     shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
     owner = root / "src/h2h_dev_tools/merge_command.py"
-    owner.write_text(
-        owner.read_text().replace(
-            "        if status == 0:",
-            "        import time\n"
-            "        state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
-            "        (state / 'ready').touch()\n"
-            "        while not (state / 'release').exists():\n"
-            "            time.sleep(0.01)\n"
-            f"        if {owner_result!r} == 'crash':\n"
-            "            os._exit(1)\n"
-            f"        if {owner_result!r} == 'corrupt':\n"
-            "            pending.write_text('{}')\n"
-            "        if status == 0:",
-        )
+    injection = (
+        "original_run_owned = _run_owned\n"
+        "def _run_owned(phase, **kwargs):\n"
+        "    status = original_run_owned(phase, **kwargs)\n"
+        "    if phase.label == 'Code review':\n"
+        "        import time as hold_clock\n"
+        "        state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
+        "        (state / 'ready').touch()\n"
+        "        while not (state / 'release').exists():\n"
+        "            hold_clock.sleep(0.01)\n"
+        f"        if {owner_result!r} == 'crash':\n"
+        "            os._exit(1)\n"
+        f"        if {owner_result!r} == 'corrupt':\n"
+        "            Path(phase.environment['H2H_REVIEW_PENDING_RECEIPT']).write_text('{}')\n"
+        "    return status\n\n"
     )
+    source = owner.read_text()
+    anchor = 'if __name__ == "__main__":'
+    assert source.count(anchor) == 1
+    source = source.replace(anchor, injection + anchor)
+    compile(source, str(owner), "exec")
+    owner.write_text(source)
     git(root, "add", ".")
     git(root, "commit", "-m", "test: pause owner after command cleanup")
     state = tmp_path / "state"
@@ -1874,7 +1917,7 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
         "if sys.argv[1:] == ['--version']:\n"
         "    print('codex-cli publication-fixture')\n"
         "    raise SystemExit(0)\n"
-        "sys.stdin.read()\n"
+        "prompt = sys.stdin.read()\n"
         "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
         + _PASS_REVIEW,
     )
@@ -2073,24 +2116,38 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
     git(root, "add", ".")
     git(root, "commit", "-m", "test: exercise the complete review lifecycle")
     task = git(root, "rev-parse", "HEAD")
-    with (state / "output").open("w+") as output:
-        wrapper = subprocess.Popen(
-            ("scripts/git-flow-merge.sh",),
-            cwd=root,
-            env=os.environ
-            | {
-                "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
-                "MERGE_INTERRUPTION_STATE": str(state),
-                "MERGE_REVIEW_STAGE": stage,
-                "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "1"
-                if interruption == "timeout"
-                else "900",
-            },
-            stdout=subprocess.PIPE if piped_output else output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    cleanup_deadline = time.monotonic() + (65 if interruption == "timeout" else 35)
+    with (
+        process.controlled_termination_signals() as controller,
+        (state / "output").open("w+b") as output,
+    ):
+        owner: process.OwnedProcess | None = None
+        clean = False
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "review interruption fixture",
+                        ("scripts/git-flow-merge.sh",),
+                        root,
+                        environment=os.environ
+                        | {
+                            "PATH": str(binary)
+                            + os.pathsep
+                            + os.environ.get("PATH", ""),
+                            "MERGE_INTERRUPTION_STATE": str(state),
+                            "MERGE_REVIEW_STAGE": stage,
+                            "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "40"
+                            if interruption == "timeout"
+                            else "900",
+                        },
+                        stdout=subprocess.PIPE if piped_output else output,
+                        stderr=subprocess.STDOUT,
+                    ),
+                    deadline=cleanup_deadline,
+                    signal_controller=controller,
+                )
+            wrapper = owner.process
             deadline = time.monotonic() + 15
             while not (state / "ready").exists():
                 assert wrapper.poll() is None, (state / "output").read_text()
@@ -2107,12 +2164,21 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 "backpressure"
             ):
                 wrapper.send_signal(signal.SIGTERM)
-            wrapper.wait(timeout=15)
+            # Two shards reserve 20% for integration, including six cleanup seconds.
+            wrapper.wait(timeout=45 if interruption == "timeout" else 15)
             assert wrapper.returncode != 0, (state / "output").read_text()
             if interruption in {"cancel", "closed-pipe"} or interruption.startswith(
                 "backpressure"
             ):
                 assert wrapper.returncode == 143
+            # Wrapper exit and released locks cannot discharge nested obligations.
+            # The canonical outer owner must prove cleanup before fixture rescue.
+            _assert_interrupted_workflow_cleanup(
+                owner, (state / "output").read_text(), deadline=cleanup_deadline
+            )
+            with pytest.raises(ProcessLookupError):
+                os.killpg(int((state / "group").read_text()), 0)
+            clean = True
             _assert_gate_lock_released(state / "leader-lock")
             _assert_gate_lock_released(state / "child-lock")
             assert not (root / ".git/MERGE_HEAD").exists()
@@ -2123,15 +2189,16 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 assert (state / "restore-hook-ran").exists()
             assert git(root, "status", "--porcelain") == ""
         finally:
-            groups = {wrapper.pid}
-            if (state / "group").exists():
-                groups.add(int((state / "group").read_text()))
-            for group in groups:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            wrapper.wait(timeout=5)
+            if owner is not None and not clean:
+                # Rescue cannot turn unknown cleanup into a passing assertion.
+                with controller.defer():
+                    empty = process.terminate_owned_tree(
+                        owner, deadline=cleanup_deadline
+                    )
+                    closed = process.close_owner(owner, deadline=cleanup_deadline)
+                    assert empty and closed, "Fixture cleanup remains unproven"
+            if owner is not None and owner.process.stdout is not None:
+                owner.process.stdout.close()
 
 
 def _assert_interrupted_workflow_cleanup(
@@ -2218,27 +2285,29 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
     task = git(root, "rev-parse", "HEAD")
     deadline = time.monotonic() + 25
     with process.controlled_termination_signals() as controller:
-        with controller.defer():
-            owner = process.start_owned_process(
-                process.ProcessCommand(
-                    "merge interruption fixture",
-                    (
-                        "bash",
-                        str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
-                        str(root),
-                        "scripts/review-merge-candidate.sh",
-                    ),
-                    root,
-                    environment=os.environ | {"MERGE_INTERRUPTION_STATE": str(state)},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                ),
-                deadline=deadline,
-                signal_controller=controller,
-            )
-        wrapper = owner.process
+        owner: process.OwnedProcess | None = None
         clean = False
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "merge interruption fixture",
+                        (
+                            "bash",
+                            str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
+                            str(root),
+                            "scripts/review-merge-candidate.sh",
+                        ),
+                        root,
+                        environment=os.environ
+                        | {"MERGE_INTERRUPTION_STATE": str(state)},
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            wrapper = owner.process
             while not (state / "ready").exists():
                 assert wrapper.poll() is None, wrapper.communicate()[0]
                 assert time.monotonic() < deadline - 6, (
@@ -2293,15 +2362,15 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
                 assert not git(root, "branch", "--list", "task")
                 assert not (root / ".git/h2h-merge-workflow.lock").exists()
         finally:
-            if not clean:
+            if owner is not None and not clean:
                 # Rescue is never a passing oracle. Retain an uncertain ledger;
                 # force-killing its owner cannot manufacture nested cleanup proof.
                 with controller.defer():
                     empty = process.terminate_owned_tree(owner, deadline=deadline)
                     closed = process.close_owner(owner, deadline=deadline)
                     assert empty and closed, "Fixture cleanup remains unproven"
-            if wrapper.stdout is not None:
-                wrapper.stdout.close()
+            if owner is not None and owner.process.stdout is not None:
+                owner.process.stdout.close()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
@@ -2379,6 +2448,7 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
     base = fixture_repository(root, succeeds=False)
     calls = tmp_path / "diagnostic-calls"
     commands = tmp_path / "commands.jsonl"
+    boundary = tmp_path / "commands-before-diagnostic.jsonl"
     receipts = tmp_path / "receipts.tsv"
     record_workflow_receipts(root, receipts)
     exports = tmp_path / "exports"
@@ -2400,6 +2470,8 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
         + "_original_report_diagnostic = report_diagnostic\n"
         + "def report_diagnostic(message, **kwargs):\n"
         + "    if message.startswith('git-flow-merge:'):\n"
+        + f"        with open({str(commands)!r}, 'rb') as before, open({str(boundary)!r}, 'wb') as saved:\n"
+        + "            saved.write(before.read())\n"
         + f"        with open({str(calls)!r}, 'a') as events: events.write('called\\n')\n"
         + f"        {outcome}\n"
         + "    return _original_report_diagnostic(message, **kwargs)\n"
@@ -2423,7 +2495,12 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
     assert status == 1, output.read_text()
     assert calls.read_text().splitlines() == ["called"]
     events = [json.loads(line) for line in commands.read_text().splitlines()]
-    assert events[-1][-2:] == ["commit", "--no-edit"]
+    assert sum(event[-2:] == ["commit", "--no-edit"] for event in events) == 1
+    # Commit hooks legitimately issue nested owned queries. The diagnostic
+    # boundary, not the last outer command's position, closes command admission.
+    assert commands.read_bytes() == boundary.read_bytes(), (
+        "Commands started after diagnostic failure"
+    )
     assert git(root, "rev-parse", "master") == base
     assert git(root, "rev-parse", "task") == task
     assert git(root, "branch", "--show-current") == "master"
@@ -2569,22 +2646,23 @@ def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
     task = git(root, "rev-parse", "HEAD")
     deadline = time.monotonic() + 15
     with process.controlled_termination_signals() as controller:
-        with controller.defer():
-            owner = process.start_owned_process(
-                process.ProcessCommand(
-                    "interrupted diagnostic launcher",
-                    ("scripts/git-flow-merge.sh",),
-                    root,
-                    environment=os.environ | {"TMPDIR": str(exports)},
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                ),
-                deadline=deadline,
-                signal_controller=controller,
-            )
-        wrapper = owner.process
+        owner: process.OwnedProcess | None = None
         clean = False
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "interrupted diagnostic launcher",
+                        ("scripts/git-flow-merge.sh",),
+                        root,
+                        environment=os.environ | {"TMPDIR": str(exports)},
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            wrapper = owner.process
             while not ready.exists():
                 assert wrapper.poll() is None, wrapper.communicate()[0]
                 assert time.monotonic() < deadline - 6
@@ -2611,21 +2689,239 @@ def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
             assert diagnostic_receipt.parent == retained[0]
             assert not diagnostic_receipt.exists()
         finally:
-            if not clean:
+            if owner is not None and not clean:
                 with controller.defer():
                     empty = process.terminate_owned_tree(owner, deadline=deadline)
                     closed = process.close_owner(owner, deadline=deadline)
                     assert empty and closed, "Diagnostic fixture cleanup is unproven"
-            if wrapper.stdout is not None:
-                wrapper.stdout.close()
+            if owner is not None and owner.process.stdout is not None:
+                owner.process.stdout.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX descendant cleanup oracle")
+@pytest.mark.parametrize("surviving_descendant", [False, True])
+def test_interruption_oracle_tracks_non_locking_descendants_after_wrapper_exit(
+    tmp_path: Path, surviving_descendant: bool
+) -> None:
+    child_pid = tmp_path / "child-pid"
+    lock = tmp_path / "wrapper-lock"
+    child = (
+        "import os, signal, sys, time\nfrom pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        f"time.sleep({60 if surviving_descendant else 0})\n"
+    )
+    wrapper_source = (
+        "import fcntl, subprocess, sys, time\nfrom pathlib import Path\n"
+        "lock = Path(sys.argv[1]).open('a')\n"
+        "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        f"child = subprocess.Popen([sys.executable, '-I', '-c', {child!r}, sys.argv[2]])\n"
+        "while not Path(sys.argv[2]).exists():\n    time.sleep(0.01)\n"
+        + ("" if surviving_descendant else "child.wait()\n")
+        + "raise SystemExit(143)\n"
+    )
+    deadline = time.monotonic() + 6
+    with process.controlled_termination_signals() as controller:
+        owner: process.OwnedProcess | None = None
+        clean = False
+        try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "non-locking descendant oracle control",
+                        (
+                            sys.executable,
+                            "-I",
+                            "-c",
+                            wrapper_source,
+                            str(lock),
+                            str(child_pid),
+                        ),
+                        tmp_path,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            assert owner.process.wait(timeout=3) == 143
+            _assert_gate_lock_released(lock)
+            assert owner.posix_scope is not None
+            assert not owner.posix_scope.has_pending(deadline=deadline)
+            if surviving_descendant:
+                os.kill(int(child_pid.read_text()), 0)
+                with pytest.raises(AssertionError):
+                    _assert_interrupted_workflow_cleanup(
+                        owner, "normal signal exit", deadline=time.monotonic() + 0.1
+                    )
+            else:
+                with pytest.raises(ProcessLookupError):
+                    os.kill(int(child_pid.read_text()), 0)
+                _assert_interrupted_workflow_cleanup(
+                    owner, "normal signal exit", deadline=deadline
+                )
+                clean = True
+        finally:
+            # Only after observing the oracle's result may the fixture rescue
+            # its deliberately surviving child; released locks are insufficient.
+            if owner is not None and not clean:
+                with controller.defer():
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX launch interruption cleanup")
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "hook",
+        "review",
+        "non-locking",
+        "cleanliness",
+        "capture",
+        "merge-interruption",
+        "diagnostic",
+        "nested-obligation",
+        "publication",
+    ],
+)
+@pytest.mark.parametrize("signal_number", [signal.SIGINT, signal.SIGTERM])
+def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: str, signal_number: int
+) -> None:
+    start = process.start_owned_process
+    close = process.close_owner
+    owners: list[tuple[process.OwnedProcess, float]] = []
+    closed: list[tuple[process.OwnedProcess, float, bool]] = []
+
+    def start_and_interrupt(
+        command: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        assert signal_controller is not None
+        assert signal_controller.defer_depth > 0
+        owner = start(command, deadline=deadline, signal_controller=signal_controller)
+        owners.append((owner, deadline))
+        signal_controller.receive(signal_number)
+        return owner
+
+    def record_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        result = close(owner, deadline=deadline, diagnostic=diagnostic)
+        closed.append((owner, deadline, result))
+        return result
+
+    monkeypatch.setattr(process, "start_owned_process", start_and_interrupt)
+    monkeypatch.setattr(process, "close_owner", record_close)
+    try:
+        with pytest.raises(
+            (KeyboardInterrupt, process.RunnerSignalInterrupt)
+        ) as caught:
+            if fixture == "hook":
+                test_all_mutating_workflow_hooks_are_owned(
+                    tmp_path, "checkout", "cancel"
+                )
+            elif fixture == "review":
+                test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
+                    tmp_path, "execute", "cancel"
+                )
+            elif fixture == "non-locking":
+                test_interruption_oracle_tracks_non_locking_descendants_after_wrapper_exit(
+                    tmp_path, True
+                )
+            elif fixture == "cleanliness":
+                test_cleanliness_stage_owns_git_callbacks_before_task_cleanup(
+                    tmp_path, "normal"
+                )
+            elif fixture == "capture":
+                test_candidate_export_uses_owned_capture_before_review(
+                    tmp_path, "normal"
+                )
+            elif fixture == "merge-interruption":
+                test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
+                    tmp_path, committed=False, handoff_signal=False, nested=False
+                )
+            elif fixture == "diagnostic":
+                test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
+                    tmp_path, handoff_signal=False
+                )
+            elif fixture == "nested-obligation":
+                test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
+                    tmp_path
+                )
+            else:
+                test_cancel_merge_after_canonical_receipt_rename_revokes_and_restores_task(
+                    tmp_path
+                )
+        if signal_number == signal.SIGINT:
+            assert isinstance(caught.value, KeyboardInterrupt)
+        else:
+            assert isinstance(caught.value, process.RunnerSignalInterrupt)
+            assert caught.value.signal_number == signal_number
+        assert len(owners) == 1
+        owner, deadline = owners[0]
+        assert closed == [(owner, deadline, True)]
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
+    finally:
+        # Observe the fixture's canonical close before rescuing a failed control.
+        failure = sys.exception()
+        for owner, deadline in owners:
+            if (owner, deadline, True) not in closed:
+                try:
+                    with process.controlled_termination_signals() as controller:
+                        with controller.defer():
+                            try:
+                                if fixture == "nested-obligation":
+                                    _finish_unlaunched_scope_negative_control(
+                                        owner,
+                                        tmp_path / "unlaunched-scope.json",
+                                        deadline=deadline,
+                                    )
+                            finally:
+                                empty = process.terminate_owned_tree(
+                                    owner, deadline=deadline
+                                )
+                                released = close(owner, deadline=deadline)
+                                assert empty and released
+                except BaseException as rescue_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(
+                        f"Launch control rescue also failed: {rescue_error}"
+                    )
+
+
+def _finish_unlaunched_scope_negative_control(
+    owner: process.OwnedProcess, marker: Path, *, deadline: float
+) -> None:
+    # Only the exact negative-control program below creates this marker. It
+    # creates one closed-admission scope and never launches a child from it.
+    # First observe that program's completion: checking the marker before then
+    # races scope creation when interruption is raised at the launch handoff.
+    from h2h_dev_tools._process_scope import PosixScope, _Capability
+
+    owner.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    if marker.exists():
+        assert owner.posix_scope is not None
+        unlaunched = PosixScope(
+            _Capability.decode(marker.read_text()),
+            owner.posix_scope.capability,
+            proven_empty=True,
+        )
+        unlaunched.close(deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX nested obligation oracle")
 def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
     tmp_path: Path,
 ) -> None:
-    from h2h_dev_tools._process_scope import PosixScope, _Capability
-
     marker = tmp_path / "unlaunched-scope.json"
     package = Path(process.__file__).resolve().parent
     child = (
@@ -2642,27 +2938,28 @@ def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
     )
     deadline = time.monotonic() + 6
     with process.controlled_termination_signals() as controller:
-        with controller.defer():
-            owner = process.start_owned_process(
-                process.ProcessCommand(
-                    "missing nested cleanup negative control",
-                    (
-                        sys.executable,
-                        "-I",
-                        "-B",
-                        "-c",
-                        child,
-                        str(package),
-                        str(marker),
-                    ),
-                    tmp_path,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                ),
-                deadline=deadline,
-                signal_controller=controller,
-            )
+        owner: process.OwnedProcess | None = None
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "missing nested cleanup negative control",
+                        (
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            "-c",
+                            child,
+                            str(package),
+                            str(marker),
+                        ),
+                        tmp_path,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
             assert owner.process.wait(timeout=3) == 143
             with pytest.raises(ProcessLookupError):
                 os.killpg(owner.process.pid, 0)
@@ -2673,20 +2970,16 @@ def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
                     owner, "normal signal exit", deadline=time.monotonic() + 0.1
                 )
         finally:
-            # This fixture's exact child program never launches anything after
-            # scope creation. Only that known unlaunched obligation is discharged;
-            # this cannot recover an unknown runtime owner or make the oracle pass.
-            if marker.exists():
-                assert owner.posix_scope is not None
-                unlaunched = PosixScope(
-                    _Capability.decode(marker.read_text()),
-                    owner.posix_scope.capability,
-                    proven_empty=True,
-                )
-                unlaunched.close(deadline=deadline)
-            with controller.defer():
-                assert process.terminate_owned_tree(owner, deadline=deadline)
-                assert process.close_owner(owner, deadline=deadline)
+            if owner is not None:
+                with controller.defer():
+                    try:
+                        _finish_unlaunched_scope_negative_control(
+                            owner, marker, deadline=deadline
+                        )
+                    finally:
+                        empty = process.terminate_owned_tree(owner, deadline=deadline)
+                        closed = process.close_owner(owner, deadline=deadline)
+                        assert empty and closed
 
 
 def _ignored_file_fixture(root: Path) -> None:
@@ -3487,3 +3780,606 @@ def test_initial_primary_checkout_cleans_hook_child_holding_output_streams(
     assert not (root / ".git/h2h-merge-workflow.lock").exists()
     assert not (root / ".git/MERGE_HEAD").exists()
     assert not (root / ".git/fixture-gate").exists()
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "index", "unstaged", "primary", "merge-parent"]
+)
+def test_release_gate_rejects_drift_during_final_review_verification(
+    tmp_path: Path, change: str
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True)
+    verifier = (
+        "import subprocess\nfrom pathlib import Path\n"
+        "def git(*args):\n"
+        "    return subprocess.check_output(['git', *args], text=True).strip()\n"
+        "counter = Path(git('rev-parse', '--git-path', 'verify-count'))\n"
+        "count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(count))\n"
+        "if count == 2:\n"
+    )
+    mutations = {
+        "none": "    pass\n",
+        "index": "    Path('README.md').write_text('changed candidate\\n')\n    git('add', 'README.md')\n",
+        "unstaged": "    Path('README.md').write_text('unstaged candidate\\n')\n",
+        "primary": "    git('update-ref', 'HEAD', git('rev-parse', 'MERGE_HEAD'))\n",
+        "merge-parent": "    Path(git('rev-parse', '--git-path', 'MERGE_HEAD')).write_text(git('rev-parse', 'HEAD') + '\\n')\n",
+    }
+    (root / "scripts/review-code.py").write_text(verifier + mutations[change])
+    git(root, "add", ".")
+    git(
+        root,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        "test: move candidate during final verification",
+    )
+    git(root, "switch", "master")
+    git(root, "merge", "--no-ff", "--no-commit", "task")
+    result = subprocess.run(
+        (sys.executable, "scripts/release-gate.py"),
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (root / ".git/verify-count").read_text() == "2"
+    if change == "none":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Verified full merge candidate" in result.stdout
+    else:
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "candidate changed during the gate" in result.stderr
+        assert "Verified full merge candidate" not in result.stdout
+
+
+@pytest.mark.parametrize("timeout", [1, 20])
+def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: int
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True)
+    binary = tmp_path / "stall-version"
+    binary.mkdir()
+    marker = tmp_path / "version-started"
+    lock = tmp_path / "version-lock"
+    write_python_executable(
+        binary / "codex",
+        f'import fcntl,time\nfrom pathlib import Path\nstream=Path({str(lock)!r}).open("w")\nfcntl.flock(stream.fileno(),fcntl.LOCK_EX)\nPath({str(marker)!r}).touch()\ntime.sleep(120)\n',
+    )
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("H2H_CODE_REVIEW_TIMEOUT_SECONDS", str(timeout))
+    started = time.monotonic()
+    result = subprocess.run(
+        ("scripts/git-flow-merge.sh",),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout + 20,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert time.monotonic() - started < timeout + 10, result.stdout + result.stderr
+    assert git(root, "branch", "--show-current") == "task"
+    assert not (root / ".git/MERGE_HEAD").exists()
+    assert not list((root / ".git/h2h-review").glob("receipts/*.json"))
+    assert "owned_tree_empty=True" in result.stdout + result.stderr
+    if timeout == 20:
+        import fcntl
+
+        assert marker.exists(), (
+            "This oracle must actually enter the stalled CLI version probe."
+        )
+        with lock.open("a") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX merge wrapper cancellation")
+def test_cancel_merge_after_canonical_receipt_rename_revokes_and_restores_task(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
+    module = root / "src/h2h_dev_tools/code_review.py"
+    source = module.read_text()
+    anchor = "            os.replace(pending, path)\n"
+    assert source.count(anchor) == 1
+    module.write_text(
+        source.replace(
+            anchor,
+            anchor
+            + (
+                "            state = Path(os.environ['PUBLICATION_HOLD'])\n"
+                "            state.write_text(str(os.getpid()))\n"
+                "            while not state.with_suffix('.release').exists():\n"
+                "                time.sleep(0.01)\n"
+            ),
+        )
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: pause canonical receipt publication")
+    task = git(root, "rev-parse", "HEAD")
+    marker = tmp_path / "published"
+    output_path = tmp_path / "output"
+    deadline = time.monotonic() + 15
+    with output_path.open("w+b") as output:
+        with process.controlled_termination_signals() as controller:
+            owner: process.OwnedProcess | None = None
+            clean = False
+            try:
+                with controller.defer():
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "cancel canonical receipt publication",
+                            ("scripts/git-flow-merge.sh",),
+                            root,
+                            environment=os.environ | {"PUBLICATION_HOLD": str(marker)},
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                wrapper = owner.process
+                while not marker.exists():
+                    assert wrapper.poll() is None, output_path.read_text()
+                    assert time.monotonic() < deadline, "Owner did not publish receipt"
+                    time.sleep(0.01)
+                receipts = tuple((root / ".git/h2h-review/receipts").glob("*.json"))
+                assert len(receipts) == 1
+                wrapper.send_signal(signal.SIGTERM)
+                assert (
+                    wrapper.wait(timeout=max(0.0, deadline - time.monotonic())) == 143
+                ), output_path.read_text()
+                _assert_interrupted_workflow_cleanup(
+                    owner, output_path.read_text(), deadline=deadline
+                )
+                clean = True
+                with pytest.raises(ProcessLookupError):
+                    os.killpg(wrapper.pid, 0)
+                verification = subprocess.run(
+                    (sys.executable, "scripts/review-code.py", "verify", "--index"),
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                (tmp_path / "wrapper-signal-proof.json").write_text(
+                    json.dumps(
+                        {
+                            "wrapper_returncode": wrapper.returncode,
+                            "receipt_exists": receipts[0].exists(),
+                            "verify_returncode": verification.returncode,
+                            "merge_head_exists": (root / ".git/MERGE_HEAD").exists(),
+                            "branch": git(root, "branch", "--show-current"),
+                            "owned_tree_empty_before_rescue": clean,
+                        }
+                    )
+                )
+                assert not receipts[0].exists(), output_path.read_text()
+                assert verification.returncode != 0
+                assert not (root / ".git/MERGE_HEAD").exists(), output_path.read_text()
+                assert git(root, "rev-parse", "master") == base
+                assert git(root, "rev-parse", "task") == task
+                assert git(root, "branch", "--show-current") == "task"
+                assert git(root, "status", "--porcelain") == ""
+            finally:
+                with controller.defer():
+                    try:
+                        marker.with_suffix(".release").touch()
+                    finally:
+                        if owner is not None and not clean:
+                            empty = process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            closed = process.close_owner(owner, deadline=deadline)
+                            assert empty and closed, (
+                                "Publication fixture cleanup is unproven"
+                            )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real publication owner cleanup")
+def test_publication_fixture_closes_owner_when_release_marker_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    start = process.start_owned_process
+    close = process.close_owner
+    touch = Path.touch
+    marker_error = OSError("fixture release marker write failed")
+    owners: list[tuple[process.OwnedProcess, float]] = []
+    closed: list[tuple[process.OwnedProcess, float, bool]] = []
+
+    def start_and_interrupt(
+        command: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        assert signal_controller is not None and signal_controller.defer_depth > 0
+        owner = start(command, deadline=deadline, signal_controller=signal_controller)
+        owners.append((owner, deadline))
+        signal_controller.receive(signal.SIGTERM)
+        return owner
+
+    def refuse_marker(path: Path, mode: int = 0o666, exist_ok: bool = True) -> None:
+        if path == tmp_path / "published.release":
+            raise marker_error
+        touch(path, mode=mode, exist_ok=exist_ok)
+
+    def record_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        result = close(owner, deadline=deadline, diagnostic=diagnostic)
+        closed.append((owner, deadline, result))
+        return result
+
+    monkeypatch.setattr(process, "start_owned_process", start_and_interrupt)
+    monkeypatch.setattr(process, "close_owner", record_close)
+    monkeypatch.setattr(Path, "touch", refuse_marker)
+    try:
+        with pytest.raises(OSError) as caught:
+            test_cancel_merge_after_canonical_receipt_rename_revokes_and_restores_task(
+                tmp_path
+            )
+        assert caught.value is marker_error
+        assert len(owners) == 1
+        owner, deadline = owners[0]
+        assert closed == [(owner, deadline, True)]
+        assert owner.posix_scope is not None
+        assert not owner.posix_scope.capability.directory.exists()
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
+    finally:
+        failure = sys.exception()
+        for owner, deadline in owners:
+            if (owner, deadline, True) not in closed:
+                try:
+                    with process.controlled_termination_signals() as controller:
+                        with controller.defer():
+                            empty = process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            released = close(owner, deadline=deadline)
+                            assert empty and released
+                except BaseException as rescue_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(
+                        f"Publication control rescue also failed: {rescue_error}"
+                    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX Git fsmonitor ownership")
+@pytest.mark.parametrize("mode", ["normal", "fsmonitor-stray", "unknown-cleanup"])
+def test_cleanliness_stage_owns_git_callbacks_before_task_cleanup(
+    tmp_path: Path, mode: str
+) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True, primary_hooks=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    scopes = tmp_path / "scopes"
+    scopes.mkdir()
+    if mode == "unknown-cleanup":
+        source = root / "src/h2h_dev_tools/process.py"
+        source.write_text(
+            source.read_text() + "\n_original_run_command = run_command\n"
+            "def run_command(phase, **kwargs):\n"
+            "    target = ('--workflow-state', 'check-clean')\n"
+            "    if any(phase.argv[index:index + len(target)] == target\n"
+            "           for index in range(len(phase.argv) - len(target) + 1)):\n"
+            f"        Path({str(state / 'unknown-cleanup')!r}).touch()\n"
+            "        raise ProcessOwnershipError('fixture cleanup unproven')\n"
+            "    return _original_run_command(phase, **kwargs)\n"
+        )
+        git(root, "add", ".")
+        git(root, "commit", "-m", "test: refuse unproven cleanliness cleanup")
+    task = git(root, "rev-parse", "task")
+    git(root, "update-ref", "refs/heads/master", task)
+    child = (
+        "import json, os, signal, sys, time\nfrom pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).write_text(json.dumps({'pid': os.getpid(), "
+        "'group': os.getpgrp()}))\n"
+        "while True:\n    time.sleep(0.1)\n"
+    )
+    hook = tmp_path / "fsmonitor"
+    write_python_executable(
+        hook,
+        "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
+        f"state = Path({str(state)!r})\n"
+        "with (state / 'queries.jsonl').open('a') as events:\n"
+        "    events.write(json.dumps({'group': os.getpgrp()}) + '\\n')\n"
+        + (
+            "try:\n    (state / 'spawned').touch(exist_ok=False)\n"
+            "except FileExistsError:\n    pass\n"
+            "else:\n"
+            f"    subprocess.Popen([sys.executable, '-I', '-S', '-B', '-c', {child!r}, "
+            "str(state / 'child.json')], stdin=subprocess.DEVNULL, "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "    while not (state / 'child.json').exists():\n"
+            "        time.sleep(0.005)\n"
+            if mode == "fsmonitor-stray"
+            else ""
+        )
+        + "os.write(1, b'cleanliness-token\\0/\\0')\n",
+    )
+    git(root, "config", "core.fsmonitor", str(hook))
+    git(root, "config", "core.fsmonitorHookVersion", "2")
+    deadline = time.monotonic() + 20
+    output_path = state / "workflow-output"
+    with output_path.open("wb") as output:
+        with process.controlled_termination_signals() as controller:
+            owner = None
+            clean = False
+            try:
+                with controller.defer():
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "owned cleanliness before task cleanup",
+                            ("scripts/git-flow-merge.sh", "--cleanup-only"),
+                            root,
+                            environment=os.environ | {"TMPDIR": str(scopes)},
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                status = owner.process.wait(timeout=12)
+                recorded = output_path.read_text()
+                assert process.wait_for_owned_tree_exit(
+                    owner, deadline=min(deadline - 6, time.monotonic() + 0.25)
+                ), recorded
+                _assert_interrupted_workflow_cleanup(owner, recorded, deadline=deadline)
+                clean = True
+                if mode == "unknown-cleanup":
+                    assert (state / "unknown-cleanup").exists()
+                    assert not (state / "queries.jsonl").exists()
+                    retained = list(scopes.glob("h2h-merge-owner.*"))
+                    assert len(retained) == 1
+                    assert (retained[0] / "cleanup-1").read_text() == (
+                        "owned_tree_empty\n"
+                    )
+                    assert not (retained[0] / "cleanup-2").exists()
+                    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
+                else:
+                    queries = [
+                        json.loads(line)
+                        for line in (state / "queries.jsonl").read_text().splitlines()
+                    ]
+                    assert queries
+                    assert all(row["group"] != owner.process.pid for row in queries)
+                    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+                    assert not list(scopes.glob("h2h-merge-owner.*"))
+                if mode == "fsmonitor-stray":
+                    identity = json.loads((state / "child.json").read_text())
+                    with pytest.raises(ProcessLookupError):
+                        os.kill(identity["pid"], 0)
+                    with pytest.raises(ProcessLookupError):
+                        os.killpg(identity["group"], 0)
+                    assert "surviving descendants required cleanup" in recorded
+                    assert "owned_tree_empty=True" in recorded
+                assert git(root, "rev-parse", "master") == task
+                assert not (root / ".git/MERGE_HEAD").exists()
+                assert not (root / ".git/fixture-gate").exists()
+                assert not (root / ".git/fixture-review-events").exists()
+                if mode == "normal":
+                    assert status == 0, recorded
+                    assert not git(root, "branch", "--list", "task")
+                    assert git(root, "branch", "--show-current") == "master"
+                else:
+                    assert status == 1, recorded
+                    assert git(root, "rev-parse", "task") == task
+                    assert git(root, "branch", "--show-current") == "task"
+            finally:
+                if owner is not None and not clean:
+                    with controller.defer():
+                        empty = process.terminate_owned_tree(owner, deadline=deadline)
+                        closed = process.close_owner(owner, deadline=deadline)
+                        assert empty and closed, (
+                            "Cleanliness fixture cleanup is unproven"
+                        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX Git fsmonitor ownership")
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "normal",
+        "fsmonitor-stray",
+        "unknown-cleanup",
+        "export-failure",
+        "missing-export",
+        "empty-export",
+    ],
+)
+def test_candidate_export_uses_owned_capture_before_review(
+    tmp_path: Path, mode: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True, primary_hooks=True)
+    state = tmp_path / "state"
+    state.mkdir()
+    scopes = tmp_path / "scopes"
+    scopes.mkdir()
+    shell = root / "src/h2h_dev_tools/git-flow-merge.sh"
+    marker = 'archive_paths=("$source_relative")\n'
+    assert shell.read_text().count(marker) == 1
+    shell.write_text(
+        shell.read_text().replace(
+            marker,
+            "printf '%s\\n' \"$candidate_tree\" > "
+            + shlex.quote(str(state / "exported-tree"))
+            + "\n"
+            + marker,
+        )
+    )
+    if mode in {"missing-export", "empty-export"}:
+        read_tree = 'candidate_tree="$(cat "${workflow_state%.json}.tree")"'
+        assert shell.read_text().count(read_tree) == 1
+        alteration = (
+            'rm -- "${workflow_state%.json}.tree"'
+            if mode == "missing-export"
+            else ': > "${workflow_state%.json}.tree"'
+        )
+        shell.write_text(
+            shell.read_text().replace(read_tree, alteration + "\n" + read_tree)
+        )
+    if mode == "unknown-cleanup":
+        source = root / "src/h2h_dev_tools/process.py"
+        source.write_text(
+            source.read_text() + "\n_original_run_command = run_command\n"
+            "def run_command(phase, **kwargs):\n"
+            "    target = ('--workflow-state', 'capture')\n"
+            "    if any(phase.argv[index:index + len(target)] == target\n"
+            "           for index in range(len(phase.argv) - len(target) + 1)):\n"
+            f"        Path({str(state / 'unknown-cleanup')!r}).touch()\n"
+            "        raise ProcessOwnershipError('fixture cleanup unproven')\n"
+            "    return _original_run_command(phase, **kwargs)\n"
+        )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: observe captured candidate export")
+    task = git(root, "rev-parse", "task")
+    child = (
+        "import json, os, signal, sys, time\nfrom pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).write_text(json.dumps({'pid': os.getpid(), "
+        "'group': os.getpgrp()}))\n"
+        "while True:\n    time.sleep(0.1)\n"
+    )
+    hook = tmp_path / "fsmonitor"
+    write_python_executable(
+        hook,
+        "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
+        f"state = Path({str(state)!r})\n"
+        f"scopes = Path({str(scopes)!r})\n"
+        f"mode = {mode!r}\n"
+        "suffix = f'-P{os.getppid():08x}'\n"
+        "trace = [json.loads(line) for line in "
+        "(state / 'git-trace').read_text().splitlines()]\n"
+        "command = next(row['argv'] for row in reversed(trace) "
+        "if row['event'] == 'start' and row['sid'].endswith(suffix))\n"
+        "workflow = next(scopes.glob('h2h-merge-owner.*/workflow.json'))\n"
+        "phase = json.loads(workflow.read_text())['phase']\n"
+        "write_tree = command[-1] == 'write-tree'\n"
+        "with (state / 'queries.jsonl').open('a') as events:\n"
+        "    events.write(json.dumps({'group': os.getpgrp(), 'phase': phase, "
+        "'write_tree': write_tree}) + '\\n')\n"
+        "while not (state / 'outer-group').exists():\n"
+        "    time.sleep(0.005)\n"
+        "outer_group = int((state / 'outer-group').read_text())\n"
+        "spawn = write_tree and ((mode == 'normal' and os.getpgrp() == "
+        "outer_group) or (mode == 'fsmonitor-stray' and phase == 'retained'))\n"
+        "if spawn and not (state / 'spawned').exists():\n"
+        "    (state / 'spawned').touch()\n"
+        f"    subprocess.Popen([sys.executable, '-I', '-S', '-B', '-c', {child!r}, "
+        "str(state / 'child.json')], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    while not (state / 'child.json').exists():\n"
+        "        time.sleep(0.005)\n"
+        "if write_tree and phase == 'retained' and mode == 'export-failure':\n"
+        "    workflow.with_suffix('.tree').mkdir()\n"
+        "os.write(1, b'candidate-token\\0/\\0')\n",
+    )
+    git(root, "config", "core.fsmonitor", str(hook))
+    git(root, "config", "core.fsmonitorHookVersion", "2")
+    deadline = time.monotonic() + 90
+    output_path = state / "workflow-output"
+    with output_path.open("wb") as output:
+        with process.controlled_termination_signals() as controller:
+            owner = None
+            clean = False
+            try:
+                with controller.defer():
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "owned candidate capture before review",
+                            ("scripts/git-flow-merge.sh",),
+                            root,
+                            environment=os.environ
+                            | {
+                                "TMPDIR": str(scopes),
+                                "GIT_TRACE2_EVENT": str(state / "git-trace"),
+                            },
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                (state / "outer-group").write_text(str(owner.process.pid))
+                status = owner.process.wait(timeout=60)
+                recorded = output_path.read_text()
+                assert process.wait_for_owned_tree_exit(
+                    owner, deadline=min(deadline - 30, time.monotonic() + 0.25)
+                ), recorded
+                _assert_interrupted_workflow_cleanup(owner, recorded, deadline=deadline)
+                clean = True
+                queries = [
+                    json.loads(line)
+                    for line in (state / "queries.jsonl").read_text().splitlines()
+                ]
+                write_tree_queries = [row for row in queries if row["write_tree"]]
+                assert write_tree_queries
+                assert all(
+                    row["group"] != owner.process.pid for row in write_tree_queries
+                )
+                if mode == "normal":
+                    assert status == 0, recorded
+                    assert (state / "exported-tree").read_text().strip() == git(
+                        root, "rev-parse", "HEAD^{tree}"
+                    )
+                    assert git(root, "rev-parse", "HEAD^1") == base
+                    assert git(root, "rev-parse", "HEAD^2") == task
+                    assert not git(root, "branch", "--list", "task")
+                    assert git(root, "branch", "--show-current") == "master"
+                    assert not (state / "child.json").exists()
+                else:
+                    assert status == 1, recorded
+                    assert git(root, "rev-parse", "master") == base
+                    assert git(root, "rev-parse", "task") == task
+                    assert not (state / "exported-tree").exists()
+                    assert not (root / ".git/fixture-gate").exists()
+                    assert not (root / ".git/fixture-review-events").exists()
+                if mode == "unknown-cleanup":
+                    assert (state / "unknown-cleanup").exists()
+                    assert (root / ".git/MERGE_HEAD").exists()
+                    assert git(root, "branch", "--show-current") == "master"
+                    retained = list(scopes.glob("h2h-merge-owner.*"))
+                    assert len(retained) == 1
+                    assert not (retained[0] / "workflow.tree").exists()
+                    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
+                else:
+                    assert not (root / ".git/MERGE_HEAD").exists()
+                    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+                    assert not list(scopes.glob("h2h-merge-owner.*"))
+                    if mode != "normal":
+                        assert git(root, "branch", "--show-current") == "task"
+                if mode == "fsmonitor-stray":
+                    identity = json.loads((state / "child.json").read_text())
+                    with pytest.raises(ProcessLookupError):
+                        os.kill(identity["pid"], 0)
+                    with pytest.raises(ProcessLookupError):
+                        os.killpg(identity["group"], 0)
+                    assert "surviving descendants required cleanup" in recorded
+                if mode == "export-failure":
+                    assert "Is a directory" in recorded
+                if mode == "missing-export":
+                    assert "could not read captured merge candidate tree" in recorded
+                if mode == "empty-export":
+                    assert "captured merge candidate tree is empty" in recorded
+            finally:
+                if owner is not None and not clean:
+                    with controller.defer():
+                        empty = process.terminate_owned_tree(owner, deadline=deadline)
+                        closed = process.close_owner(owner, deadline=deadline)
+                        assert empty and closed, "Candidate fixture cleanup is unproven"

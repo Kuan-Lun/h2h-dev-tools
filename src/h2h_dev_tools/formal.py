@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import os
 import re
@@ -12,6 +13,7 @@ import tempfile
 import tomllib
 import urllib.request
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Literal
 
@@ -122,6 +124,16 @@ def _run(command: list[str], *, cwd: Path) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
+def _readonly_bind_mount(source: Path, destination: str) -> str:
+    # Docker parses --mount as one CSV record before splitting key=value fields.
+    # Keep the normal terminator while encoding so embedded newlines are quoted.
+    record = StringIO(newline="")
+    csv.writer(record).writerow(
+        ["type=bind", f"src={source}", f"dst={destination}", "readonly"]
+    )
+    return record.getvalue().removesuffix("\r\n")
+
+
 def verify_tla(
     repository_root: Path,
     tla_jar: Path,
@@ -184,9 +196,9 @@ def verify_tla(
                     "--tmpfs",
                     "/tmp:rw,nosuid,nodev,size=512m",
                     "--mount",
-                    f"type=bind,src={repository_root},dst=/workspace,readonly",
+                    _readonly_bind_mount(repository_root, "/workspace"),
                     "--mount",
-                    f"type=bind,src={tla_jar.resolve()},dst=/tools/tla2tools.jar,readonly",
+                    _readonly_bind_mount(tla_jar.resolve(), "/tools/tla2tools.jar"),
                     "--workdir",
                     "/workspace/verification/tla",
                     lock.runtime_image,

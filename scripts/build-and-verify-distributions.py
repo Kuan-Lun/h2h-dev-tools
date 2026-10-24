@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.metadata
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
+from io import StringIO
 from pathlib import Path
 
 
@@ -35,20 +37,61 @@ def single(directory: Path, pattern: str) -> Path:
 
 def provide_dependency(site: Path, name: str) -> None:
     """Copy the complete inventory of one explicitly selected distribution."""
+    if name not in {"packaging", "distlib"}:
+        raise ValueError(f"unsupported offline dependency: {name}")
     dependency = importlib.metadata.distribution(name)
-    files = dependency.files
-    if files is None:
+    record = dependency.read_text("RECORD")
+    if not record:
         raise ValueError(f"{name} has no installed-file inventory")
-    for relative in files:
+    try:
+        rows = list(csv.reader(StringIO(record, newline=""), strict=True))
+    except csv.Error as error:
+        raise ValueError(f"invalid {name} installed-file inventory: {error}") from error
+    metadata = f"{name}-{dependency.version}.dist-info"
+    source_root = Path(str(dependency.locate_file(""))).resolve()
+    destination_root = site.resolve()
+    members: set[Path] = set()
+    copies: list[tuple[Path, Path]] = []
+    # Distribution.files filters missing entries on Python 3.14. Validate the
+    # raw RECORD completely before creating any part of the offline copy.
+    for row in rows:
+        if len(row) != 3 or not row[0]:
+            raise ValueError(f"invalid {name} installed-file inventory row: {row!r}")
+        relative = Path(row[0])
         if (
             relative.is_absolute()
             or ".." in relative.parts
             or not relative.parts
-            or relative.parts[0] not in {name, f"{name}-{dependency.version}.dist-info"}
+            or relative.as_posix() != row[0].replace(os.sep, "/")
+            or relative.parts[0] not in {name, metadata}
+            or relative in members
         ):
-            raise ValueError(f"unexpected {name} distribution member: {relative}")
-        source = Path(str(dependency.locate_file(relative)))
-        destination = site / relative
+            raise ValueError(f"unexpected {name} distribution member: {row[0]!r}")
+        members.add(relative)
+        source = source_root / relative
+        destination = destination_root / relative
+        if not source.resolve().is_relative_to(source_root / relative.parts[0]):
+            raise ValueError(f"{name} distribution member escapes source: {relative}")
+        if not source.is_file():
+            raise ValueError(f"missing {name} distribution file: {relative}")
+        if not destination.resolve().is_relative_to(
+            destination_root / relative.parts[0]
+        ):
+            raise ValueError(
+                f"{name} distribution member escapes destination: {relative}"
+            )
+        copies.append((source, destination))
+    required = {
+        Path(name) / "__init__.py",
+        Path(metadata) / "METADATA",
+        Path(metadata) / "WHEEL",
+        Path(metadata) / "RECORD",
+    }
+    if missing := required - members:
+        raise ValueError(
+            f"incomplete {name} installed-file inventory: {sorted(missing)}"
+        )
+    for source, destination in copies:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
 
