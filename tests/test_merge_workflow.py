@@ -2448,6 +2448,7 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
     base = fixture_repository(root, succeeds=False)
     calls = tmp_path / "diagnostic-calls"
     commands = tmp_path / "commands.jsonl"
+    boundary = tmp_path / "commands-before-diagnostic.jsonl"
     receipts = tmp_path / "receipts.tsv"
     record_workflow_receipts(root, receipts)
     exports = tmp_path / "exports"
@@ -2469,6 +2470,8 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
         + "_original_report_diagnostic = report_diagnostic\n"
         + "def report_diagnostic(message, **kwargs):\n"
         + "    if message.startswith('git-flow-merge:'):\n"
+        + f"        with open({str(commands)!r}, 'rb') as before, open({str(boundary)!r}, 'wb') as saved:\n"
+        + "            saved.write(before.read())\n"
         + f"        with open({str(calls)!r}, 'a') as events: events.write('called\\n')\n"
         + f"        {outcome}\n"
         + "    return _original_report_diagnostic(message, **kwargs)\n"
@@ -2492,7 +2495,12 @@ def test_failed_diagnostic_preserves_candidate_and_stops_further_commands(
     assert status == 1, output.read_text()
     assert calls.read_text().splitlines() == ["called"]
     events = [json.loads(line) for line in commands.read_text().splitlines()]
-    assert events[-1][-2:] == ["commit", "--no-edit"]
+    assert sum(event[-2:] == ["commit", "--no-edit"] for event in events) == 1
+    # Commit hooks legitimately issue nested owned queries. The diagnostic
+    # boundary, not the last outer command's position, closes command admission.
+    assert commands.read_bytes() == boundary.read_bytes(), (
+        "Commands started after diagnostic failure"
+    )
     assert git(root, "rev-parse", "master") == base
     assert git(root, "rev-parse", "task") == task
     assert git(root, "branch", "--show-current") == "master"
