@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -274,16 +275,19 @@ def test_low_level_launch_does_not_pollute_callers_output(
         stderr=subprocess.DEVNULL,
     )
     with process.controlled_termination_signals() as controller:
-        with controller.defer():
-            owner = process.start_owned_process(
-                command, deadline=deadline, signal_controller=controller
-            )
+        owner: process.OwnedProcess | None = None
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    command, deadline=deadline, signal_controller=controller
+                )
             assert owner.process.wait(timeout=5) == 0
             assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
         finally:
-            process.terminate_owned_tree(owner, deadline=deadline)
-            assert process.close_owner(owner, deadline=deadline)
+            with controller.defer():
+                if owner is not None:
+                    process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
     assert capsys.readouterr().out == ""
 
 
@@ -478,55 +482,69 @@ def test_owner_close_deadline_retains_responsibility_until_lock_release(
 
     from h2h_dev_tools import _process_scope as scope_module
 
-    parent = scope_module.PosixScope.create(deadline=time.monotonic() + 3)
-    monkeypatch.setenv(scope_module.ENVIRONMENT_KEY, parent.capability.encode())
-    owner = process.start_owned_process(
-        process.ProcessCommand(
-            "bounded close", (sys.executable, "-c", "pass"), tmp_path
-        ),
-        deadline=time.monotonic() + 3,
-        signal_controller=None,
-    )
-    scope = owner.posix_scope
-    assert scope is not None
-    try:
-        assert owner.process.wait(timeout=3) == 0
-        messages: list[str] = []
-        assert not process.close_owner(
-            owner, deadline=time.monotonic() + 1, diagnostic=messages.append
-        )
-        assert "Unproven process scope retained" in messages.pop()
-        assert parent.has_pending(deadline=time.monotonic() + 1)
-        assert process.wait_for_owned_tree_exit(owner, deadline=time.monotonic() + 1)
-        with (parent.capability.directory / "lock").open("rb") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            started = time.monotonic()
+    deadline = time.monotonic() + 3
+    parent: scope_module.PosixScope | None = None
+    owner: process.OwnedProcess | None = None
+    with process.controlled_termination_signals() as controller:
+        try:
+            with controller.defer():
+                parent = scope_module.PosixScope.create(deadline=deadline)
+                monkeypatch.setenv(
+                    scope_module.ENVIRONMENT_KEY, parent.capability.encode()
+                )
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "bounded close", (sys.executable, "-c", "pass"), tmp_path
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            scope = owner.posix_scope
+            assert scope is not None
+            assert owner.process.wait(timeout=3) == 0
+            messages: list[str] = []
             assert not process.close_owner(
-                owner, deadline=started + 0.04, diagnostic=messages.append
+                owner, deadline=time.monotonic() + 1, diagnostic=messages.append
             )
-            assert time.monotonic() - started < 0.5
-            assert "Process scope lock deadline" in messages.pop()
-            assert scope.proven_empty
-            assert scope.capability.directory.is_dir()
-            assert (
-                parent.capability.directory / "pending" / scope.capability.token
-            ).is_file()
-        assert process.close_owner(owner, deadline=time.monotonic() + 1)
-        assert not scope.capability.directory.exists()
-        assert not parent.has_pending(deadline=time.monotonic() + 1)
-        assert not messages
-    finally:
-        if scope.capability.directory.exists():
-            cleanup_deadline = time.monotonic() + 3
-            assert process.terminate_owned_tree(owner, deadline=cleanup_deadline)
-            assert process.close_owner(owner, deadline=cleanup_deadline)
-        assert owner.process.poll() == 0
-        with pytest.raises(ProcessLookupError):
-            os.killpg(owner.process.pid, 0)
-        assert not parent.has_pending(deadline=time.monotonic() + 1)
-        parent.proven_empty = True  # Synthetic ledger, no parent process launched.
-        parent.close(deadline=time.monotonic() + 1)
-        assert not parent.capability.directory.exists()
+            assert "Unproven process scope retained" in messages.pop()
+            assert parent.has_pending(deadline=time.monotonic() + 1)
+            assert process.wait_for_owned_tree_exit(
+                owner, deadline=time.monotonic() + 1
+            )
+            with (parent.capability.directory / "lock").open("rb") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                started = time.monotonic()
+                assert not process.close_owner(
+                    owner, deadline=started + 0.04, diagnostic=messages.append
+                )
+                assert time.monotonic() - started < 0.5
+                assert "Process scope lock deadline" in messages.pop()
+                assert scope.proven_empty
+                assert scope.capability.directory.is_dir()
+                assert (
+                    parent.capability.directory / "pending" / scope.capability.token
+                ).is_file()
+            assert process.close_owner(owner, deadline=time.monotonic() + 1)
+            assert not scope.capability.directory.exists()
+            assert not parent.has_pending(deadline=time.monotonic() + 1)
+            assert not messages
+        finally:
+            with controller.defer():
+                if owner is not None:
+                    scope = owner.posix_scope
+                    assert scope is not None
+                    if scope.capability.directory.exists():
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert process.close_owner(owner, deadline=deadline)
+                    assert owner.process.poll() is not None
+                    with pytest.raises(ProcessLookupError):
+                        os.killpg(owner.process.pid, 0)
+                if parent is not None:
+                    assert not parent.has_pending(deadline=deadline)
+                    # This exact fixture ledger never launches its own process group.
+                    parent.proven_empty = True
+                    parent.close(deadline=deadline)
+                    assert not parent.capability.directory.exists()
 
 
 def _observe_exited_unreaped(child: subprocess.Popen[bytes], deadline: float) -> None:
@@ -562,19 +580,28 @@ def test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
     real_killpg = os.killpg
     observations: list[tuple[int, int]] = []
     with process.controlled_termination_signals() as controller:
-        with controller.defer():
-            owner = process.start_owned_process(
-                process.ProcessCommand(
-                    "native signal exit barrier",
-                    (sys.executable, "-I", "-S", "-c", child, str(ready), str(release)),
-                    tmp_path,
-                ),
-                deadline=deadline,
-                signal_controller=controller,
-            )
-        scope = owner.posix_scope
-        assert scope is not None
+        owner: process.OwnedProcess | None = None
         try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "native signal exit barrier",
+                        (
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            "-c",
+                            child,
+                            str(ready),
+                            str(release),
+                        ),
+                        tmp_path,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            scope = owner.posix_scope
+            assert scope is not None
             if edge == "term":
                 _observe_exited_unreaped(owner.process, deadline)
             else:
@@ -611,15 +638,178 @@ def test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
             with pytest.raises(ChildProcessError):
                 os.waitpid(owner.process.pid, os.WNOHANG)
         finally:
-            # The OLD regression control also cleans its real exited child,
-            # using the same absolute deadline and the existing absence oracle.
-            release.touch()
-            if not scope.proven_empty:
-                assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
-            assert process.close_owner(owner, deadline=deadline)
+            with controller.defer():
+                # The OLD regression control also cleans its real exited child,
+                # using the same absolute deadline and the existing absence oracle.
+                if owner is not None:
+                    scope = owner.posix_scope
+                    assert scope is not None
+                    release.touch()
+                    if not scope.proven_empty:
+                        assert process.wait_for_owned_tree_exit(
+                            owner, deadline=deadline
+                        )
+                    assert process.close_owner(owner, deadline=deadline)
         assert not scope.capability.directory.exists()
         if scope.parent is not None:
             with scope.parent.locked(deadline=deadline):
                 assert not (
                     scope.parent.directory / "pending" / scope.capability.token
                 ).exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real signal at owner handoff")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("boundary", ["launch", "cleanup"])
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "silent",
+        "close",
+        pytest.param(
+            "native-term",
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="XNU EPERM"),
+        ),
+        pytest.param(
+            "native-kill",
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="XNU EPERM"),
+        ),
+    ],
+)
+def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signum: int,
+    fixture: str,
+    boundary: str,
+) -> None:
+    from h2h_dev_tools import _process_scope as scope_module
+
+    original = process.start_owned_process
+    close = process.close_owner
+    create = scope_module.PosixScope.create
+    close_scope = scope_module.PosixScope.close
+    owners: list[tuple[process.OwnedProcess, float]] = []
+    closed: list[tuple[process.OwnedProcess, float, bool]] = []
+    scopes: list[tuple[scope_module.PosixScope, float]] = []
+    pending: list[int | None] = []
+    controllers: list[process.SignalController | None] = []
+    parents_closed: list[tuple[scope_module.PosixScope, float]] = []
+
+    def send_signal(controller: process.SignalController | None) -> None:
+        os.kill(os.getpid(), signum)
+        assert controller is not None and controller.defer_depth > 0
+        pending.append(controller.pending_signal)
+
+    def observe_scope(*, deadline: float) -> scope_module.PosixScope:
+        scope = create(deadline=deadline)
+        scopes.append((scope, deadline))
+        return scope
+
+    def interrupt(
+        phase: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        owner = original(phase, deadline=deadline, signal_controller=signal_controller)
+        owners.append((owner, deadline))
+        controllers.append(signal_controller)
+        if boundary == "launch":
+            send_signal(signal_controller)
+        return owner
+
+    def record_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        if boundary == "cleanup" and fixture != "close":
+            send_signal(controllers[0])
+        result = close(owner, deadline=deadline, diagnostic=diagnostic)
+        closed.append((owner, deadline, result))
+        return result
+
+    def record_parent_close(scope: scope_module.PosixScope, *, deadline: float) -> None:
+        if scopes and scope is scopes[0][0]:
+            if boundary == "cleanup":
+                send_signal(controllers[0])
+            close_scope(scope, deadline=deadline)
+            parents_closed.append((scope, deadline))
+        else:
+            close_scope(scope, deadline=deadline)
+
+    monkeypatch.setattr(process, "start_owned_process", interrupt)
+    monkeypatch.setattr(process, "close_owner", record_close)
+    if fixture == "close":
+        monkeypatch.setattr(scope_module.PosixScope, "create", observe_scope)
+        monkeypatch.setattr(scope_module.PosixScope, "close", record_parent_close)
+    expected = (
+        KeyboardInterrupt if signum == signal.SIGINT else process.RunnerSignalInterrupt
+    )
+    try:
+        # A regressed controller=None fixture must raise a typed interruption,
+        # not deliver default SIGTERM to the pytest process before rescue.
+        with process.controlled_termination_signals(), pytest.raises(expected):
+            if fixture == "silent":
+                test_low_level_launch_does_not_pollute_callers_output(tmp_path, capsys)
+            elif fixture == "close":
+                test_owner_close_deadline_retains_responsibility_until_lock_release(
+                    tmp_path, monkeypatch
+                )
+            else:
+                test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
+                    tmp_path, monkeypatch, fixture.removeprefix("native-")
+                )
+        assert len(owners) == 1
+        owner, deadline = owners[0]
+        if fixture == "close" and boundary == "cleanup":
+            # The normal body deliberately rejects two closes before proving
+            # and closing the child; cleanup then closes its synthetic parent.
+            assert [result for _, _, result in closed] == [False, False, True]
+            assert all(item is owner and end <= deadline for item, end, _ in closed)
+        else:
+            assert closed == [(owner, deadline, True)]
+        assert owner.process.poll() is not None
+        assert owner.posix_scope is not None
+        assert not owner.posix_scope.capability.directory.exists()
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
+        if fixture == "close":
+            assert len(scopes) == 2 and scopes[1][0] is owner.posix_scope
+            parent = scopes[0][0]
+            assert owner.posix_scope.parent == parent.capability
+            assert parents_closed == [(parent, scopes[0][1])]
+            assert not parent.capability.directory.exists()
+        assert pending == [signum]
+    finally:
+        # Failure-only rescue cannot satisfy the assertions above. Retain the
+        # original deadlines, including this fixture's exact synthetic parent.
+        failure = sys.exception()
+        try:
+            with process.controlled_termination_signals() as controller:
+                with controller.defer():
+                    for owner, deadline in owners:
+                        if not any(
+                            item is owner and result for item, _, result in closed
+                        ):
+                            empty = process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            released = close(owner, deadline=deadline)
+                            assert empty and released
+                    if fixture == "close" and scopes:
+                        parent, parent_deadline = scopes[0]
+                        if parent.capability.directory.exists():
+                            assert not parent.has_pending(deadline=parent_deadline)
+                            # Only this recorded ledger has no launched group.
+                            parent.proven_empty = True
+                            close_scope(parent, deadline=parent_deadline)
+        except BaseException as rescue_error:
+            if failure is None:
+                raise
+            failure.add_note(
+                f"Owner boundary control rescue also failed: {rescue_error}"
+            )

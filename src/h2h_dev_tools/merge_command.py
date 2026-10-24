@@ -9,8 +9,8 @@ import runpy
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
@@ -23,6 +23,7 @@ REVIEW_OWNER_ENVIRONMENT = (
     "H2H_REVIEW_OWNER_SOURCE",
     "H2H_REVIEW_LOCK_TARGET",
     "H2H_REVIEW_PENDING_RECEIPT",
+    "H2H_REVIEW_DEADLINE",
 )
 RECOVERY_TIMEOUT_SECONDS = 10.0
 RECOVERY_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024
@@ -139,9 +140,10 @@ def _run_git(
                 )
 
 
+@contextmanager
 def _review(
     repository: Path, command: tuple[str, ...], environment: dict[str, str]
-) -> int:
+) -> Iterator[int]:
     from . import process
 
     # Classify under ownership before requiring any online-review prerequisites.
@@ -163,7 +165,8 @@ def _review(
             )
         )
         if status != 0:
-            return status
+            yield status
+            return
         output.seek(0)
         scope = output.read().decode("utf-8").strip()
     if scope == "documentation":
@@ -171,59 +174,71 @@ def _review(
             "Documentation-only candidate: online code review is not required.",
             standard_output=True,
         )
-        return 0
+        yield 0
+        return
     if scope != "full":
         process.report_diagnostic(f"merge-command: invalid check scope: {scope}")
-        return 1
+        yield 1
+        return
     if os.name != "posix":
         process.report_diagnostic(
             "merge-command: online code review currently requires POSIX"
         )
-        return 1
+        yield 1
+        return
 
-    from . import code_review
+    from . import code_review, review_execution
 
+    try:
+        timeout = int(environment.get("H2H_CODE_REVIEW_TIMEOUT_SECONDS", "900"))
+        if not 1 <= timeout <= 3600:
+            raise ValueError("Review timeout must be between 1 and 3600 seconds")
+    except ValueError as error:
+        process.report_diagnostic(f"merge-command: {error}")
+        yield 1
+        return
+    deadline = time.monotonic() + timeout
+    environment["H2H_REVIEW_DEADLINE"] = str(deadline)
     reviewer = code_review.Reviewer(repository)
-    with ExitStack() as locks:
-        try:
-            target = reviewer._target(index=True)
-            reviewer._assert_workspace(target)
-            locks.enter_context(reviewer._review_lock(target, exclusive=True))
-            reviewer._receipt_path(target).unlink(missing_ok=True)
-            # Keep both atomic renames on Git metadata's filesystem, including
-            # repositories on a different volume from TMPDIR.
-            pending_directory = locks.enter_context(
-                tempfile.TemporaryDirectory(
-                    prefix="pending-", dir=reviewer._directory()
+    with review_execution.within_deadline(deadline):
+        target = reviewer._target(index=True)
+        reviewer._assert_workspace(target)
+        destination = reviewer._receipt_path(target)
+        directory = reviewer._directory()
+    with ExitStack() as admission:
+        with review_execution.within_deadline(deadline):
+            admission.enter_context(reviewer._review_lock(target, exclusive=True))
+            publication = admission.enter_context(code_review._publication(destination))
+            # Keep atomic renames on Git metadata's filesystem. The pending
+            # directory must finish cleanup before publication can be completed.
+            with tempfile.TemporaryDirectory(prefix="pending-", dir=directory) as name:
+                pending = Path(name) / "receipt.json"
+                environment.update(
+                    H2H_REVIEW_PROCESS_OWNER=str(os.getpid()),
+                    H2H_REVIEW_OWNER_SOURCE=owner_source_digest(),
+                    H2H_REVIEW_LOCK_TARGET=target.key,
+                    H2H_REVIEW_PENDING_RECEIPT=str(pending),
+                    H2H_REVIEW_DEADLINE=str(deadline),
                 )
-            )
-            pending = Path(pending_directory) / "receipt.json"
-        except (code_review.ReviewError, OSError, ValueError) as error:
-            process.report_diagnostic(f"merge-command: {error}")
-            return 1
-        environment.update(
-            H2H_REVIEW_PROCESS_OWNER=str(os.getpid()),
-            H2H_REVIEW_OWNER_SOURCE=owner_source_digest(),
-            H2H_REVIEW_LOCK_TARGET=target.key,
-            H2H_REVIEW_PENDING_RECEIPT=str(pending),
-        )
-        status = _run_owned(
-            process.ProcessCommand(
-                "Code review", command, repository, environment=environment
-            )
-        )
+                status = _run_owned(
+                    process.ProcessCommand(
+                        "Code review", command, repository, environment=environment
+                    ),
+                    hard_deadline=deadline,
+                )
+                if status == 0:
+                    process.report_diagnostic(
+                        "Code review cleanup verified; publishing "
+                        f"{reviewer._receipt_path(target)}",
+                        standard_output=True,
+                        deadline=deadline,
+                    )
+                    reviewer._publish_managed_receipt(target, pending)
+                # The caller writes its owned-tree proof while this transaction
+                # still owns rollback; failed proof I/O cannot leave a passing review.
+                yield status
         if status == 0:
-            try:
-                process.report_diagnostic(
-                    "Code review cleanup verified; publishing "
-                    f"{reviewer._receipt_path(target)}",
-                    standard_output=True,
-                )
-                reviewer._publish_managed_receipt(target, pending)
-            except (code_review.ReviewError, OSError, ValueError) as error:
-                process.report_diagnostic(f"merge-command: {error}")
-                status = 1
-        return status
+            publication.complete(deadline)
 
 
 def _execute(
@@ -235,15 +250,30 @@ def _execute(
     receipt: Path,
     release_workflow: Path | None = None,
 ) -> int:
-    from . import process
+    from . import code_review, process, review_execution, review_plan
 
     environment = without_review_owner(os.environ)
     recovery_deadline = (
         time.monotonic() + RECOVERY_TIMEOUT_SECONDS if recovery else None
     )
+
+    def report(message: str) -> None:
+        # A proof written inside publication covers only work already cleaned.
+        # Revoke it before admitting another diagnostic writer; failed unlink
+        # must stop here, and unknown writer cleanup must leave no stale proof.
+        receipt.unlink(missing_ok=True)
+        review_deadline = environment.get("H2H_REVIEW_DEADLINE")
+        process.report_diagnostic(
+            message,
+            deadline=float(review_deadline)
+            if review_deadline is not None
+            else recovery_deadline,
+        )
+
     try:
         if review:
-            status = _review(repository, command, environment)
+            with _review(repository, command, environment) as status:
+                _write_cleanup_receipt(receipt)
         else:
             status = _run_git(
                 process.ProcessCommand(
@@ -255,12 +285,34 @@ def _execute(
                 recovery=recovery,
                 deadline=recovery_deadline,
             )
+            _write_cleanup_receipt(receipt)
     except process.ProcessOwnershipError:
         return process.TERMINATION_FAILED_EXIT_CODE
-    # An exit status alone cannot distinguish a cleaned interrupt from an owner
-    # killed before/during teardown. Every started phase must complete cleanup
-    # before publishing proof, including classification-only documentation merges.
-    _write_cleanup_receipt(receipt)
+    except (KeyboardInterrupt, process.RunnerSignalInterrupt) as error:
+        if not review:
+            raise
+        # Publication owns signal rollback after all nested commands have been
+        # cleaned. A failed command cleanup raises ProcessOwnershipError above,
+        # so interruption here can report an empty tree. Pre-commit cancellation
+        # revokes review evidence; post-commit cancellation may retain it but
+        # still blocks this merge. Preserve the original signal exit status.
+        report("merge-command: review publication interrupted")
+        status = (
+            process.INTERRUPTED_EXIT_CODE
+            if isinstance(error, KeyboardInterrupt)
+            else 128 + error.signal_number
+        )
+        _write_cleanup_receipt(receipt)
+    except (
+        code_review.ReviewError,
+        review_execution.ExecutionError,
+        review_plan.PlanError,
+    ) as error:
+        # Every nested owner either completed or propagated ownership failure
+        # before this evidence/deadline error; preserve failed status and cleanup.
+        report(f"merge-command: {error}")
+        status = 1
+        _write_cleanup_receipt(receipt)
     if release_workflow is not None and status == 0:
         from . import merge_admission
 
@@ -279,9 +331,11 @@ def _execute(
 
 
 def _write_cleanup_receipt(receipt: Path) -> None:
-    temporary_receipt = receipt.with_suffix(".pending")
-    temporary_receipt.write_text("owned_tree_empty\n", encoding="ascii")
-    temporary_receipt.replace(receipt)
+    # An exit status alone cannot distinguish a cleaned interrupt from an owner
+    # killed before/during teardown. Write only after every started phase is empty.
+    temporary = receipt.with_suffix(".pending")
+    temporary.write_text("owned_tree_empty\n", encoding="ascii")
+    temporary.replace(receipt)
 
 
 def _workflow_diagnostic(message: str, receipt: Path) -> int:

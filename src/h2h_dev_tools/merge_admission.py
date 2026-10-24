@@ -180,6 +180,12 @@ def acquire(repository: Path, state_path: Path, owner_pid: int) -> None:
         raise
 
 
+def check_clean(state_path: Path, worktree: Path) -> None:
+    _load(state_path)
+    if _git(worktree, "status", "--porcelain=v1", "--untracked-files=all", "-z"):
+        raise AdmissionError(f"worktree is not clean: {worktree}")
+
+
 def configure(
     state_path: Path,
     *,
@@ -343,7 +349,9 @@ def _walk_error(error: OSError) -> NoReturn:
 
 
 def _tracked_path(root: Path, relative: Path, tracked: set[bytes]) -> bool:
-    if os.fsencode(relative) in tracked:
+    # Git inventories always use slash separators. as_posix() preserves literal
+    # backslashes and surrogateescaped filename bytes on POSIX.
+    if os.fsencode(relative.as_posix()) in tracked:
         return True
     # A case-only rename can resolve to an existing tracked spelling on native
     # case-insensitive filesystems. Prefer exact directory entries so a distinct
@@ -367,7 +375,7 @@ def _tracked_path(root: Path, relative: Path, tracked: set[bytes]) -> bool:
         actual = actual / exact.name
         if index < len(relative.parts) - 1 and not stat.S_ISDIR(actual.lstat().st_mode):
             return False
-    return os.fsencode(actual.relative_to(root)) in tracked
+    return os.fsencode(actual.relative_to(root).as_posix()) in tracked
 
 
 def _protect_checkout_paths(state: Workflow, *, target_tree: str) -> None:
@@ -573,7 +581,7 @@ def begin(state_path: Path, *, cleanup: bool) -> None:
     replace(state, phase="cleanup" if cleanup else "merging").save(state_path)
 
 
-def capture(state_path: Path) -> None:
+def capture(state_path: Path) -> str | None:
     state = _load(state_path)
     if state.phase != "merging":
         raise AdmissionError("No owned merge invocation awaits candidate capture")
@@ -588,12 +596,14 @@ def capture(state_path: Path) -> None:
         and snapshot["merge_head"] == state.task_oid + "\n"
     ):
         replace(state, phase="candidate", candidate=snapshot).save(state_path)
+        return snapshot["tree"]
     elif _clean_primary(state, snapshot):
         replace(state, phase="prepared").save(state_path)
     else:
         raise AdmissionError(
             "Merge outcome has unknown ownership; candidate and admission retained"
         )
+    return None
 
 
 def recover_abort(state_path: Path) -> None:
@@ -776,6 +786,7 @@ def main(arguments: list[str]) -> int:
         "operation",
         choices=(
             "acquire",
+            "check-clean",
             "configure",
             "switch-primary",
             "begin",
@@ -801,6 +812,10 @@ def main(arguments: list[str]) -> int:
             if args.repository is None or args.owner_pid is None:
                 raise AdmissionError("Acquisition requires repository and workflow PID")
             acquire(args.repository, args.state, args.owner_pid)
+        elif args.operation == "check-clean":
+            if args.worktree is None:
+                raise AdmissionError("Cleanliness check requires its worktree")
+            check_clean(args.state, args.worktree)
         elif args.operation == "configure":
             if any(
                 value is None
@@ -829,6 +844,14 @@ def main(arguments: list[str]) -> int:
                     "Task worktree removal requires its registered path"
                 )
             remove_task_worktree(args.state, args.task_worktree)
+        elif args.operation == "capture":
+            tree = capture(args.state)
+            if tree is not None:
+                # Export the exact owned observation without another Git read
+                # in the shell. Recovery capture does not publish this output.
+                args.state.with_suffix(".tree").write_text(
+                    tree + "\n", encoding="ascii"
+                )
         elif args.operation == "finish":
             # Return the already-verified commit to the shell. Re-reading HEAD
             # there could adopt a later external commit as cleanup authority.
@@ -841,15 +864,14 @@ def main(arguments: list[str]) -> int:
         else:
             {
                 "switch-primary": switch_primary,
-                "capture": capture,
                 "recover-abort": recover_abort,
                 "recover-restore": recover_restore,
                 "validate-release": validate_release,
             }[args.operation](args.state)
     except (AdmissionError, OSError, ValueError, TypeError) as error:
-        # The shell always runs this entry in its canonical bounded recovery
-        # owner, which captures both streams to a regular private file. Do not
-        # launch another diagnostic owner or grant it a new deadline here.
+        # The shell runs this entry inside its canonical owner. Recovery
+        # captures both streams under its original deadline; never launch
+        # another diagnostic owner or grant it a new deadline here.
         import sys
 
         print(f"git-flow-merge admission: {error}", file=sys.stderr)

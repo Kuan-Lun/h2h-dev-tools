@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-from h2h_dev_tools import bundle, merge_command
+from h2h_dev_tools import (
+    bundle,
+    code_review,
+    merge_command,
+    process,
+    review_execution,
+    review_plan,
+)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
@@ -75,16 +85,17 @@ def test_recovery_never_waits_for_an_open_undrained_diagnostic_pipe(
         os.close(write_descriptor)
 
 
+@pytest.mark.parametrize("poisoned_source_package", ["merge_command.py"], indirect=True)
 @pytest.mark.parametrize("failed_operation", ["seek", "read", "close"])
 def test_recovery_diagnostic_io_error_preserves_result_and_cleanup_receipt(
-    tmp_path: Path, failed_operation: str
+    tmp_path: Path, failed_operation: str, poisoned_source_package: Path
 ) -> None:
     receipt = tmp_path / "cleanup"
     marker = tmp_path / "completed"
-    module_root = str(Path(merge_command.__file__).resolve().parents[1])
     script = (
-        "import sys\n"
-        f"sys.path.insert(0, {module_root!r})\n"
+        "import runpy\nfrom pathlib import Path\n"
+        f"package = Path({str(poisoned_source_package)!r})\n"
+        "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
         "from h2h_dev_tools import merge_command\n"
         "original = merge_command.tempfile.TemporaryFile\n"
         "class BrokenReplay:\n"
@@ -171,7 +182,13 @@ def test_recovery_finishes_before_replaying_bounded_unterminated_output(
     assert marker.exists()
     assert receipt.read_text() == "owned_tree_empty\n"
     assert len(diagnostic_bytes) < 70_000
-    assert b"recovery diagnostics truncated after 64 KiB" in diagnostic_bytes
+    truncation = b"merge-command: recovery diagnostics truncated after 64 KiB"
+    assert truncation in diagnostic_bytes
+    # A writable sink receives the complete bounded prefix, even if the low-level
+    # diagnostic transport must split it into smaller messages for the platform.
+    start = diagnostic_bytes.index(b"o" * 1024)
+    prefix = diagnostic_bytes[start : diagnostic_bytes.index(truncation)]
+    assert prefix == b"o" * (64 * 1024) + b"\n"
 
 
 def test_exported_git_owner_passes_strict_typing_without_installed_toolkit(
@@ -205,6 +222,30 @@ def test_exported_git_owner_passes_strict_typing_without_installed_toolkit(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "interrupt", [KeyboardInterrupt(), process.RunnerSignalInterrupt(15)]
+)
+def test_git_owner_interruption_cannot_claim_review_publication_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: BaseException
+) -> None:
+    receipt = tmp_path / "cleanup"
+
+    def interrupt_git(
+        phase: process.ProcessCommand, *, recovery: bool, deadline: float | None
+    ) -> int:
+        del phase
+        assert not recovery
+        assert deadline is None
+        raise interrupt
+
+    monkeypatch.setattr(merge_command, "_run_git", interrupt_git)
+    with pytest.raises(type(interrupt)):
+        merge_command._execute(
+            tmp_path, ("git", "status"), review=False, recovery=False, receipt=receipt
+        )
+    assert not receipt.exists()
+
+
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le"])
 @pytest.mark.parametrize("shape", ["split-unicode", "trailing-newlines", "truncated"])
 def test_recovery_replay_preserves_exact_decoded_text_and_sink_encoding(
@@ -228,3 +269,227 @@ def test_recovery_replay_preserves_exact_decoded_text_and_sink_encoding(
     sink.flush()
     assert binary.getvalue() == expected.encode(encoding)
     sink.close()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        KeyboardInterrupt(),
+        process.RunnerSignalInterrupt(signal.SIGTERM),
+        code_review.ReviewError("evidence rejected"),
+        review_execution.ExecutionError("deadline exhausted"),
+        review_plan.PlanError("coverage rejected"),
+    ],
+)
+@pytest.mark.parametrize("diagnostic", ["complete", "unknown", "unlink-fails"])
+def test_post_proof_diagnostic_revokes_receipt_before_new_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    diagnostic: str,
+) -> None:
+    receipt = tmp_path / "cleanup"
+    deadline = time.monotonic() + 10
+    called: list[str] = []
+    unknown = process.ProcessOwnershipError("diagnostic cleanup unknown")
+    unlink_failure = OSError("cleanup proof cannot be revoked")
+
+    @contextmanager
+    def after_proof(
+        repository: Path, command: tuple[str, ...], environment: dict[str, str]
+    ) -> Iterator[int]:
+        del repository, command
+        environment["H2H_REVIEW_DEADLINE"] = str(deadline)
+        yield 0
+        assert receipt.read_text() == "owned_tree_empty\n"
+        raise failure
+
+    def report(message: str, *, deadline: float | None) -> None:
+        assert not receipt.exists(), "old proof survived new diagnostic admission"
+        assert deadline == expected_deadline
+        called.append(message)
+        if diagnostic == "unknown":
+            raise unknown
+
+    original_unlink = Path.unlink
+
+    def unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path == receipt:
+            raise unlink_failure
+        original_unlink(path, missing_ok=missing_ok)
+
+    expected_deadline = deadline
+    monkeypatch.setattr(merge_command, "_review", after_proof)
+    monkeypatch.setattr(process, "report_diagnostic", report)
+    if diagnostic == "unlink-fails":
+        monkeypatch.setattr(Path, "unlink", unlink)
+    if diagnostic != "complete":
+        expected = unknown if diagnostic == "unknown" else unlink_failure
+        with pytest.raises(type(expected)) as raised:
+            merge_command._execute(
+                tmp_path, ("review",), review=True, recovery=False, receipt=receipt
+            )
+        assert raised.value is expected
+        if diagnostic == "unlink-fails":
+            assert not called
+            assert receipt.read_text() == "owned_tree_empty\n"
+        else:
+            assert len(called) == 1
+            assert not receipt.exists()
+    else:
+        status = merge_command._execute(
+            tmp_path, ("review",), review=True, recovery=False, receipt=receipt
+        )
+        assert status == (
+            130
+            if isinstance(failure, KeyboardInterrupt)
+            else 143
+            if isinstance(failure, process.RunnerSignalInterrupt)
+            else 1
+        )
+        assert len(called) == 1
+        assert receipt.read_text() == "owned_tree_empty\n"
+
+
+_POST_PROOF_DIAGNOSTIC_ACTOR = """
+import json, os, runpy, signal, subprocess, sys, time
+from contextlib import contextmanager
+from pathlib import Path
+package, state = map(Path, sys.argv[1:3])
+deadline = float(sys.argv[3])
+scenario = sys.argv[4]
+runpy.run_path(str(package / 'source_loader.py'))['load_package'](
+    package, 'h2h_dev_tools')
+from h2h_dev_tools import code_review, merge_command, process
+from h2h_dev_tools import _process_diagnostic, _process_scope
+# Model the normal standalone shell-to-launcher boundary. The test guardian
+# still owns the actual process group; this does not model dead nested owners.
+os.environ.pop(_process_scope.ENVIRONMENT_KEY, None)
+receipt = state / 'cleanup'
+real_popen = subprocess.Popen
+def observe_popen(command, **kwargs):
+    child = real_popen(command, **kwargs)
+    assert command[5] == _process_diagnostic._WRITER
+    marker = state / 'writer.pending'
+    marker.write_text(json.dumps(dict(
+        pid=child.pid, group=os.getpgid(child.pid), launcher=os.getpid(),
+        launcher_group=os.getpgrp(), receipt_exists=receipt.exists())))
+    marker.replace(state / 'writer.json')
+    # Hold at the true admitted writer boundary, before its owner can reap it.
+    # The pipe is full and left unread. The original absolute fixture deadline
+    # bounds even this injected pause; production diagnostic budgets are intact.
+    while time.monotonic() < deadline:
+        time.sleep(0.001)
+    raise RuntimeError('test did not kill the launcher at its observed boundary')
+subprocess.Popen = observe_popen
+@contextmanager
+def review(repository, command, environment):
+    environment['H2H_REVIEW_DEADLINE'] = str(deadline)
+    with code_review._publication(state / 'review-receipt'):
+        yield 0
+        assert receipt.read_text() == 'owned_tree_empty\\n'
+        if scenario == 'signal':
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            raise code_review.ReviewError('evidence failed after cleanup proof')
+merge_command._review = review
+raise SystemExit(merge_command._execute(
+    state, ('review',), review=True, recovery=False, receipt=receipt))
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real same-group POSIX writer death")
+@pytest.mark.parametrize("scenario", ["signal", "evidence"])
+def test_killed_post_proof_launcher_leaves_no_proof_for_live_writer(
+    tmp_path: Path, scenario: str
+) -> None:
+    read_descriptor, write_descriptor = os.pipe()
+    deadline = time.monotonic() + 15
+    owner: process.OwnedProcess | None = None
+    failure: BaseException | None = None
+    try:
+        os.set_blocking(write_descriptor, False)
+        try:
+            while True:
+                os.write(write_descriptor, b"x" * 8192)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_descriptor, True)
+        with process.controlled_termination_signals() as controller:
+            try:
+                with controller.defer():
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "post-proof diagnostic launcher",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                _POST_PROOF_DIAGNOSTIC_ACTOR,
+                                str(Path(process.__file__).resolve().parent),
+                                str(tmp_path),
+                                str(deadline),
+                                scenario,
+                            ),
+                            tmp_path,
+                            stdout=subprocess.DEVNULL,
+                            stderr=write_descriptor,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                marker = tmp_path / "writer.json"
+                while not marker.exists():
+                    assert owner.process.poll() is None
+                    assert time.monotonic() < deadline - 6
+                    time.sleep(0.001)
+                writer = json.loads(marker.read_text())
+                assert writer["group"] == writer["launcher_group"] == owner.process.pid
+                os.kill(writer["pid"], 0)
+                owner.process.kill()
+                assert (
+                    owner.process.wait(timeout=max(0, deadline - time.monotonic()))
+                    == -9
+                )
+                os.kill(writer["pid"], 0)
+                tree_empty = process.wait_for_owned_tree_exit(
+                    owner, deadline=min(deadline, time.monotonic() + 0.1)
+                )
+                receipt_exists = (tmp_path / "cleanup").exists()
+                (tmp_path / "before-rescue.json").write_text(
+                    json.dumps(
+                        dict(
+                            writer,
+                            tree_empty=tree_empty,
+                            receipt_after_kill=receipt_exists,
+                        )
+                    )
+                )
+                assert not tree_empty, (
+                    "the blocked writer must outlive its killed launcher"
+                )
+                assert not receipt_exists, (
+                    "stale proof would let the shell recover early"
+                )
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                with controller.defer():
+                    if owner is not None:
+                        try:
+                            empty = process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            closed = process.close_owner(owner, deadline=deadline)
+                            assert empty and closed, "Post-proof writer rescue unproven"
+                        except BaseException as error:
+                            if failure is None:
+                                raise
+                            failure.add_note(
+                                f"Post-proof writer rescue failed: {error}"
+                            )
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)

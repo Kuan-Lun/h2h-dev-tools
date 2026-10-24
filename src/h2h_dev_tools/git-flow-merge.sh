@@ -30,13 +30,10 @@ usage() {
 }
 
 assert_clean() {
-    local status_output worktree=$1
+    local worktree=$1
 
-    status_output="$(
-        git -C "$worktree" status --porcelain=v1 --untracked-files=all
-    )" || fail "could not inspect worktree status: $worktree"
-    [[ -z "$status_output" ]] \
-        || fail "worktree is not clean: $worktree"
+    run_workflow_state check-clean --worktree "$worktree" \
+        || fail "could not verify clean worktree: $worktree"
 }
 
 assert_no_operation() {
@@ -214,12 +211,12 @@ HOOK
 
 run_workflow_state() {
     # Capture/comparison and recovery retain the ten-second owner budget.
-    # Merge planning and primary checkout can run normal Git hooks/drivers.
-    # Both use the existing outer lifetime, not a failure-recovery budget.
+    # Cleanliness checks, merge planning and checkout can run Git callbacks.
+    # They use the existing outer lifetime, not a failure-recovery budget.
     # Always use the original copied bootstrap, even after task removal.
     local state_action=1 owner=process
     case "${1-}" in
-        begin | switch-primary) state_action=0 ;;
+        begin | switch-primary | check-clean) state_action=0 ;;
         release) owner=release; shift; set -- validate-release "$@" ;;
     esac
     run_tracked "$owner" "${merge_worktree:-$repository_root}" \
@@ -565,7 +562,9 @@ mkdir "$candidate_directory"
 source_relative="${source_directory#"$repository_root"/}"
 [[ "$source_relative" != "$source_directory" ]] \
     || fail 'process owner source is outside the task repository'
-candidate_tree="$(git -C "$merge_worktree" write-tree)"
+candidate_tree="$(cat "${workflow_state%.json}.tree")" \
+    || fail 'could not read captured merge candidate tree'
+[[ -n "$candidate_tree" ]] || fail 'captured merge candidate tree is empty'
 archive_paths=("$source_relative")
 if [[ "$source_relative" == scripts/_shared/h2h_dev_tools ]]; then
     # Snapshot source bootstrap also verifies the repository's explicit

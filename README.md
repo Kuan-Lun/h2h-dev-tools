@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.8.0 is available on your selected
+Use Python 3.14 or newer. When version 0.9.0 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.8.0
+python -m pip install h2h-dev-tools==0.9.0
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.8.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.9.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -76,6 +76,7 @@ current-closure checks; none executes a compatibility fallback or downloads a wh
 | `formal` | Pinned TLC download and offline host/Docker execution |
 | `code-review` | Exact-candidate Codex review and offline evidence verification |
 | `test-support` | Portable executable Python command fixtures |
+| `review-test-support` | Explicitly synthetic V3 responses for disposable workflow fixtures |
 
 Disposable command fixtures may select `test-support` and call
 `executable_fixture.write_python_executable(path, source, python=...)`; always use its returned
@@ -102,6 +103,19 @@ Only the explicit launcher, POSIX payload and optional wrapper files are replace
 The helper does not execute fixtures, change console code pages, add Python startup
 flags or change the selected interpreter. Native Windows path, argument and stdio behavior
 is checked by the Windows platform workflow; POSIX checks do not prove it.
+
+Disposable workflow tests may explicitly select `review-test-support`. After
+bootstrapping that repository's verified snapshot, call
+`review_test_support.synthetic_review_response_source()` and include the returned
+self-contained module in a fake CLI script. Its
+`synthetic_review_response(prompt)` projects the V3 assignment into synthetic raw
+output; local fixtures retain CLI arguments, failure injection, event tracking and
+output-file handling. Serialize the result with compact UTF-8 JSON
+(`json.dumps(result, ensure_ascii=False, separators=(",", ":"))`) to preserve the
+assignment's wire bound. The builder rejects malformed or legacy prompts and does
+not perform code review or write receipts. Production `code-review` and `git-flow`
+components do not depend on this test support. Never use a fake CLI for actual
+candidate review; genuine review and coverage validators remain unchanged.
 
 Schema-1 snapshots from 0.1 use a fixed payload and are not accepted by normal
 schema-2 verification or sync. After declaring components, convert once:
@@ -152,7 +166,11 @@ bytecode caches may exist but are never executed by this loader; `-B` alone only
 prevents new cache writes. Repeated bootstrap of the same namespace, directory
 and bytes preserves existing module and class identity. A changed source set,
 conflicting directory or package imported before bootstrap is rejected; start a
-fresh process after an update.
+fresh process after an update. Review fingerprints use that original loader
+registration, rechecking the complete source set before candidate capture and
+final verification. Updating and staging source after import cannot relabel old
+code as the new candidate; a fresh process is required. Historical Git candidate
+blobs remain distinct from the executed source identity.
 
 Qualified namespaces also pin every parent package to its explicit directory.
 Parent initializers remain repository-owned and outside the snapshot manifest;
@@ -495,17 +513,19 @@ results, diagnostics and exact-candidate evidence in Git metadata remain separat
 and continue to follow the same verification rules.
 The merge launcher first owns classification in a dedicated process group and
 proves that group empty. Only a full-profile candidate then requires the local
-review entry and starts the reviewer, CLI-version preflight and Codex descendants
-in their next owned group. Documentation needs neither the review entry nor Codex.
+review entry and starts the reviewer in its next owned group. The reviewer registers
+nested cleanup obligations before starting CLI-version, shard or integration owners.
+Documentation needs neither the review entry nor Codex.
 The owner is exported from the actual staged candidate after the three-way merge,
 so an independently updated primary does not require rebasing the task. The owner
 holds the candidate review lock through cleanup and publication. Managed reviewers
 write only pending evidence; the owner publishes it after successful group exit
 and fresh candidate/coverage validation. The managed reviewer validates its direct
 parent, group leader and complete owner source closure before sharing ownership.
-It does not create a separate Codex session that could survive
-the reviewer's unexpected death. The launcher proves group cleanup before Git
-aborts; missing cleanup evidence retains the candidate for inspection. Standalone
+Every separate Codex session has a registered canonical owner. Unexpected owner
+death cannot turn an empty outer group into proof of nested cleanup. The launcher
+proves all groups and obligations empty before Git aborts; missing cleanup evidence
+retains the candidate and scope for inspection. Standalone
 review instead owns its CLI-version and Codex command groups directly. Even a
 successful leader exit requires bounded proof that its group is empty before
 standalone review evidence can be published.
@@ -546,6 +566,97 @@ initializers. The default timeout is 900 seconds
 when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
 review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not
 converted: run the new review to establish evidence for the current implementation.
+V3 also rejects V2 evidence and partial-run continuation. Updating the shared reviewer
+closure requires a fresh full-repository baseline in every updated consumer; historical
+receipts remain historical evidence, and are never rewritten into new coverage.
+
+A deterministic plan binds every tracked path, mode, blob and text byte range.
+Fresh-context shards contain at most 32 units, each at most 64 KiB, packed into
+384 KiB assignments. Up to four registered owners run concurrently. Every shard
+can read any raw candidate source; all shards must pass, followed by a separate
+cross-module integration review (a single shard performs both roles). Coverage is
+reviewer attestation, not machine proof that a model read or understood the bytes.
+The aggregate deadline includes planning, preflight, output validation and cleanup;
+it is never multiplied by shard count. Before review starts, the full inventory and
+id/path/origin/member/range map determine each shard's UTF-8 JSON handoff budget.
+Every accepted handoff, together with the policy and integration assignment,
+must fit the declared prompt bound; no contracts or coverage are truncated.
+Each assignment also declares its response limits. Shard-only output is bounded
+to 512 KiB; integration and combined single-shard output to 1 MiB, including JSON
+escaping and whitespace. Packing reserves exact keys, identities and every required
+related source, plus up to 2 KiB of decoded UTF-8 per unit method, 8 KiB for the
+summary and 8 KiB per integration analysis, allowing six wire bytes per text byte.
+Each of the six integration obligations can cite every known source once.
+Contracts retain their per-shard wire budget, at most eight 1 KiB strings;
+integration output has a fixed 8256-byte contracts cap with no downstream handoff.
+Repeated paths within one source list are rejected. Optional extra references,
+findings and pretty-printing share the same response bound. A combined response
+that cannot fit is split into shard and integration stages; if one unit or the
+complete integration still cannot fit, planning fails before review admission.
+Planning admits only bounded inputs before retaining review content. Each Git
+inventory, diff or configuration output is limited to 2 MiB and each inventory
+or selected path set to 4096 entries. Git metadata is spooled to a temporary file
+under the same command deadline before a bounded read; this controls planner
+memory, not a filesystem disk quota. Selected raw blob sizes total at most
+64 MiB, counting every path even when multiple paths share one blob. Actual gzip
+expansion totals at most 128 MiB across the plan, including tar headers and
+padding; each read is bounded by both the artifact envelope and the remaining
+aggregate allowance. Declared maxima are not charged as actual expanded bytes.
+
+Retained examination views total at most 32 MiB. Before decoding and appending
+units, planning also limits the count to 4096 and their cumulative serialized
+metadata to 8 MiB; repeated reasons and related paths count for every unit.
+Each view is hashed once, and every unit retains that same complete-view hash.
+Sampled JSON members are limited before DOM parsing to 16 MiB, a conservative
+1,000,000 structural slots and nesting depth 64. The preflight uses the standard
+JSON byte-encoding detection, preserving UTF-8/16/32 input and ignoring quoted
+and escaped punctuation. Complete syntax is still validated by the standard
+parser. Each member's DOM is released before parsing the next member. These are
+explicit planner memory and work admission limits, not an operating-system RSS
+limit. Exceeding any limit rejects the plan without truncating coverage, sampling
+additional source or publishing a partial receipt.
+
+Multi-shard review reserves 20% of that budget,
+up to 600 seconds, for integration. Managed review also reserves the final 5%
+(up to 30 seconds, within that same total) for owner verification and publication.
+Any failing/incomplete/missing shard, candidate
+drift, malformed range, late output or unproven owner blocks publication and stops
+admission; all active owners are cleaned under the same remaining deadline.
+
+Tracked binary artifacts require repository-owned declarations, for example:
+
+```toml
+[[tool.h2h-dev-tools.review.artifacts]]
+path = "evidence/results.tar.gz"
+role = "historical-evidence"
+format = "tar-gzip"
+related-paths = ["scripts/collect.py", "tests/test_evidence.py"]
+reason = "Inspect the archived collector and report structure; do not claim numerical reruns."
+max-expanded-bytes = 33554432
+max-members = 64
+sampled-data-members = ["reports/numeric-results.json"]
+```
+
+Roles are `generated`, `fixture` or `historical-evidence`; formats are `opaque`,
+`gzip` or `tar-gzip`. ZIP artifact declarations are unsupported and rejected before
+archive parsing. This review-format restriction does not affect wheel packaging
+or consumer CBZ support. Every related path must exist in the same authority tree.
+Expanded bytes are bounded by 128 MiB and member count by 4096; single-payload
+formats require one member. Inventory covers every archive member's path, type,
+mode, size and hash without extracting, following links or executing/deserializing
+payloads. Tar inventory requires a complete two-zero-block end marker followed
+only by whole zero-padding blocks. Concatenated streams, non-padding trailing
+bytes and invalid or truncated later headers fail closed, even when the standard
+reader would stop successfully at an earlier member. USTAR, GNU and PAX metadata
+remain supported within the same limits. Unsafe names, links, special files,
+undeclared binary and exceeded limits fail closed. Embedded source is always examined
+in full. Only exact nonexecutable
+JSON names in a historical archive's optional `sampled-data-members` roster use
+complete syntax parsing plus bounded structure/value samples; unlisted JSON remains
+full text. Samples and hashes do not prove historical numerical correctness.
+Generated opaque payloads require examination of their declared generator, restricted
+decoder, validator, consumer and source correspondence. Binary deletions and rename
+sources use the primary parent's declaration and related-source identities.
 
 Process-owner and code-review human diagnostics use a small, finite writer
 process for POSIX descriptors and Windows pipes. It never changes inherited FD

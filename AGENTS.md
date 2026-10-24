@@ -275,24 +275,44 @@
   `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
 - Merge 的 review stage 先以獨立 owned process group 完成分類；確認該組清空
   後，只有 full profile 才要求 local review 入口、取得 candidate lock 並啟動
-  reviewer。純文件不要求 local review 入口或 Codex。CLI version preflight、
-  reviewer 與 Codex 由外部 owner 管理同一 process group，reviewer 驗證 parent PID 及 group leader
-  與 owner execution closure 完全符合 candidate 後才共用 ownership；owner 從真正
+  reviewer。純文件不要求 local review 入口或 Codex。Reviewer 驗證 parent PID、
+  group leader 與 owner execution closure 後，才繼承外層 ownership。CLI version、
+  fresh-context shards 及 integration 使用先登記 nested cleanup obligation 的
+  canonical owners；最多四片並行，不得啟動未登記的 detached session。Owner 從真正
   staged candidate 匯出完整 review closure，不要求 task 包含最新 primary。
   Owner 持有 candidate lock 至清理及 evidence publication 完成；managed reviewer
   只產生 pending result，整組成功退出且 candidate／coverage 重驗後才發布 receipt。
-  不得建立逃出該 owner 的第二個 Codex session。Reviewer
-  非預期死亡仍須清理整組，取得 cleanup receipt 後才可 abort；缺少證據保留
+  任一分片失敗即關閉 admission 並清理所有 active owners。Reviewer
+  非預期死亡時，不得以外層 group 清空代替 nested obligations；取得整棵樹
+  cleanup proof 後才可 abort，缺少證據保留
   candidate。Standalone review 自行管理 CLI version 與 Codex command groups；
   正常退出亦須以 bounded cleanup 證明整組清空，無法證明時不發布 passing receipt。
 - Evidence 存於 Git common metadata 的 `h2h-review`，綁定 exact tree、ordered
   parents、本檔、local reviewer 與 merge review 入口及 shared reviewer、process ownership、
-  change-scope 及完整匯出 dependency closure 實作。V2 evidence 另綁 scope 與
-  full baseline reference；不能把
-  舊差異 receipt 轉成完整專案審查證明。`--revision` 可
+  change-scope 及完整匯出 dependency closure 實作。V3 evidence 另綁 scope、
+  full baseline reference、immutable unit manifest、每片 attestation 與跨模組
+  integration。V2 不轉換、不沿用；partial run 不續接，closure 更新後須重建
+  full-repository baseline。不能把舊 receipt 轉成全專案審查證明。`--revision` 可
   審查或驗證既有 commit；正式合併必須使用 `--index`。同 candidate 只允許一個
   run；重疊要求拒絕，不取代正在執行者。已接納的重新 run 先廢止舊紀錄，
   失敗不得沿用舊結果；POSIX verify 在 review 執行中也拒絕。
+- 全專案 manifest 涵蓋所有 tracked path/mode/blob 與文字半開 byte ranges；
+  每片可讀完整 candidate，最後 integration 必須讀 raw sources 並檢查跨片契約。
+  Planning 依完整 inventory 與 coverage map 預算每片 contracts 的 UTF-8 JSON 大小，
+  最壞可接受交接與 root policy 必須先確認可容納；不得事後截斷契約或覆蓋範圍。
+  unit coverage 是 reviewer attestation，不是 hash、tool-call count 或模型實讀
+  語義的機器證明。缺片、重複、wrong target、finding 或 incomplete 皆 fail closed。
+  Planning、preflight、四片排程、validation、integration 及 cleanup 共用單一
+  monotonic deadline；多片保留 20%（至多 600 秒）給 integration，不乘上片數。
+  Managed reviewer 另在總預算最後保留 5%（至多 30 秒）供外層重驗及發布，
+  不增加 deadline；逾時完成的 publication 會撤回，不能留下 passing receipt。
+- Binary 必須在 `[tool.h2h-dev-tools.review]` 的 artifacts 宣告 exact path、role、
+  format、related-paths、reason、max-expanded-bytes 與 max-members。安全 inventory
+  不 extract、不 follow links、不 execute/unpickle；未知或超限輸入 fail closed。
+  Embedded source 必須全文審查。只有 historical-evidence archive 明列的
+  sampled-data-members 可作完整 JSON syntax/hash 與有限結構／值抽樣；不宣稱
+  重算歷史數值。Generated data 須審查 generator、restricted decoder、validator、
+  consumer 與 source correspondence。增量刪除使用 primary parent 的歷史宣告。
 - `review-code.py verify` 只離線驗證，絕不啟動 Codex。既有 full release gate
   在 checks 前後驗證同一 candidate 的 review；不得另建第二套 gate。Review
   與測試是不同證據，AI 未發現缺陷不是正確性證明，local receipt 不是防竄改
