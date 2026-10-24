@@ -246,10 +246,12 @@ def run_invocations(
     completed: list[dict[str, object]] = []
     next_index = 0
     execution_deadline = deadline - CLEANUP_RESERVE
+    collection_ownership_error: process.ProcessOwnershipError | None = None
     with process.controlled_termination_signals() as controller:
 
         def collect_completed() -> None:
             """Validate every exited owner before admitting further work."""
+            nonlocal collection_ownership_error
             for pid, item in list(active.items()):
                 invocation, owned = item.invocation, item.owned
                 code = owned.process.poll()
@@ -257,9 +259,19 @@ def run_invocations(
                     continue
                 remaining()
                 with controller.defer():
-                    empty = process.wait_for_owned_tree_exit(
-                        owned, deadline=min(deadline, time.monotonic() + 0.25)
-                    )
+                    try:
+                        empty = process.wait_for_owned_tree_exit(
+                            owned,
+                            deadline=execution_deadline,
+                            poll_deadline=min(
+                                execution_deadline, time.monotonic() + 0.25
+                            ),
+                        )
+                    except process.ProcessOwnershipError as error:
+                        # This owner is already registered in active. Only the
+                        # complete final cleanup can upgrade its failed probe.
+                        collection_ownership_error = error
+                        raise
                     if not empty:
                         raise ExecutionError(
                             f"Review leader left surviving descendants: {invocation.id}"
@@ -387,4 +399,6 @@ def run_invocations(
                             deadline=cleanup_deadline,
                             signal_controller=controller,
                         )
+                if collection_ownership_error is not None:
+                    collection_ownership_error.cleanup_proven = True
     return completed

@@ -708,3 +708,231 @@ def test_finished_owner_closure_uses_explicit_phase_deadlines(
     assert close_deadlines[0] == deadline - execution.CLEANUP_RESERVE
     assert diagnostic_writes == []
     _empty(owners)
+
+
+@pytest.mark.parametrize(
+    "outcome", ["released", "execution-cutoff", "invalid-token", "diagnostic-failure"]
+)
+def test_completed_review_owner_uses_phase_budget_for_scope_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    import threading
+
+    from h2h_dev_tools import _process_scope
+
+    deadline = time.monotonic() + 8
+    phase_deadline = deadline - execution.CLEANUP_RESERVE
+    owners: list[process.OwnedProcess] = []
+    collected_errors: list[process.ProcessOwnershipError] = []
+    waits: list[tuple[float, float | None]] = []
+    thread_errors: list[BaseException] = []
+    locked = threading.Event()
+    collecting = threading.Event()
+    release = threading.Event()
+    contender: threading.Thread | None = None
+    start = process.start_owned_process
+    wait = process.wait_for_owned_tree_exit
+    terminate = process.terminate_owned_tree
+    close_admission = _process_scope.PosixScope.close_admission
+    diagnostic_failure = process.ProcessOwnershipError("new diagnostic cleanup unknown")
+    validated: list[str] = []
+
+    def contend(scope: _process_scope.PosixScope) -> None:
+        try:
+            # This is the owner's actual flock, held by a distinct thread with
+            # its own descriptor, not a fake clock or replaced ledger method.
+            with scope.capability.locked(deadline=deadline):
+                locked.set()
+                assert collecting.wait(timeout=process.seconds_remaining(deadline))
+                if outcome == "invalid-token":
+                    (scope.capability.directory / "token").write_text("invalid token")
+                until = (
+                    phase_deadline + 0.05
+                    if outcome in {"execution-cutoff", "diagnostic-failure"}
+                    else time.monotonic() + 0.5
+                )
+                release.wait(timeout=max(0, min(deadline, until) - time.monotonic()))
+        except BaseException as error:
+            thread_errors.append(error)
+            locked.set()
+
+    def launch(*args: Any, **kwargs: Any) -> process.OwnedProcess:
+        nonlocal contender
+        owner = start(*args, **kwargs)
+        owners.append(owner)
+        # Force collection of a genuinely exited owner while its scope is busy.
+        # run_invocations keeps this handoff inside its signal deferral.
+        assert owner.process.wait(timeout=process.seconds_remaining(deadline)) == 0
+        assert owner.posix_scope is not None
+        contender = threading.Thread(target=contend, args=(owner.posix_scope,))
+        contender.start()
+        assert locked.wait(timeout=process.seconds_remaining(deadline))
+        assert not thread_errors
+        return owner
+
+    def observe_admission(scope: _process_scope.PosixScope, *, deadline: float) -> None:
+        if owners and scope is owners[0].posix_scope:
+            collecting.set()
+        close_admission(scope, deadline=deadline)
+
+    def observe_wait(owner: process.OwnedProcess, **kwargs: Any) -> bool:
+        waits.append((kwargs["deadline"], kwargs.get("poll_deadline")))
+        try:
+            return wait(owner, **kwargs)
+        except process.ProcessOwnershipError as error:
+            collected_errors.append(error)
+            raise
+
+    def stop(owner: process.OwnedProcess, **kwargs: Any) -> bool:
+        if outcome == "diagnostic-failure":
+            kwargs["diagnostic"]("Cleanup finished with a diagnostic to emit")
+        return terminate(owner, **kwargs)
+
+    def fail_diagnostic(*args: Any, **kwargs: Any) -> None:
+        raise diagnostic_failure
+
+    monkeypatch.setattr(_process_scope.PosixScope, "close_admission", observe_admission)
+    monkeypatch.setattr(process, "start_owned_process", launch)
+    monkeypatch.setattr(process, "wait_for_owned_tree_exit", observe_wait)
+    if outcome == "diagnostic-failure":
+        monkeypatch.setattr(process, "terminate_owned_tree", stop)
+        monkeypatch.setattr(process, "report_diagnostic", fail_diagnostic)
+    with process.controlled_termination_signals() as controller:
+        try:
+            failure: Exception | None = None
+            results: list[dict[str, object]] | None = None
+            try:
+                results = execution.run_invocations(
+                    tmp_path,
+                    [_invocation(tmp_path, "finished")],
+                    deadline=deadline,
+                    validate=lambda item: validated.append(item.id),
+                )
+            except Exception as error:
+                failure = error
+            assert len(owners) == 1
+            assert contender is not None
+            contender.join(timeout=process.seconds_remaining(deadline))
+            assert not contender.is_alive()
+            assert not thread_errors
+            scope = owners[0].posix_scope
+            assert scope is not None
+            if outcome == "invalid-token":
+                assert isinstance(failure, process.ProcessOwnershipError)
+                assert not failure.cleanup_proven
+                assert len(collected_errors) == 1
+                assert not collected_errors[0].cleanup_proven
+                cause = collected_errors[0].__cause__
+                assert isinstance(cause, _process_scope.ScopeError)
+                assert "identity changed" in str(cause)
+                assert scope.capability.directory.exists()
+                assert not scope.proven_empty
+                assert owners[0].process.poll() == 0
+                with pytest.raises(ProcessLookupError):
+                    os.killpg(owners[0].process.pid, 0)
+            else:
+                # Before fixture rescue: both real process absence and the
+                # canonical scope/parent-obligation closure must already hold.
+                _empty(owners)
+                if outcome == "released":
+                    assert failure is None, {
+                        "failure": repr(failure),
+                        "validated": validated,
+                        "scope_removed_before_rescue": True,
+                    }
+                    assert results == [
+                        {"id": "finished", "exit_code": 0, "owned_tree_empty": True}
+                    ]
+                    assert validated == ["finished"]
+                elif outcome == "execution-cutoff":
+                    assert len(collected_errors) == 1
+                    assert failure is collected_errors[0]
+                    assert failure.cleanup_proven
+                    assert isinstance(failure.__cause__, _process_scope.ScopeError)
+                    assert "lock deadline" in str(failure.__cause__)
+                else:
+                    assert len(collected_errors) == 1
+                    assert failure is diagnostic_failure
+                    assert failure is not collected_errors[0]
+                    assert not failure.cleanup_proven
+                    assert not collected_errors[0].cleanup_proven
+            if outcome != "released":
+                assert validated == [] and results is None
+            assert waits[0][0] == phase_deadline
+            assert waits[0][1] is not None and waits[0][1] <= phase_deadline
+        finally:
+            # Rescue owns only this synthetic obstruction and uses the same
+            # original deadline. It never supplies the assertions above.
+            failure_in_flight = sys.exception()
+            try:
+                with controller.defer():
+                    release.set()
+                    if contender is not None:
+                        contender.join(timeout=process.seconds_remaining(deadline))
+                        assert not contender.is_alive()
+                    for owner in owners:
+                        scope = owner.posix_scope
+                        if scope is not None and scope.capability.directory.exists():
+                            if outcome == "invalid-token":
+                                (scope.capability.directory / "token").write_text(
+                                    scope.capability.token
+                                )
+                            messages: list[str] = []
+                            empty = terminate(
+                                owner, deadline=deadline, diagnostic=messages.append
+                            )
+                            closed = process.close_owner(
+                                owner, deadline=deadline, diagnostic=messages.append
+                            )
+                            assert empty and closed, messages
+            except BaseException as rescue_error:
+                if failure_in_flight is None:
+                    raise
+                failure_in_flight.add_note(
+                    f"Scope contention rescue failed: {rescue_error}"
+                )
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_scope_contention_fixture_rescues_interrupted_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int
+) -> None:
+    start = process.start_owned_process
+    owners: list[tuple[process.OwnedProcess, float]] = []
+
+    def interrupt(*args: Any, **kwargs: Any) -> process.OwnedProcess:
+        owner = start(*args, **kwargs)
+        owners.append((owner, kwargs["deadline"]))
+        os.kill(os.getpid(), signum)
+        return owner
+
+    monkeypatch.setattr(process, "start_owned_process", interrupt)
+    expected = (
+        KeyboardInterrupt if signum == signal.SIGINT else process.RunnerSignalInterrupt
+    )
+    try:
+        with pytest.raises(expected):
+            test_completed_review_owner_uses_phase_budget_for_scope_lock(
+                tmp_path, monkeypatch, "released"
+            )
+        # The actual fixture's finally must have released its owner before this
+        # control's own failure-only rescue can contribute any cleanup.
+        assert len(owners) == 1
+        _empty([owner for owner, _deadline in owners])
+    finally:
+        failure = sys.exception()
+        for owner, deadline in owners:
+            scope = owner.posix_scope
+            if scope is not None and scope.capability.directory.exists():
+                try:
+                    with process.controlled_termination_signals() as controller:
+                        with controller.defer():
+                            empty = process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            closed = process.close_owner(owner, deadline=deadline)
+                            assert empty and closed
+                except BaseException as rescue_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"Launch control rescue failed: {rescue_error}")

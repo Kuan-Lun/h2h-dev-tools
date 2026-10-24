@@ -16,6 +16,152 @@ import pytest
 from h2h_dev_tools import process
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX scope ledger locks")
+@pytest.mark.parametrize(
+    ("scope_phase", "bounded", "status"),
+    [
+        (phase, bounded, status)
+        for phase in ("admission", "pending")
+        for bounded in (False, True)
+        for status in (0, 7)
+    ]
+    + [("term-grace", True, 124)],
+)
+def test_scope_lock_wait_preserves_original_cleanup_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope_phase: str,
+    bounded: bool,
+    status: int,
+) -> None:
+    import threading
+
+    from h2h_dev_tools import _process_scope as scopes
+
+    original_start = process.start_owned_process
+    original_close = process.close_owner
+    original_admission = scopes.PosixScope.close_admission
+    original_pending = scopes.PosixScope.has_pending
+    owners: list[process.OwnedProcess] = []
+    scope_deadlines: list[float] = []
+    close_deadlines: list[float] = []
+    errors: list[BaseException] = []
+    locked = threading.Event()
+    release = threading.Event()
+    threads: list[threading.Thread] = []
+    test_deadline = time.monotonic() + 12
+
+    def start(
+        phase: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None = None,
+    ) -> process.OwnedProcess:
+        owner = original_start(
+            phase, deadline=deadline, signal_controller=signal_controller
+        )
+        owners.append(owner)
+        return owner
+
+    def contend(scope: scopes.PosixScope, deadline: float) -> None:
+        if not owners or scope is not owners[0].posix_scope:
+            return
+        scope_deadlines.append(deadline)
+        if threads:
+            return
+
+        def hold() -> None:
+            try:
+                with scope.capability.locked(deadline=test_deadline):
+                    locked.set()
+                    # Exceed the 250ms exit probe or the unmodified 2s TERM
+                    # grace, while remaining inside the original owner budget.
+                    release.wait(timeout=2.2 if scope_phase == "term-grace" else 0.6)
+            except BaseException as error:
+                errors.append(error)
+                locked.set()
+
+        thread = threading.Thread(target=hold)
+        threads.append(thread)
+        thread.start()
+        assert locked.wait(timeout=max(0, test_deadline - time.monotonic()))
+        assert not errors
+
+    def admission(scope: scopes.PosixScope, *, deadline: float) -> None:
+        if scope_phase == "admission":
+            contend(scope, deadline)
+        original_admission(scope, deadline=deadline)
+
+    def pending(scope: scopes.PosixScope, *, deadline: float) -> bool:
+        if scope_phase != "admission":
+            contend(scope, deadline)
+        return original_pending(scope, deadline=deadline)
+
+    def close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        close_deadlines.append(deadline)
+        return original_close(owner, deadline=deadline, diagnostic=diagnostic)
+
+    monkeypatch.setattr(process, "start_owned_process", start)
+    monkeypatch.setattr(process, "close_owner", close)
+    monkeypatch.setattr(scopes.PosixScope, "close_admission", admission)
+    monkeypatch.setattr(scopes.PosixScope, "has_pending", pending)
+    code = (
+        "import time; time.sleep(30)"
+        if scope_phase == "term-grace"
+        else f"raise SystemExit({status})"
+    )
+    command = process.ProcessCommand(
+        "scope lock contention", (sys.executable, "-c", code), tmp_path
+    )
+    started = time.monotonic()
+    hard_deadline = started + (5 if scope_phase == "term-grace" else 8)
+    with process.controlled_termination_signals() as controller:
+        try:
+            assert (
+                process.run_command(
+                    command,
+                    hard_deadline=hard_deadline if bounded else None,
+                    termination_reserve_seconds=4 if scope_phase == "term-grace" else 2,
+                    signal_controller=controller,
+                )
+                == status
+            )
+            assert 0.5 <= time.monotonic() - started < 8
+            assert len(owners) == len(close_deadlines) == 1
+            assert scope_deadlines and set(scope_deadlines) == {close_deadlines[0]}
+            if bounded:
+                assert close_deadlines == [hard_deadline]
+            else:
+                assert started + 2 <= close_deadlines[0] <= test_deadline
+            owner = owners[0]
+            assert owner.process.poll() is not None
+            with pytest.raises(ProcessLookupError):
+                os.killpg(owner.process.pid, 0)
+            assert owner.posix_scope is not None
+            assert not owner.posix_scope.capability.directory.exists()
+        finally:
+            with controller.defer():
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=max(0, test_deadline - time.monotonic()))
+                    assert not thread.is_alive()
+                # Failure-only rescue follows the before-rescue assertions and
+                # retains the original test deadline, including on old code.
+                for owner in owners:
+                    scope = owner.posix_scope
+                    if scope is not None and scope.capability.directory.exists():
+                        assert process.terminate_owned_tree(
+                            owner, deadline=test_deadline
+                        )
+                        assert original_close(owner, deadline=test_deadline)
+                assert not errors
+
+
 def _source_bootstrap(package: Path) -> str:
     return (
         "import runpy\nfrom pathlib import Path\n"
@@ -418,9 +564,14 @@ def test_normal_exit_closes_parent_obligation_with_remaining_cleanup_budget(
 
     contender = threading.Thread(target=contend)
 
-    def wait_then_contend(owner: process.OwnedProcess, *, deadline: float) -> bool:
+    def wait_then_contend(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        poll_deadline: float | None = None,
+    ) -> bool:
         owners.append(owner)
-        assert original_wait(owner, deadline=deadline)
+        assert original_wait(owner, deadline=deadline, poll_deadline=poll_deadline)
         contender.start()
         assert locked.wait(timeout=3)
         assert not errors

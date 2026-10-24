@@ -559,7 +559,11 @@ def _wait_for_posix_process_group_exit(
     kill_process_group: Callable[[int, int], None],
     deadline: float,
     scope: PosixScope | None = None,
+    poll_deadline: float | None = None,
 ) -> bool:
+    observation_deadline = (
+        deadline if poll_deadline is None else min(deadline, poll_deadline)
+    )
     while True:
         # poll() reaps an exited leader; group membership, rather than leader
         # state, remains the authority for whether descendants survived.
@@ -570,10 +574,10 @@ def _wait_for_posix_process_group_exit(
             if scope is not None and seconds_remaining(deadline) <= 0:
                 return False
             if scope is None or not scope.has_pending(deadline=deadline):
-                return _wait_for_process_until(process, deadline=deadline)
+                return _wait_for_process_until(process, deadline=observation_deadline)
         except PermissionError:
             pass
-        remaining_seconds = seconds_remaining(deadline)
+        remaining_seconds = seconds_remaining(observation_deadline)
         if remaining_seconds <= 0:
             return False
         time.sleep(min(TERMINATION_POLL_SECONDS, remaining_seconds))
@@ -617,8 +621,9 @@ def _terminate_posix_process_group(
     if _wait_for_posix_process_group_exit(
         process,
         kill_process_group=kill_process_group,
-        deadline=graceful_deadline,
+        deadline=deadline,
         scope=scope,
+        poll_deadline=graceful_deadline,
     ):
         return True
     # The inner owner must survive long enough to prove its separate session
@@ -664,14 +669,23 @@ def wait_for_owned_tree_exit(
     owner: OwnedProcess,
     *,
     deadline: float,
+    poll_deadline: float | None = None,
 ) -> bool:
+    """Observe group exit briefly while retaining the original ledger budget.
+
+    A short poll limits waiting for group disappearance, not admission closure
+    or nested-obligation proof. Both remain bounded by the caller's deadline.
+    """
+    observation_deadline = (
+        deadline if poll_deadline is None else min(deadline, poll_deadline)
+    )
     if owner.windows_job is not None:
         try:
             return owner.windows_job.wait_empty(
-                deadline=deadline
+                deadline=observation_deadline
             ) and _wait_for_process_until(
                 owner.process,
-                deadline=deadline,
+                deadline=observation_deadline,
             )
         except OSError:
             return False
@@ -681,14 +695,22 @@ def wait_for_owned_tree_exit(
     )
     if kill_process_group is None:
         return False
-    if owner.posix_scope is not None:
-        owner.posix_scope.close_admission(deadline=deadline)
-    empty = _wait_for_posix_process_group_exit(
-        owner.process,
-        kill_process_group=kill_process_group,
-        deadline=deadline,
-        scope=owner.posix_scope,
-    )
+    from ._process_scope import ScopeError
+
+    try:
+        if owner.posix_scope is not None:
+            owner.posix_scope.close_admission(deadline=deadline)
+        empty = _wait_for_posix_process_group_exit(
+            owner.process,
+            kill_process_group=kill_process_group,
+            deadline=deadline,
+            scope=owner.posix_scope,
+            poll_deadline=observation_deadline,
+        )
+    except ScopeError as error:
+        raise ProcessOwnershipError(
+            f"Process scope cleanup could not be proven: {error}"
+        ) from error
     if owner.posix_scope is not None:
         owner.posix_scope.proven_empty = empty
     return empty
@@ -866,9 +888,16 @@ def terminate_owned_tree(
 
     if owner.windows_job is not None:
         return _terminate_windows_tree(owner, deadline=deadline, diagnostic=diagnostic)
-    empty = _terminate_posix_process_group(
-        owner.process, deadline=deadline, scope=owner.posix_scope
-    )
+    from ._process_scope import ScopeError
+
+    try:
+        empty = _terminate_posix_process_group(
+            owner.process, deadline=deadline, scope=owner.posix_scope
+        )
+    except ScopeError as error:
+        raise ProcessOwnershipError(
+            f"Process scope cleanup could not be proven: {error}"
+        ) from error
     if owner.posix_scope is not None:
         owner.posix_scope.proven_empty = empty
     return empty
@@ -1020,7 +1049,8 @@ def _run_command(
             with signal_controller.defer():
                 tree_empty_proven = wait_for_owned_tree_exit(
                     owner,
-                    deadline=clean_exit_deadline,
+                    deadline=termination_deadline,
+                    poll_deadline=clean_exit_deadline,
                 )
             if not tree_empty_proven:
                 messages.append(
@@ -1029,6 +1059,9 @@ def _run_command(
                 )
                 ownership_error = ProcessOwnershipError(phase.label)
                 raise ownership_error
+    except ProcessOwnershipError as error:
+        ownership_error = error
+        raise
     except KeyboardInterrupt, RunnerSignalInterrupt:
         messages.append(
             f"command interrupted during {phase.label}; terminating its process tree"
