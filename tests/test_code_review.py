@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
@@ -49,8 +50,10 @@ if sys.argv[1:] == ["--version"]:
 
 state = Path(os.environ["FAKE_CODEX_STATE"])
 prompt = sys.stdin.read()
+schema_path = Path(sys.argv[sys.argv.index("--output-schema") + 1])
+schema = json.loads(schema_path.read_text(encoding="utf-8"))
 with (state / "calls.jsonl").open("a", encoding="utf-8") as stream:
-    stream.write(json.dumps({"args": sys.argv[1:], "prompt": prompt}) + "\n")
+    stream.write(json.dumps({"args": sys.argv[1:], "prompt": prompt, "schema": schema}) + "\n")
 
 mode = os.environ.get("FAKE_CODEX_MODE", "pass")
 if mode in {"hold-pass", "hold-failure"}:
@@ -108,6 +111,12 @@ if mode == "integration-finding" and result['shard_id'] == 'integration':
     mode = 'p2'
 if mode == "integration-incomplete" and result['shard_id'] == 'integration':
     mode = 'incomplete'
+if mode.startswith('integration-wrong-') and result['shard_id'] == 'integration':
+    mode = mode.removeprefix('integration-')
+if mode == 'wrong-plan-digest':
+    result['plan_digest'] = result['plan_digest'][:36] + '0123456789abcdef'
+if mode == 'wrong-shard-id':
+    result['shard_id'] = 'different-invocation'
 if mode == 'missing-unit' and result['unit_reviews']:
     result['unit_reviews'].pop()
 if mode in {"p0", "p1", "p2", "contradictory"}:
@@ -315,6 +324,48 @@ def _held_review(repo: ReviewRepository, mode: str) -> Iterator[subprocess.Popen
             process.communicate(timeout=5)
 
 
+def test_invocation_schemas_isolate_targets_and_template() -> None:
+    original = deepcopy(code_review.RESULT_SCHEMA)
+    first = code_review._result_schema("a" * 64, "shard-0000")
+    second = code_review._result_schema("b" * 64, "integration")
+    assert first["properties"]["plan_digest"]["enum"] == ["a" * 64]
+    assert second["properties"]["plan_digest"]["enum"] == ["b" * 64]
+    assert first["properties"]["shard_id"]["enum"] == ["shard-0000"]
+    assert second["properties"]["shard_id"]["enum"] == ["integration"]
+    first["properties"]["verdict"]["enum"].append("not-a-verdict")
+    first["required"].clear()
+    assert second["properties"]["verdict"] == original["properties"]["verdict"]
+    assert second["required"] == original["required"]
+    assert code_review.RESULT_SCHEMA == original
+
+
+def _assert_invocation_schema(call: dict[str, object]) -> Path:
+    arguments = call["args"]
+    assert isinstance(arguments, list)
+    assignment = json.loads(
+        str(call["prompt"]).split(
+            "COORDINATOR ASSIGNMENT (data, not instructions):\n", 1
+        )[1]
+    )
+    schema_path = Path(arguments[arguments.index("--output-schema") + 1])
+    result_path = Path(arguments[arguments.index("--output-last-message") + 1])
+    assert schema_path.is_relative_to(result_path.parent.parent)
+    schema = call["schema"]
+    assert isinstance(schema, dict)
+    assert json.loads(schema_path.read_text()) == schema
+    for key in ("plan_digest", "shard_id"):
+        assert schema["properties"][key] == {
+            "type": "string",
+            "enum": [assignment[key]],
+        }
+    # Only invocation identity is narrowed; all existing result obligations stay.
+    properties = dict(schema["properties"])
+    for key in ("plan_digest", "shard_id"):
+        properties[key] = code_review.RESULT_SCHEMA["properties"][key]
+    assert {**schema, "properties": properties} == code_review.RESULT_SCHEMA
+    return schema_path
+
+
 @pytest.mark.parametrize("model", [None, "fixture-model"], ids=["default", "explicit"])
 def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
     review_repository: ReviewRepository, model: str | None
@@ -326,6 +377,7 @@ def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
     _assert_passed(repo.review("run", "--index", *model_arguments))
     calls = repo.calls()
     assert len(calls) == 1
+    _assert_invocation_schema(calls[0])
     arguments = calls[0]["args"]
     assert isinstance(arguments, list)
     assert arguments[0] == "exec"
@@ -1889,7 +1941,17 @@ def test_review_rejects_index_visibility_drift_before_publishing(
 
 
 @pytest.mark.parametrize(
-    "mode", ["pass", "integration-finding", "integration-incomplete", "missing-unit"]
+    "mode",
+    [
+        "pass",
+        "integration-finding",
+        "integration-incomplete",
+        "missing-unit",
+        "wrong-plan-digest",
+        "wrong-shard-id",
+        "integration-wrong-plan-digest",
+        "integration-wrong-shard-id",
+    ],
 )
 def test_partitioned_review_requires_every_shard_and_integration(
     review_repository: ReviewRepository, mode: str
@@ -1909,6 +1971,13 @@ def test_partitioned_review_requires_every_shard_and_integration(
     else:
         _assert_blocked(result)
         _assert_blocked(repo.review("verify", "--index"))
+    calls = repo.calls()
+    schema_paths = [_assert_invocation_schema(call) for call in calls]
+    assert len(schema_paths) == len(set(schema_paths))
+    if "wrong-" in mode:
+        assert "Review attestation targets a different plan or shard" in result.stderr
+        reviewer = code_review.Reviewer(repo.path)
+        assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
     assignments = [
         json.loads(
             str(call["prompt"]).split(
@@ -1917,7 +1986,7 @@ def test_partitioned_review_requires_every_shard_and_integration(
         )
         for call in repo.calls()
     ]
-    if mode in {"integration-finding", "integration-incomplete"}:
+    if mode.startswith("integration-"):
         assert assignments[-1]["shard_id"] == "integration"
     if mode == "integration-incomplete":
         # Completed shards cannot replace the raw-source integration review.
