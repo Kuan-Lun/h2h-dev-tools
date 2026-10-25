@@ -106,6 +106,8 @@ if mode == "malformed":
 result = synthetic_review_response(prompt)
 if mode == "integration-finding" and result['shard_id'] == 'integration':
     mode = 'p2'
+if mode == "integration-incomplete" and result['shard_id'] == 'integration':
+    mode = 'incomplete'
 if mode == 'missing-unit' and result['unit_reviews']:
     result['unit_reviews'].pop()
 if mode in {"p0", "p1", "p2", "contradictory"}:
@@ -1886,7 +1888,9 @@ def test_review_rejects_index_visibility_drift_before_publishing(
     assert not reviewer._receipt_path(target).exists()
 
 
-@pytest.mark.parametrize("mode", ["pass", "integration-finding", "missing-unit"])
+@pytest.mark.parametrize(
+    "mode", ["pass", "integration-finding", "integration-incomplete", "missing-unit"]
+)
 def test_partitioned_review_requires_every_shard_and_integration(
     review_repository: ReviewRepository, mode: str
 ) -> None:
@@ -1913,8 +1917,28 @@ def test_partitioned_review_requires_every_shard_and_integration(
         )
         for call in repo.calls()
     ]
-    if mode == "integration-finding":
+    if mode in {"integration-finding", "integration-incomplete"}:
         assert assignments[-1]["shard_id"] == "integration"
+    if mode == "integration-incomplete":
+        # Completed shards cannot replace the raw-source integration review.
+        # This exercises fail-closed publication, not model prompt compliance.
+        reviewer = code_review.Reviewer(repo.path)
+        target = reviewer._target(index=True)
+        assert not reviewer._receipt_path(target).exists()
+        runs = repo.path / ".git" / "h2h-review" / "runs"
+        results = [
+            json.loads(path.read_text()) for path in runs.glob("*/shard-*/result.json")
+        ]
+        assert len(results) == len(assignments) - 1
+        assert all(result["verdict"] == "pass" for result in results)
+        assert assignments[-1]["units"] == []
+        assert set(assignments[-1]["integration_obligations"]) == set(
+            review_plan.INTEGRATION_OBLIGATIONS
+        )
+        assert all(
+            assignment["integration_obligations"] == []
+            for assignment in assignments[:-1]
+        )
     if mode == "missing-unit":
         assert all(
             assignment["shard_id"] != "integration" for assignment in assignments
