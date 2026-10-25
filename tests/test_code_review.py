@@ -34,8 +34,32 @@ from h2h_dev_tools.executable_fixture import write_python_executable
 
 ROOT = Path(__file__).resolve().parents[1]
 
+REVIEW_OWNER_TRACE = r"""
+import json
+import os
+from pathlib import Path
+
+def record_review_owner(state):
+    scope = json.loads(os.environ['H2H_PRIVATE_POSIX_PROCESS_SCOPE'])
+    directory = Path(scope['directory'])
+    assert (directory / 'token').read_text() == scope['token']
+    assert (directory / 'pending').is_dir()
+    parent = os.environ.get('FAKE_CODEX_SCOPE_PARENT')
+    obligation = None
+    if parent:
+        parent = json.loads(parent)
+        obligation = Path(parent['directory']) / 'pending' / scope['token']
+        assert json.loads(obligation.read_text()) == scope
+    (state / 'review-owner.json').write_text(json.dumps({
+        'pgid': os.getpgrp(),
+        'scope': str(directory),
+        'obligation': None if obligation is None else str(obligation),
+    }))
+"""
+
 FAKE_CODEX = (
     review_test_support.synthetic_review_response_source()
+    + REVIEW_OWNER_TRACE
     + r'''
 import json
 import os
@@ -65,6 +89,7 @@ if mode in {"hold-pass", "hold-failure"}:
 if mode == "nonzero":
     raise SystemExit(7)
 if mode in {"timeout", "passing-child"}:
+    record_review_owner(state)
     child_code = """
 import fcntl
 import os
@@ -234,6 +259,9 @@ def _make_review_repository(tmp_path: Path, layout: str = "source") -> ReviewRep
         str(executable_directory) + os.pathsep + environment.get("PATH", "")
     )
     environment["FAKE_CODEX_STATE"] = str(state)
+    environment["FAKE_CODEX_SCOPE_PARENT"] = environment.get(
+        "H2H_PRIVATE_POSIX_PROCESS_SCOPE", ""
+    )
     package_parent = "src" if layout == "source" else "scripts/_shared"
     implementation = f"{package_parent}/h2h_dev_tools/code_review.py"
     repo = ReviewRepository(local, state, environment, implementation)
@@ -790,29 +818,143 @@ def _child_released_lock(state: Path) -> bool:
     return True
 
 
+def _assert_review_tree_cleaned(state: Path) -> None:
+    # These identities were recorded while the actual invocation's scope and
+    # exact parent obligation existed. Check them BEFORE any fixture rescue.
+    record = json.loads((state / "review-owner.json").read_text())
+    pgid = record["pgid"]
+    inventory = subprocess.run(
+        ("ps", "-axo", "pid=,pgid=,stat="),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    members = [
+        line.strip()
+        for line in inventory.stdout.splitlines()
+        if int(line.split()[1]) == pgid
+    ]
+    assert not members, f"Reviewer process group {pgid} survived: {members}"
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)
+    assert not os.path.lexists(record["scope"]), (
+        f"Reviewer scope remains: {record['scope']}"
+    )
+    obligation = record["obligation"]
+    assert obligation is None or not os.path.lexists(obligation), (
+        f"Reviewer parent obligation remains: {obligation}"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Reviewer ownership uses POSIX groups")
+@pytest.mark.parametrize("residue", ["descendant", "scope"])
+def test_review_cleanup_oracle_rejects_residue_before_rescue(
+    tmp_path: Path, residue: str
+) -> None:
+    # Both controls satisfy the former leader/lock oracle. One leaves a real
+    # same-group descendant; the other proves the group empty but withholds
+    # scope closure, retaining its exact parent obligation as well.
+    source = (
+        REVIEW_OWNER_TRACE
+        + r'''
+import subprocess
+import sys
+import time
+state = Path(sys.argv[1])
+record_review_owner(state)
+if sys.argv[2] == 'descendant':
+    child_code = """
+import os
+import sys
+import time
+from pathlib import Path
+Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(60)
+"""
+    ready = state / 'child-pid'
+    subprocess.Popen([sys.executable, '-c', child_code, str(ready)])
+    while not ready.exists():
+        time.sleep(0.01)
+'''
+    )
+    deadline = time.monotonic() + 8
+    owner: process.OwnedProcess | None = None
+    environment = dict(os.environ)
+    environment["FAKE_CODEX_SCOPE_PARENT"] = environment.get(
+        "H2H_PRIVATE_POSIX_PROCESS_SCOPE", ""
+    )
+    with process.controlled_termination_signals() as controller:
+        try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "Review cleanup negative control",
+                        (sys.executable, "-c", source, str(tmp_path), residue),
+                        tmp_path,
+                        environment=environment,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            assert owner.process.wait(timeout=2) == 0
+            assert _child_released_lock(tmp_path)
+            if residue == "scope":
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+            expected = (
+                "process group .* survived"
+                if residue == "descendant"
+                else "scope remains"
+            )
+            with pytest.raises(AssertionError, match=expected):
+                _assert_review_tree_cleaned(tmp_path)
+        finally:
+            # Failure-only fixture rescue is never evidence for the assertions
+            # above, and shares this fixture's original absolute deadline.
+            failure = sys.exception()
+            with controller.defer():
+                if owner is not None:
+                    messages: list[str] = []
+                    try:
+                        empty = process.terminate_owned_tree(
+                            owner, deadline=deadline, diagnostic=messages.append
+                        )
+                        closed = process.close_owner(
+                            owner, deadline=deadline, diagnostic=messages.append
+                        )
+                        assert empty and closed, messages
+                    except BaseException as rescue_error:
+                        if failure is None:
+                            raise
+                        failure.add_note(
+                            f"Review oracle fixture rescue failed: {rescue_error}"
+                        )
+
+
 def test_review_timeout_terminates_the_codex_descendant(
     review_repository: ReviewRepository,
 ) -> None:
     repo = review_repository
-    child_pid: int | None = None
     try:
         started = time.monotonic()
         result = repo.review("run", "--index", "--timeout-seconds", "8", mode="timeout")
         elapsed = time.monotonic() - started
         pid_path = repo.state / "child-pid"
         assert pid_path.exists(), "The timeout oracle must exercise a real descendant"
-        child_pid = int(pid_path.read_text(encoding="utf-8"))
         _assert_blocked(result)
         assert elapsed < 10, result.stdout + result.stderr
-        deadline = time.monotonic() + 2
-        while not _child_released_lock(repo.state) and time.monotonic() < deadline:
-            time.sleep(0.01)
+        _assert_review_tree_cleaned(repo.state)
         assert _child_released_lock(repo.state), "The Codex descendant survived timeout"
         _assert_blocked(repo.review("verify", "--index"))
     finally:
-        if child_pid is not None and not _child_released_lock(repo.state):
+        record_path = repo.state / "review-owner.json"
+        if record_path.exists():
+            # Rescue cannot supply a passing oracle or erase an unclosed ledger.
+            pgid = json.loads(record_path.read_text())["pgid"]
             try:
-                os.kill(child_pid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
@@ -824,13 +966,15 @@ def test_standalone_surviving_descendant_blocks_publication_even_after_cleanup(
     try:
         _assert_blocked(repo.review("run", "--index", mode="passing-child"))
         assert (repo.state / "child-pid").exists()
+        _assert_review_tree_cleaned(repo.state)
         assert _child_released_lock(repo.state)
         _assert_blocked(repo.review("verify", "--index"))
     finally:
-        pid_path = repo.state / "child-pid"
-        if pid_path.exists() and not _child_released_lock(repo.state):
+        record_path = repo.state / "review-owner.json"
+        if record_path.exists():
+            pgid = json.loads(record_path.read_text())["pgid"]
             try:
-                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
@@ -1101,7 +1245,9 @@ def test_merge_review_routes_only_a_valid_exact_candidate_profile(
     assert (repository / "review-called").exists() == reviewed
 
 
-REVIEW_PROCESS_TREE = r"""
+REVIEW_PROCESS_TREE = (
+    REVIEW_OWNER_TRACE
+    + r"""
 import fcntl
 import os
 import subprocess
@@ -1110,6 +1256,7 @@ import time
 from pathlib import Path
 
 state = Path(sys.argv[1])
+record_review_owner(state)
 leader_lock = (state / 'leader-lock').open('a')
 fcntl.flock(leader_lock, fcntl.LOCK_EX)
 child_code = '''
@@ -1132,6 +1279,7 @@ while not (state / 'child-pid').exists():
 while True:
     time.sleep(0.1)
 """
+)
 
 
 @pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM", "SIGHUP"])
@@ -1186,6 +1334,9 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
 
     monkeypatch.setenv("PATH", repo.environment["PATH"])
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
+    monkeypatch.setenv(
+        "FAKE_CODEX_SCOPE_PARENT", repo.environment["FAKE_CODEX_SCOPE_PARENT"]
+    )
     monkeypatch.setattr(subprocess, "Popen", launch_then_signal)
     monkeypatch.setattr(process, "terminate_owned_tree", stop_with_repeated_signals)
     signal.signal(signal_number, unprotected_signal)
@@ -1196,9 +1347,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
         child = owned[0]
         assert cleanup_started == [child.pid]
         assert child.poll() is not None, "The reviewer process survived interruption"
-        deadline = time.monotonic() + 2
-        while not _child_released_lock(repo.state) and time.monotonic() < deadline:
-            time.sleep(0.01)
+        _assert_review_tree_cleaned(repo.state)
         assert _child_released_lock(repo.state), "The descendant survived interruption"
         assert not reviewer._receipt_path(target).exists()
         assert signal.getsignal(signal_number) is unprotected_signal
