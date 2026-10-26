@@ -236,15 +236,29 @@ def _result(document: object) -> dict[str, Any]:
     return document
 
 
-def _require_pass(result: dict[str, Any]) -> None:
-    if result["verdict"] != "pass" or result["findings"]:
-        details = [result["summary"]]
-        details.extend(
+def _failure_details(result: dict[str, Any]) -> list[str]:
+    return [
+        result["summary"],
+        *(
             f"P{item['priority']} {item['file']}:{item['line_start']}: "
             f"{item['title']}\n{item['body']}"
             for item in result["findings"]
-        )
+        ),
+    ]
+
+
+def _require_pass(result: dict[str, Any]) -> None:
+    if result["verdict"] != "pass" or result["findings"]:
+        details = _failure_details(result)
         raise ReviewError("Code review blocked the merge:\n" + "\n".join(details))
+
+
+def _require_complete(result: dict[str, Any]) -> None:
+    """Accept a completed opinion for collection, never incomplete evidence."""
+    if result["verdict"] == "incomplete":
+        _require_pass(result)
+    if (result["verdict"] == "pass") != (not result["findings"]):
+        raise ReviewError("Review verdict contradicts its findings")
 
 
 def _prompt(target: Target, coverage: Coverage) -> str:
@@ -342,6 +356,9 @@ identify the unread sources/ranges or unresolved obligations, the concrete
 barrier and why bounded continuation cannot resolve it. Do not invent capacity
 or deadline evidence. Retain all established findings and do not silently omit
 units or integration duties. Never report pass with unresolved required coverage.
+Finding a defect does not end the assignment: complete every assigned unit,
+integration duty and bounded contract before returning changes_requested.
+Use incomplete if those obligations cannot be completed, retaining known findings.
 Return the required JSON only, with Traditional Chinese summary/findings.
 Pass requires the entire assignment examined and no actionable finding.
 """
@@ -1054,7 +1071,7 @@ class Reviewer:
                     raise ReviewError(
                         f"No valid JSON review: {invocation.id}"
                     ) from error
-                _require_pass(result)
+                _require_complete(result)
                 review_coverage.validate_attestation(result, plan, index)
                 # No subsequent wave may be admitted after candidate/source drift.
                 self._assert_workspace(target)
@@ -1181,6 +1198,19 @@ class Reviewer:
             ordered = [f"shard-{i:04d}" for i in range(len(shards))]
             if len(shards) > 1:
                 ordered.append("integration")
+            blocked = [
+                f"{key}:\n" + "\n".join(_failure_details(results[key]))
+                for key in ordered
+                if results[key]["verdict"] != "pass" or results[key]["findings"]
+            ]
+            if blocked:
+                # Every result has valid coverage, contracts and proven cleanup.
+                # A final integration pass cannot erase earlier shard findings.
+                # Keep all raw results, but never create pending/passing evidence.
+                raise ReviewError(
+                    "Code review completed with findings; merge blocked:\n"
+                    + "\n".join(blocked)
+                )
             execution = {
                 "plan": plan.document(),
                 "plan_digest": plan.fingerprint,

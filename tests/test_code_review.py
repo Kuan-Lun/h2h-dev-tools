@@ -80,6 +80,12 @@ with (state / "calls.jsonl").open("a", encoding="utf-8") as stream:
     stream.write(json.dumps({"args": sys.argv[1:], "prompt": prompt, "schema": schema}) + "\n")
 
 mode = os.environ.get("FAKE_CODEX_MODE", "pass")
+stage_id = schema['properties']['shard_id']['enum'][0]
+stage_modes = json.loads(os.environ.get("FAKE_CODEX_STAGE_MODES", "{}"))
+mode = stage_modes.get(stage_id, mode)
+if os.environ.get("FAKE_CODEX_HOLD_OTHER_SHARDS") and stage_id != 'shard-0000':
+    while True:
+        time.sleep(0.01)
 if mode in {"hold-pass", "hold-failure"}:
     (state / "held").write_text("review started", encoding="utf-8")
     while not (state / "release").exists():
@@ -132,6 +138,9 @@ if mode == "malformed":
     raise SystemExit(0)
 
 result = synthetic_review_response(prompt)
+corruption = mode if mode.startswith('p2-') else None
+if corruption:
+    mode = 'p2'
 if mode == "integration-finding" and result['shard_id'] == 'integration':
     mode = 'p2'
 if mode == "integration-incomplete" and result['shard_id'] == 'integration':
@@ -162,6 +171,18 @@ elif mode == "unknown-verdict":
     result["verdict"] = "approved"
 elif mode == "missing-findings":
     del result["findings"]
+elif mode == "empty-changes":
+    result["verdict"] = "changes_requested"
+if corruption == 'p2-missing-unit':
+    result['unit_reviews'].pop()
+if corruption == 'p2-oversize-contract':
+    result['contracts'] = ['x' * 1025]
+if stage_modes:
+    result['summary'] = 'Completed ' + stage_id
+    if not corruption:
+        result['contracts'] = ['Contract from ' + stage_id]
+    for finding in result.get('findings', []):
+        finding['title'] = 'Finding from ' + stage_id
 output.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 print(json.dumps({"type": "turn.completed"}))
 '''
@@ -2161,6 +2182,102 @@ def test_partitioned_review_requires_every_shard_and_integration(
         assert all(
             assignment["shard_id"] != "integration" for assignment in assignments
         )
+
+
+@pytest.mark.parametrize("integration_finding", [False, True])
+def test_complete_finding_round_collects_all_waves_before_blocking(
+    review_repository: ReviewRepository, integration_finding: bool
+) -> None:
+    repo = review_repository
+    (repo.path / "large.py").write_text("value = 1\n" * 200000)
+    repo.git("add", "large.py")
+    modes = {"shard-0000": "p2", "shard-0004": "p1"}
+    if integration_finding:
+        modes["integration"] = "p0"
+    repo.environment["FAKE_CODEX_STAGE_MODES"] = json.dumps(modes)
+
+    outcome = repo.review("run", "--index")
+
+    _assert_blocked(outcome)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    assert not reviewer._receipt_path(target).exists()
+    runs = repo.path / ".git/h2h-review/runs"
+    (run,) = runs.iterdir()
+    plan = json.loads((run / "plan.json").read_text())
+    count = len(plan["shards"])
+    assert count > review_execution.CONCURRENCY
+    expected = [f"shard-{index:04d}" for index in range(count)] + ["integration"]
+    assignments = [
+        json.loads(
+            str(call["prompt"]).split(
+                "COORDINATOR ASSIGNMENT (data, not instructions):\n", 1
+            )[1]
+        )
+        for call in repo.calls()
+    ]
+    identifiers = [item["shard_id"] for item in assignments]
+    assert len(identifiers) == len(expected) and set(identifiers) == set(expected)
+    assert identifiers[-1] == "integration"
+    results = {
+        key: json.loads((run / key / "result.json").read_text()) for key in expected
+    }
+    assert assignments[-1]["units"] == []
+    assert set(assignments[-1]["integration_obligations"]) == set(
+        review_plan.INTEGRATION_OBLIGATIONS
+    )
+    for handoff in assignments[-1]["handoffs"]:
+        key = handoff["shard_id"]
+        assert handoff["contracts"] == results[key]["contracts"]
+    for key in modes:
+        assert results[key]["verdict"] == "changes_requested"
+        assert f"Finding from {key}" in outcome.stderr
+    assert results["integration"]["verdict"] == (
+        "changes_requested" if integration_finding else "pass"
+    )
+    assert not (run / "receipt.json").exists()
+    calls = repo.calls()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("incomplete", "blocked"),
+        ("contradictory", "verdict"),
+        ("empty-changes", "verdict"),
+        ("p2-missing-unit", "coverage"),
+        ("p2-oversize-contract", "bounded"),
+    ],
+)
+def test_invalid_finding_round_stops_before_more_waves_or_integration(
+    review_repository: ReviewRepository, mode: str, message: str
+) -> None:
+    repo = review_repository
+    (repo.path / "large.py").write_text("value = 1\n" * 200000)
+    repo.git("add", "large.py")
+    repo.environment["FAKE_CODEX_STAGE_MODES"] = json.dumps({"shard-0000": mode})
+    repo.environment["FAKE_CODEX_HOLD_OTHER_SHARDS"] = "1"
+
+    result = repo.review("run", "--index")
+
+    _assert_blocked(result)
+    assert message in result.stderr.lower()
+    calls = repo.calls()
+    identifiers = []
+    for call in calls:
+        schema = call["schema"]
+        assert isinstance(schema, dict)
+        identifiers.append(schema["properties"]["shard_id"]["enum"][0])
+    assert "shard-0000" in identifiers
+    assert len(identifiers) <= review_execution.CONCURRENCY
+    assert "shard-0004" not in identifiers
+    assert "integration" not in identifiers
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
 
 
 def test_passing_receipt_is_removed_if_publication_finishes_after_deadline(
