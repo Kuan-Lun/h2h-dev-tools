@@ -493,3 +493,162 @@ def test_killed_post_proof_launcher_leaves_no_proof_for_live_writer(
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
+
+
+_OUTER_IO_ACTOR = """
+import os, runpy, sys, tempfile, time
+from contextlib import contextmanager
+from pathlib import Path
+package, state = map(Path, sys.argv[1:3])
+mode, fault = sys.argv[3:5]
+runpy.run_path(str(package / 'source_loader.py'))['load_package'](
+    package, 'h2h_dev_tools')
+from h2h_dev_tools import code_review, merge_command, process
+receipt = state / 'cleanup'
+original_write = Path.write_text
+original_replace = Path.replace
+original_unlink = Path.unlink
+original_rmtree = tempfile.TemporaryDirectory._rmtree
+def fail():
+    original_write(state / 'fault', fault)
+    raise OSError('injected outer I/O failure: ' + fault)
+def write(path, *args, **kwargs):
+    if fault == 'write' and path == receipt.with_suffix('.pending'): fail()
+    return original_write(path, *args, **kwargs)
+def replace(path, target):
+    if fault == 'replace' and Path(target) == receipt: fail()
+    return original_replace(path, target)
+def unlink(path, *, missing_ok=False):
+    if fault == 'revoke' and path == receipt: fail()
+    return original_unlink(path, missing_ok=missing_ok)
+def rmtree(cls, name, *args, **kwargs):
+    if fault == 'pending' and Path(name).parent == state: fail()
+    return original_rmtree(name, *args, **kwargs)
+Path.write_text = write
+Path.replace = replace
+Path.unlink = unlink
+tempfile.TemporaryDirectory._rmtree = classmethod(rmtree)
+@contextmanager
+def review(repository, command, environment):
+    deadline = time.monotonic() + 10
+    environment['H2H_REVIEW_DEADLINE'] = str(deadline)
+    status = merge_command._run_owned(process.ProcessCommand(
+        'review fixture child', command, repository, environment=environment),
+        hard_deadline=deadline)
+    with code_review._publication(state / 'passing-review') as publication:
+        with tempfile.TemporaryDirectory(prefix='pending-', dir=state):
+            (state / 'passing-review').write_text('provisional candidate')
+            yield status
+            if fault == 'revoke':
+                process.report_diagnostic = report
+                raise code_review.ReviewError('reject provisional evidence')
+        publication.complete(deadline)
+merge_command._review = review
+if fault == 'revoke':
+    def report(*args, **kwargs):
+        (state / 'reporter-admitted').touch()
+        raise AssertionError('reporter admitted before proof revocation')
+sys.argv = [sys.argv[0], '--cleanup-receipt', str(receipt)]
+if mode != 'ordinary': sys.argv.append('--' + mode)
+sys.argv += [str(state), '--', sys.executable, '-I', '-B', '-c',
+    'from pathlib import Path; Path(' + repr(str(state / 'child-completed')) + ').touch()']
+raise SystemExit(merge_command.main())
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
+@pytest.mark.parametrize(
+    ("mode", "fault"),
+    [
+        (mode, fault)
+        for mode in ("ordinary", "review", "recovery")
+        for fault in ("write", "replace")
+    ]
+    + [("review", "pending"), ("review", "revoke")],
+)
+def test_outer_io_failure_exits_without_writing_to_full_stderr(
+    tmp_path: Path, mode: str, fault: str
+) -> None:
+    read_descriptor, write_descriptor = os.pipe()
+    deadline = time.monotonic() + 15
+    owner: process.OwnedProcess | None = None
+    failure: BaseException | None = None
+    try:
+        os.set_blocking(write_descriptor, False)
+        try:
+            while True:
+                os.write(write_descriptor, b"x" * 8192)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_descriptor, True)
+        with process.controlled_termination_signals() as controller:
+            try:
+                with controller.defer():
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "outer I/O failure launcher",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                _OUTER_IO_ACTOR,
+                                str(Path(process.__file__).resolve().parent),
+                                str(tmp_path),
+                                mode,
+                                fault,
+                            ),
+                            tmp_path,
+                            stdout=subprocess.DEVNULL,
+                            stderr=write_descriptor,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                try:
+                    status = owner.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    (tmp_path / "before-rescue.json").write_text(
+                        json.dumps({"natural_exit": None, "owned_tree_empty": False})
+                    )
+                    raise
+                empty = process.wait_for_owned_tree_exit(owner, deadline=deadline)
+                (tmp_path / "before-rescue.json").write_text(
+                    json.dumps({"natural_exit": status, "owned_tree_empty": empty})
+                )
+                # These assertions precede rescue: killing a blocked traceback
+                # must never satisfy the normal-exit or nested-cleanup oracle.
+                assert status == 1
+                assert empty
+                assert (tmp_path / "child-completed").exists()
+                assert (tmp_path / "fault").read_text() == fault
+                assert not (tmp_path / "passing-review").exists()
+                assert not (tmp_path / "reporter-admitted").exists()
+                receipt = tmp_path / "cleanup"
+                if fault in {"pending", "revoke"}:
+                    # No new owner was admitted after this valid process proof.
+                    assert receipt.read_text() == "owned_tree_empty\n"
+                else:
+                    assert not receipt.exists()
+                assert os.get_blocking(write_descriptor)
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                with controller.defer():
+                    if owner is not None:
+                        try:
+                            empty = process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            closed = process.close_owner(owner, deadline=deadline)
+                            assert empty and closed, "Outer I/O fixture rescue unproven"
+                        except BaseException as error:
+                            if failure is None:
+                                raise
+                            failure.add_note(
+                                f"Outer I/O fixture rescue failed: {error}"
+                            )
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)

@@ -410,10 +410,9 @@ def main() -> int:
         except process.ProcessOwnershipError:
             return process.TERMINATION_FAILED_EXIT_CODE
         except OSError:
-            if not arguments.recovery:
-                raise
-            # A failed receipt write is still a failure and publishes no proof;
-            # reporting it must not block recovery on the caller's pipe.
+            # Receipt/publication I/O can fail after the owned command and its
+            # deadline have ended. Never emit an unbounded traceback to the
+            # caller's pipe or admit a new reporter after this cleanup boundary.
             return 1
 
 
