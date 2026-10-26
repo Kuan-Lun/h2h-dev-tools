@@ -12,6 +12,7 @@ on:
       - src/h2h_dev_tools/pytest_source.py
       - src/h2h_dev_tools/executable_fixture.py
       - scripts/run-pytest.py
+      - scripts/with-git-environment.py
       - scripts/build-and-verify-distributions.py
       - tests/test_process*.py
       - tests/test_git_environment.py

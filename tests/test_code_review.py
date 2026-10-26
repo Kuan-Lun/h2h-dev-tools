@@ -2582,11 +2582,11 @@ def test_offline_verify_rechecks_authority_after_evidence_validation(
 
 
 @pytest.mark.parametrize("boundary", ["write-return", "ancestor-exit", "run-return"])
-def test_standalone_completion_failure_revokes_published_receipt(
+def test_standalone_precommit_failure_prevents_canonical_receipt(
     review_repository: ReviewRepository, boundary: str
 ) -> None:
     repo = review_repository
-    marker = repo.state / "publication-reached"
+    marker = repo.state / "precommit-boundary-reached"
     injection = (
         "import time\nfrom contextlib import contextmanager\n"
         "from h2h_dev_tools import code_review, process\n"
@@ -2639,14 +2639,14 @@ def test_standalone_completion_failure_revokes_published_receipt(
 @pytest.mark.parametrize(
     "boundary", ["publish-return", "pending-cleanup", "cleanup-proof"]
 )
-def test_managed_completion_failure_revokes_published_receipt(
+def test_managed_precommit_failure_prevents_canonical_receipt(
     review_repository: ReviewRepository, boundary: str, tmp_path: Path
 ) -> None:
     repo = review_repository
     classifier = repo.path / "scripts/check_change_scope.py"
     classifier.write_text("print('full')\n")
     repo.git("add", "scripts/check_change_scope.py")
-    marker = repo.state / "publication-reached"
+    marker = repo.state / "precommit-boundary-reached"
     cleanup = tmp_path / "owner-cleanup"
     package = (repo.path / repo.implementation).parent
     script = (
@@ -2721,11 +2721,11 @@ def test_managed_completion_failure_revokes_published_receipt(
 
 @pytest.mark.parametrize("boundary", ["write-return", "run-return"])
 @pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM", "SIGHUP"])
-def test_standalone_publication_signal_revokes_receipt(
+def test_standalone_precommit_signal_prevents_canonical_receipt(
     review_repository: ReviewRepository, boundary: str, signal_name: str
 ) -> None:
     repo = review_repository
-    marker = repo.state / "signal-after-publication"
+    marker = repo.state / "signal-before-canonical-commit"
     injection = (
         "import os, signal\n"
         "from h2h_dev_tools import code_review, process\n"
@@ -2759,8 +2759,8 @@ def test_standalone_publication_signal_revokes_receipt(
     assert marker.exists(), result.stdout + result.stderr
     assert repo.calls(), "The real owned reviewer must finish before interruption"
     _assert_blocked(result)
-    # This is a real signal after atomic publication, not an injected exception.
-    # Offline verification must reject the failed invocation after its lock exits.
+    # This is a real signal after staging, before the terminal canonical rename.
+    # Offline verification must reject the incomplete preparation after lock exit.
     _assert_blocked(repo.review("verify", "--index"))
     reviewer = code_review.Reviewer(repo.path)
     assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
@@ -2771,14 +2771,14 @@ def test_standalone_publication_signal_revokes_receipt(
 @pytest.mark.parametrize(
     "boundary", ["publish-return", "pending-cleanup", "cleanup-proof"]
 )
-def test_managed_publication_signal_revokes_receipt(
+def test_managed_precommit_signal_prevents_canonical_receipt(
     review_repository: ReviewRepository, signal_name: str, boundary: str, tmp_path: Path
 ) -> None:
     repo = review_repository
     classifier = repo.path / "scripts/check_change_scope.py"
     classifier.write_text("print('full')\n")
     repo.git("add", "scripts/check_change_scope.py")
-    marker = repo.state / "publication-signal"
+    marker = repo.state / "precommit-signal"
     cleanup = tmp_path / "owner-cleanup"
     package = (repo.path / repo.implementation).parent
     script = (
@@ -2850,8 +2850,8 @@ def test_managed_publication_signal_revokes_receipt(
     reviewer = code_review.Reviewer(repo.path)
     receipt = reviewer._receipt_path(reviewer._target(index=True))
     verification = repo.review("verify", "--index")
-    # Record the real consequence before the negative assertion: OLD SIGTERM/HUP
-    # kills the owner with a passing receipt that the unchanged verifier accepts.
+    # Record the real precommit outcome before asserting that no canonical
+    # evidence became visible; process cleanup proof remains a separate authority.
     (repo.state / "signal-proof.json").write_text(
         json.dumps(
             {
