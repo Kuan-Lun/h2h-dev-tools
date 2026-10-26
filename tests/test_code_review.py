@@ -1718,6 +1718,154 @@ def test_baseline_classifier_only_falls_back_for_clean_git_query_failure(
 
 
 @pytest.mark.parametrize(
+    ("boundary", "failure_kind"),
+    [
+        ("metadata", "timeout"),
+        ("blobs", "descendants"),
+        ("metadata", "size"),
+        ("planning", "deadline"),
+        ("metadata", "git"),
+        ("blobs", "git"),
+        ("metadata", "ownership"),
+        ("blobs", "ownership"),
+    ],
+)
+def test_historical_plan_execution_failure_cannot_admit_a_fallback_review(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    failure_kind: str,
+) -> None:
+    repo = review_repository
+    baseline_commit, baseline_path = _merge_full_baseline(repo)
+    baseline_bytes = baseline_path.read_bytes()
+    historical_tree = repo.git("rev-parse", f"{baseline_commit}^{{tree}}")
+    _next_candidate(repo)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    receipt = reviewer._receipt_path(target)
+    calls_before = len(repo.calls())
+    build = review_plan.build_plan
+    git_output = review_execution.git_output
+    clock = time.monotonic
+    offset = 0.0
+    historical = False
+    injected: list[str] = []
+    local_cutoffs: list[float] = []
+    failure = (
+        process.ProcessOwnershipError("Historical query cleanup is unknown")
+        if failure_kind == "ownership"
+        else review_execution.ExecutionError(
+            {
+                "timeout": "Historical Git query deadline expired",
+                "descendants": "Historical Git query descendants needed cleanup",
+                "size": "Historical Git output exceeds review memory budget",
+            }.get(failure_kind, "Historical execution failed")
+        )
+    )
+
+    def plan(
+        repository: Path,
+        plan_target: dict[str, Any],
+        scope: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> review_plan.Plan:
+        nonlocal historical, offset
+        historical = plan_target["tree"] == historical_tree
+        try:
+            if historical and boundary == "planning":
+                # Expire only the existing local 120-second history-read slice;
+                # the original aggregate review deadline is still unexpired.
+                local_cutoffs.append(deadline)
+                assert 0 < deadline - clock() <= 120
+                offset = 121.0
+                remaining = review_execution.remaining()
+                assert remaining is not None and remaining > 0
+                injected.append("local-deadline")
+            return build(repository, plan_target, scope, deadline=deadline)
+        finally:
+            historical = False
+            offset = 0.0
+
+    def read(
+        repository: Path,
+        *arguments: str,
+        deadline: float | None = None,
+        input_bytes: bytes | None = None,
+        max_output_bytes: int | None = None,
+    ) -> bytes:
+        selected = (
+            arguments[:1] == ("ls-tree",)
+            if boundary == "metadata"
+            else boundary == "blobs" and arguments == ("cat-file", "--batch")
+        )
+        if historical and selected:
+            injected.append(boundary)
+            if failure_kind == "git":
+                # Preserve the normal fully owned nonzero-query fallback.
+                return git_output(
+                    repository, "cat-file", "blob", "0" * 40, deadline=deadline
+                )
+            raise failure
+        return git_output(
+            repository,
+            *arguments,
+            deadline=deadline,
+            input_bytes=input_bytes,
+            max_output_bytes=max_output_bytes,
+        )
+
+    monkeypatch.setattr(review_plan, "build_plan", plan)
+    monkeypatch.setattr(review_execution, "git_output", read)
+    monkeypatch.setattr(time, "monotonic", lambda: clock() + offset)
+    monkeypatch.setattr(sys, "argv", ["review-code.py", "run", "--index"])
+    for name in ("PATH", "FAKE_CODEX_STATE", "FAKE_CODEX_SCOPE_PARENT"):
+        monkeypatch.setenv(name, repo.environment[name])
+    outcome: SystemExit | None = None
+    try:
+        code_review.main(repo.path)
+    except SystemExit as error:
+        outcome = error
+    (repo.state / "history-execution-proof.json").write_text(
+        json.dumps(
+            {
+                "boundary": boundary,
+                "failure_kind": failure_kind,
+                "exit_code": None if outcome is None else outcome.code,
+                "cause_type": None
+                if outcome is None
+                else type(outcome.__cause__).__name__,
+                "new_reviewer_calls": len(repo.calls()) - calls_before,
+                "canonical_receipt_exists": receipt.exists(),
+                "injected": injected,
+                "historical_local_deadlines": local_cutoffs,
+            }
+        )
+    )
+    assert injected
+    assert baseline_path.read_bytes() == baseline_bytes
+    if failure_kind == "git":
+        assert outcome is None
+        assert len(repo.calls()) > calls_before
+        assert _candidate_receipt(repo)[1]["scope"] == "repository"
+        _assert_passed(repo.review("verify", "--index"))
+    else:
+        assert outcome is not None, "Historical execution failure became a full review"
+        assert len(repo.calls()) == calls_before, "Failed history admitted a reviewer"
+        assert not receipt.exists(), "Failed history published canonical evidence"
+        expected = (
+            process.TERMINATION_FAILED_EXIT_CODE if failure_kind == "ownership" else 1
+        )
+        assert outcome.code == expected
+        if failure_kind == "deadline":
+            assert isinstance(outcome.__cause__, review_execution.ExecutionError)
+            assert "deadline" in str(outcome.__cause__)
+        else:
+            assert outcome.__cause__ is failure
+
+
+@pytest.mark.parametrize(
     "changed",
     [
         "AGENTS.md",

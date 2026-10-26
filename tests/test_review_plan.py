@@ -542,6 +542,14 @@ def test_inventory_and_policy_overflow_fail_before_review_admission() -> None:
         plan.validate_prompt_capacity("界" * (planning.MAX_PROMPT_BYTES // 3))
 
 
+def test_expired_planning_deadline_is_an_execution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(time, "monotonic", lambda: 120.0)
+    with pytest.raises(review_execution.ExecutionError, match="deadline"):
+        planning.check_deadline(120.0)
+
+
 def test_late_git_batch_cannot_return_usable_plan_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -550,7 +558,7 @@ def test_late_git_batch_cannot_return_usable_plan_inputs(
         return b"a blob 1\nx\n"
 
     monkeypatch.setattr(review_execution, "git_output", late)
-    with pytest.raises(planning.PlanError, match="deadline"):
+    with pytest.raises(review_execution.ExecutionError, match="deadline"):
         planning._blobs(tmp_path, [{"blob": "a", "size": 1}], time.monotonic() + 0.01)
 
 
@@ -942,7 +950,7 @@ def test_git_metadata_is_bounded_before_returning_bytes(
         planning, "MAX_GIT_METADATA_BYTES", len(data) - int(over), raising=False
     )
     if over:
-        with pytest.raises(planning.PlanError, match="Git output"):
+        with pytest.raises(review_execution.ExecutionError, match="Git output"):
             planning._git(
                 repository,
                 "show",
@@ -980,7 +988,7 @@ def test_git_metadata_timeout_preserves_deadline_and_closes_spool(
         return process.TIMEOUT_EXIT_CODE
 
     monkeypatch.setattr(process, "run_command", timeout)
-    with pytest.raises(planning.PlanError, match="immutable Git input"):
+    with pytest.raises(review_execution.ExecutionError, match="Git query deadline"):
         planning._git(tmp_path, "ls-tree", "HEAD", deadline=time.monotonic() + 10)
     assert len(streams) == 2 and all(stream.closed for stream in streams)
 
@@ -1199,7 +1207,7 @@ def test_json_scan_checks_same_deadline_before_dom_parse(
         assert value == deadline
         calls.append(value)
         if len(calls) == 2:
-            raise planning.PlanError("Aggregate review deadline expired")
+            raise review_execution.ExecutionError("Aggregate review deadline expired")
         return 10.0
 
     def reject_parse(*args: Any, **kwargs: Any) -> Any:
@@ -1207,7 +1215,7 @@ def test_json_scan_checks_same_deadline_before_dom_parse(
 
     monkeypatch.setattr(planning, "check_deadline", expired)
     monkeypatch.setattr(json, "loads", reject_parse)
-    with pytest.raises(planning.PlanError, match="deadline"):
+    with pytest.raises(review_execution.ExecutionError, match="deadline"):
         planning._json_sample(b'["a long string"]', deadline=deadline)
     assert len(calls) == 2
 
@@ -1259,7 +1267,7 @@ def test_git_metadata_size_is_checked_before_materializing_spool(
 
     monkeypatch.setattr(tempfile, "TemporaryFile", lambda: stream)
     monkeypatch.setattr(process, "run_command", write)
-    with pytest.raises(planning.PlanError, match="Git output"):
+    with pytest.raises(review_execution.ExecutionError, match="Git output"):
         planning._git(tmp_path, "ls-tree", "HEAD", deadline=time.monotonic() + 10)
     assert stream.closed
 
