@@ -657,6 +657,94 @@ def test_explicit_failed_rerun_invalidates_the_previous_pass(
     assert len(repo.calls()) == 2
 
 
+@pytest.mark.parametrize("alias_kind", ["file", "directory"])
+def test_review_preserves_separate_metadata_path_and_shared_lock(
+    review_repository: ReviewRepository, tmp_path: Path, alias_kind: str
+) -> None:
+    import fcntl
+
+    repo = review_repository
+    common = tmp_path / "metadata \t"
+    repo.git("init", "--separate-git-dir", str(common))
+    alias = tmp_path / "metadata"
+    if alias_kind == "directory":
+        alias.mkdir()
+        sentinel = alias / "unrelated.txt"
+    else:
+        sentinel = alias
+    sentinel.write_bytes(b"Unrelated metadata alias must remain untouched.\n")
+    sentinel_bytes = sentinel.read_bytes()
+    alias_identity = alias.stat()
+
+    _assert_passed(repo.review("run", "--index"))
+    receipts = list((common / "h2h-review/receipts").glob("*.json"))
+    assert len(receipts) == 1, "Evidence must use the actual Git common directory"
+    receipt = receipts[0]
+    lock = common / "h2h-review/locks" / receipt.stem
+    lock_identity = lock.stat()
+    assert len(list((common / "h2h-review/runs").iterdir())) == 1
+    _assert_passed(repo.review("verify", "--index"))
+
+    linked_path = tmp_path / "linked"
+    repo.git("worktree", "add", "--detach", str(linked_path), "HEAD")
+    linked = ReviewRepository(
+        linked_path, repo.state, repo.environment, repo.implementation
+    )
+    linked.git("merge", "--no-ff", "--no-commit", "task/example")
+    with _held_review(repo, "hold-pass") as owner:
+        assert not receipt.exists(), "An admitted rerun must revoke the real receipt"
+        with lock.open("rb") as stream, pytest.raises(BlockingIOError):
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _assert_blocked(linked.review("verify", "--index"))
+        competing = linked.review("run", "--index")
+        _assert_blocked(competing)
+        assert "already running" in competing.stderr.lower()
+        assert len(repo.calls()) == 2, "The shared lock must reject a second reviewer"
+        (repo.state / "release").touch()
+        stdout, stderr = owner.communicate(timeout=5)
+        assert owner.returncode == 0, stdout + stderr
+    _assert_passed(linked.review("verify", "--index"))
+    _assert_blocked(linked.review("run", "--index", mode="p2"))
+    assert not receipt.exists()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert len(repo.calls()) == 3
+    assert (lock.stat().st_dev, lock.stat().st_ino) == (
+        lock_identity.st_dev,
+        lock_identity.st_ino,
+    ), "All checkouts must retain the same lock inode"
+    assert (alias.stat().st_dev, alias.stat().st_ino) == (
+        alias_identity.st_dev,
+        alias_identity.st_ino,
+    )
+    assert sentinel.read_bytes() == sentinel_bytes
+    if alias_kind == "directory":
+        assert list(alias.iterdir()) == [sentinel]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX raw filesystem path bytes")
+@pytest.mark.parametrize("path_bytes", [b"/metadata \t\n", b"/metadata-\xff"])
+def test_review_metadata_path_uses_filesystem_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_bytes: bytes
+) -> None:
+    def git_output(repository: Path, *arguments: str) -> bytes:
+        assert repository == tmp_path
+        assert arguments == ("rev-parse", "--path-format=absolute", "--git-common-dir")
+        return path_bytes + b"\n"
+
+    monkeypatch.setattr(review_execution, "git_output", git_output)
+    directory = code_review.Reviewer(tmp_path)._directory()
+    assert os.fsencode(directory.parent) == path_bytes
+    assert directory.name == "h2h-review"
+
+
+def test_review_metadata_path_rejects_an_unterminated_git_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(review_execution, "git_output", lambda *_: b"/metadata ")
+    with pytest.raises(code_review.ReviewError, match=r"terminate.*record"):
+        code_review.Reviewer(tmp_path)._directory()
+
+
 @pytest.mark.parametrize("index", [False, True])
 def test_review_verification_rejects_a_different_expected_tree(
     review_repository: ReviewRepository, index: bool
@@ -1197,7 +1285,9 @@ def test_windows_offline_verification_does_not_require_codex_or_posix_locks(
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
     _write_fixture_receipt(reviewer, target, repo.state)
-    monkeypatch.setattr(code_review, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        code_review, "os", SimpleNamespace(name="nt", fsdecode=os.fsdecode)
+    )
     with reviewer._review_lock(target, exclusive=False):
         assert reviewer._verify(target).exists()
     with pytest.raises(code_review.ReviewError, match="requires POSIX"):

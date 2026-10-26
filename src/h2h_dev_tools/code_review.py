@@ -502,6 +502,14 @@ class Reviewer:
     def _git(self, *arguments: str) -> str:
         return self._git_bytes(*arguments).decode("utf-8").strip()
 
+    def _git_path(self, *arguments: str) -> Path:
+        output = self._git_bytes(*arguments)
+        if not output.endswith(b"\n"):
+            raise ReviewError("Git did not terminate its requested path record")
+        # Remove only Git's record terminator: whitespace and non-UTF-8 bytes
+        # may belong to the filesystem path itself.
+        return Path(os.fsdecode(output[:-1]))
+
     def _parent_policy(
         self,
         tree: str,
@@ -640,10 +648,8 @@ class Reviewer:
             unresolved = self._git("ls-files", "--unmerged")
             if unresolved:
                 raise ReviewError("Resolve merge conflicts before requesting a review")
-            merge_head = Path(
-                self._git(
-                    "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"
-                )
+            merge_head = self._git_path(
+                "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"
             )
             if not merge_head.is_file():
                 raise ReviewError("--index requires a pending two-parent merge")
@@ -683,7 +689,7 @@ class Reviewer:
 
     def _directory(self) -> Path:
         return (
-            Path(self._git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+            self._git_path("rev-parse", "--path-format=absolute", "--git-common-dir")
             / "h2h-review"
         )
 
