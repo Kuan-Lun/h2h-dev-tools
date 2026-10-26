@@ -392,13 +392,12 @@ def _external_process_owner() -> bool:
 
 @dataclass
 class _Publication:
-    """Request completion; the context owns rollback until its final checks."""
+    """Prepare one receipt; only context exit can make it canonical."""
 
+    staging: Path
     deadline: float | None = None
 
     def complete(self, deadline: float) -> None:
-        # The caller has unwound fallible work, but context exit still verifies
-        # this same deadline and pending signals before committing publication.
         with review_execution.within_deadline(deadline):
             pass
         self.deadline = deadline
@@ -406,34 +405,47 @@ class _Publication:
 
 @contextmanager
 def _publication(path: Path) -> Iterator[_Publication]:
-    """Own this destination only while the caller holds candidate admission.
+    """Own the destination under candidate admission, with one terminal commit.
 
-    Resolve the path before entering: rollback must perform no Git/deadline work.
-    A managed child owns only its pending destination; its parent owns canonical
-    invalidation and publication. Rejected overlapping runs never enter here.
-
-    Commit occurs after the caller unwinds, the final deadline check succeeds,
-    and pending interruption is rejected. Only restoring prior signal handlers
-    follows that boundary. Cancellation after commit may retain valid evidence;
-    cancellation before it revokes evidence while admission is still held.
+    All fallible preparation, owner cleanup and final deadline/signal checks
+    precede the atomic rename. The final deadline check admits the atomic rename;
+    a filesystem syscall's return time cannot be bounded or rolled back safely
+    if subsequent filesystem mutations fail. After rename commits, an exit or
+    signal failure can fail the command but cannot revoke the valid receipt.
     """
     with process_control.controlled_termination_signals() as controller:
-        publication = _Publication()
+        # A rejected withdrawal must not admit a new reviewer or stage.
+        path.unlink(missing_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.", suffix=".pending", dir=path.parent, delete=False
+        ) as temporary:
+            staging = Path(temporary.name)
+        publication = _Publication(staging)
+        committed = False
         try:
-            path.unlink(missing_ok=True)
             yield publication
             if publication.deadline is None:
                 with controller.defer():
-                    path.unlink(missing_ok=True)
+                    staging.unlink(missing_ok=True)
             else:
-                with review_execution.within_deadline(publication.deadline):
-                    controller.raise_pending()
-                # Publication commits here. No review/evidence IO follows.
-        except BaseException:
-            # Re-raise inside defer: repeated signals cannot interrupt unlink or
-            # replace the original failure when the deferred scope unwinds.
+                with controller.defer():
+                    with review_execution.within_deadline(publication.deadline):
+                        controller.raise_pending()
+                    # This is the only canonical publication. No deadline or
+                    # evidence check follows it, including on deferred signals.
+                    os.replace(staging, path)
+                    committed = True
+        except BaseException as error:
             with controller.defer():
-                path.unlink(missing_ok=True)
+                if not committed:
+                    try:
+                        staging.unlink(missing_ok=True)
+                    except OSError as cleanup_error:
+                        error.add_note(
+                            f"Prepared review evidence retained: {cleanup_error}"
+                        )
+                # Preserve this failure even if cleanup receives repeated signals.
                 raise
 
 
@@ -901,11 +913,11 @@ class Reviewer:
         coverage: Coverage | None = None,
         *,
         execution: dict[str, Any],
-        destination: Path | None = None,
+        destination: Path,
     ) -> Path:
         if coverage is None:
             coverage = Coverage()
-        path = self._receipt_path(target) if destination is None else destination
+        path = destination
         path.parent.mkdir(parents=True, exist_ok=True)
         document = {
             "schema_version": 3,
@@ -921,7 +933,7 @@ class Reviewer:
         }
         temporary = run_directory / "receipt.json"
         temporary.write_text(
-            json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            json.dumps(document, indent=2, ensure_ascii=True) + "\n", encoding="utf-8"
         )
         review_execution.remaining()
         os.replace(temporary, path)
@@ -932,8 +944,10 @@ class Reviewer:
             raise
         return path
 
-    def _publish_managed_receipt(self, target: Target, pending: Path) -> Path:
-        """Publish only under the outer owner's lock, after its tree is empty."""
+    def _publish_managed_receipt(
+        self, target: Target, pending: Path, *, destination: Path
+    ) -> Path:
+        """Prepare the outer owner's stage only after its tree is empty."""
         evidence = self._read_evidence(target, path=pending)
         with self._select_coverage(
             target, force_repository=evidence.coverage.scope == "repository"
@@ -943,7 +957,7 @@ class Reviewer:
             self._assert_workspace(target)
             if self._target(index=True) != target:
                 raise ReviewError("The candidate changed before owner completion")
-            path = self._receipt_path(target)
+            path = destination
             path.parent.mkdir(parents=True, exist_ok=True)
             review_execution.remaining()
             os.replace(pending, path)
@@ -962,6 +976,7 @@ class Reviewer:
         revision: str,
         timeout: int,
         model: str | None,
+        destination: Path,
         force_repository: bool = False,
         started: float | None = None,
     ) -> None:
@@ -975,6 +990,7 @@ class Reviewer:
                 revision=revision,
                 timeout=timeout,
                 model=model,
+                destination=destination,
                 force_repository=force_repository,
                 started=started,
             )
@@ -987,6 +1003,7 @@ class Reviewer:
         revision: str,
         timeout: int,
         model: str | None,
+        destination: Path,
         force_repository: bool,
         started: float,
     ) -> None:
@@ -1005,6 +1022,7 @@ class Reviewer:
                 revision=revision,
                 timeout=timeout,
                 model=model,
+                destination=destination,
                 started=started,
             )
 
@@ -1018,6 +1036,7 @@ class Reviewer:
         revision: str,
         timeout: int,
         model: str | None,
+        destination: Path,
         started: float,
     ) -> None:
         runs = self._directory() / "runs"
@@ -1240,10 +1259,7 @@ class Reviewer:
         except (KeyboardInterrupt, process_control.RunnerSignalInterrupt) as error:
             raise ReviewError("Code review interrupted by signal") from error
         managed = _external_process_owner()
-        destination = (
-            Path(os.environ["H2H_REVIEW_PENDING_RECEIPT"]) if managed else None
-        )
-        receipt = self._receipt_path(target) if destination is None else destination
+        receipt = destination
         # Diagnostic writers must finish before the last candidate checks and
         # evidence publication, sharing the same aggregate review deadline.
         process_control.report_diagnostic(
@@ -1389,6 +1405,7 @@ def main(repository: Path) -> None:
                         revision=args.revision,
                         timeout=args.timeout_seconds,
                         model=args.model,
+                        destination=publication.staging,
                         force_repository=args.scope == "repository",
                         started=started,
                     )

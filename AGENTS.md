@@ -332,7 +332,15 @@
   Planning、preflight、四片排程、validation、integration 及 cleanup 共用單一
   monotonic deadline；多片保留 20%（至多 600 秒）給 integration，不乘上片數。
   Managed reviewer 另在總預算最後保留 5%（至多 30 秒）供外層重驗及發布，
-  不增加 deadline；逾時完成的 publication 會撤回，不能留下 passing receipt。
+  不增加 deadline。
+- Review evidence 發布以最後一次 atomic rename 為唯一 terminal commit。
+  完整 review、exact candidate／coverage 重驗、全部 review owned process group 與
+  nested obligations 清理及 passing evidence 準備均須先完成；最後再檢查原
+  absolute deadline 與 pending signals，通過後才嘗試 rename，不增加預算。
+  Commit 前失敗不得產生 canonical receipt；rename 成功後保留已生效的有效
+  receipt，後續錯誤仍阻止本次 merge，不以刪除 receipt 回復未提交狀態。
+  最後 filesystem 操作不保證在原期限內回傳；clock 檢查與 rename 並非原子
+  操作，因此也不宣稱 rename 實際開始時刻有嚴格期限保證。
 - Binary 必須在 `[tool.h2h-dev-tools.review]` 的 artifacts 宣告 exact path、role、
   format、related-paths、reason、max-expanded-bytes 與 max-members。安全 inventory
   不 extract、不 follow links、不 execute/unpickle；未知或超限輸入 fail closed。

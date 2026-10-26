@@ -144,6 +144,9 @@ or an installed copy of the tool:
 python scripts/_shared/h2h_dev_tools/bundle_verify.py --repository .
 ```
 
+The standalone `bundle_verify.py` command above performs verification itself.
+Other shared Python modules must be called through repository-owned entries;
+direct execution of their generated `.py` files does not verify the snapshot.
 Python consumer entry points must source-bootstrap before their first shared
 import (also before `runpy.run_module`):
 
@@ -236,8 +239,35 @@ directory; the helper does not change it.
 
 Test launchers select the `git-environment` component and call
 `without_local_git_environment(environment, repository=repository_root)` when
-building a test child's environment. Shell entry points can execute
-`python scripts/_shared/h2h_dev_tools/git_environment.py --repository ROOT -- COMMAND`.
+building a test child's environment. Shell entry points use a repository-owned
+Python entry, which verifies and source-loads the complete selected snapshot
+before the Git query or test child can run. For example, create
+`scripts/with-git-environment.py`:
+
+```python
+# scripts/with-git-environment.py
+import runpy
+import sys
+from pathlib import Path
+
+repository = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(repository / "scripts"))
+package = repository / "scripts/_shared/h2h_dev_tools"
+runpy.run_path(str(package / "source_loader.py"))["load_package"](
+    package, "_shared.h2h_dev_tools"
+)
+
+from _shared.h2h_dev_tools.git_environment import main
+
+raise SystemExit(main())
+```
+
+Then invoke that entry with the existing CLI arguments:
+
+```bash
+python scripts/with-git-environment.py --repository ROOT -- COMMAND
+```
+
 Both use Git's `rev-parse --local-env-vars` inventory, reject failed or malformed
 queries and preserve other environment values. On POSIX the CLI replaces itself
 with the test command; on Windows it waits for the child and returns its exit code
@@ -519,8 +549,9 @@ Documentation needs neither the review entry nor Codex.
 The owner is exported from the actual staged candidate after the three-way merge,
 so an independently updated primary does not require rebasing the task. The owner
 holds the candidate review lock through cleanup and publication. Managed reviewers
-write only pending evidence; the owner publishes it after successful group exit
-and fresh candidate/coverage validation. The managed reviewer validates its direct
+write only pending evidence; the owner publishes it at the terminal commit described
+below, after successful group exit and fresh candidate/coverage validation.
+The managed reviewer validates its direct
 parent, group leader and complete owner source closure before sharing ownership.
 Every separate Codex session has a registered canonical owner. Unexpected owner
 death cannot turn an empty outer group into proof of nested cleanup. The launcher
@@ -623,6 +654,17 @@ Any failing/incomplete/missing shard, candidate
 drift, malformed range, late output or unproven owner blocks publication and stops
 admission; all active owners are cleaned under the same remaining deadline.
 
+Review evidence becomes canonical at one terminal commit: the final atomic rename.
+Complete the review, exact candidate/coverage revalidation, cleanup of every review
+owned process group and nested obligation, and evidence preparation first. Then
+check the original absolute deadline and pending signals immediately before
+attempting the rename; this does not extend any budget. A failure before commit
+must not create a canonical receipt. A successful rename retains the valid committed
+receipt; a later error still blocks that merge attempt and does not delete the
+receipt to undo the commit. The final filesystem operation is not guaranteed to
+return within the deadline. The clock check and rename are separate operations,
+so the actual start of rename has no strict deadline guarantee either.
+
 Tracked binary artifacts require repository-owned declarations, for example:
 
 ```toml
@@ -723,10 +765,32 @@ same-user modification. Windows behavior also runs in the dedicated
 Windows workflow; a POSIX test run does not substitute for it.
 
 The `offline-wheel` component owns temporary build/install directories for
-consumer wheel smoke checks. A consumer supplies its own validation script:
+consumer wheel smoke checks. A consumer supplies its own validation script and a
+repository-owned entry such as `scripts/check-offline-wheel.py`:
+
+```python
+# scripts/check-offline-wheel.py
+import runpy
+import sys
+from pathlib import Path
+
+repository = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(repository / "scripts"))
+package = repository / "scripts/_shared/h2h_dev_tools"
+runpy.run_path(str(package / "source_loader.py"))["load_package"](
+    package, "_shared.h2h_dev_tools"
+)
+
+from _shared.h2h_dev_tools.offline_wheel import main
+
+raise SystemExit(main())
+```
+
+Run that entry, which verifies the complete selected snapshot before starting any
+build, install or callback command:
 
 ```bash
-.venv/bin/python scripts/_shared/h2h_dev_tools/offline_wheel.py \
+.venv/bin/python scripts/check-offline-wheel.py \
   --repository . --smoke-script scripts/check-installed-wheel.py
 ```
 

@@ -233,7 +233,9 @@ def _review(
                         standard_output=True,
                         deadline=deadline,
                     )
-                    reviewer._publish_managed_receipt(target, pending)
+                    reviewer._publish_managed_receipt(
+                        target, pending, destination=publication.staging
+                    )
                 # The caller writes its owned-tree proof while this transaction
                 # still owns rollback; failed proof I/O cannot leave a passing review.
                 yield status

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import py_compile
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,7 @@ import pytest
 
 from h2h_dev_tools import bundle
 from h2h_dev_tools.bundle_verify import BUNDLE_DIRECTORY
+from h2h_dev_tools.executable_fixture import write_python_executable
 
 _PRELUDE = """
 import importlib, runpy, sys
@@ -332,3 +335,218 @@ assert sys.modules['scripts._shared'] is inner
 """,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _documented_utility_entry(repository: Path, utility: str) -> Path:
+    filename = (
+        "with-git-environment.py"
+        if utility == "git_environment"
+        else "check-offline-wheel.py"
+    )
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    marker = f"```python\n# scripts/{filename}\n"
+    assert readme.count(marker) == 1
+    source = readme.split(marker, 1)[1].split("\n```", 1)[0]
+    entry = repository / "scripts" / filename
+    entry.write_text(source + "\n")
+    return entry
+
+
+@pytest.mark.parametrize("utility", ["git_environment", "offline_wheel"])
+@pytest.mark.parametrize(
+    "snapshot_state", ["valid", "missing-manifest", "selection", "payload"]
+)
+def test_documented_utility_verifies_snapshot_before_starting_children(
+    tmp_path: Path, utility: str, snapshot_state: str
+) -> None:
+    component = utility.replace("_", "-")
+    configuration = tmp_path / "pyproject.toml"
+    configuration.write_text(f'[tool.h2h-dev-tools]\ncomponents = ["{component}"]\n')
+    bundle.sync_bundle(tmp_path)
+    package = tmp_path / BUNDLE_DIRECTORY
+    entry = _documented_utility_entry(tmp_path, utility)
+    marker = tmp_path / "command-started"
+    if utility == "git_environment":
+        arguments = [
+            "--repository",
+            str(tmp_path),
+            "--",
+            sys.executable,
+            "-I",
+            "-c",
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('test child')\n"
+            "raise SystemExit(7)\n",
+        ]
+    else:
+        development_python = tmp_path / (
+            ".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python"
+        )
+        write_python_executable(
+            development_python,
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('development Python')\n"
+            "raise SystemExit(7)\n",
+        )
+        callback = tmp_path / "smoke.py"
+        callback.write_text(
+            "raise AssertionError('preparation must stop before callback')\n"
+        )
+        arguments = ["--repository", str(tmp_path), "--smoke-script", "smoke.py"]
+    if snapshot_state == "missing-manifest":
+        (package / "manifest.json").unlink()
+    elif snapshot_state == "selection":
+        configuration.write_text('[tool.h2h-dev-tools]\ncomponents = ["process"]\n')
+    elif snapshot_state == "payload":
+        source = package / f"{utility}.py"
+        source.write_bytes(source.read_bytes() + b"\n# unapproved payload drift\n")
+    result = subprocess.run(
+        (sys.executable, "-I", "-B", str(entry), *arguments),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    if snapshot_state == "valid":
+        assert marker.exists(), result.stdout + result.stderr
+        assert result.returncode == (7 if utility == "git_environment" else 1)
+    else:
+        assert not marker.exists(), "Invalid snapshot launched a real child"
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "BundleError" in result.stderr, result.stderr
+
+
+def test_repository_git_environment_entry_ignores_stale_package_bytecode(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    entry = scripts / "with-git-environment.py"
+    shutil.copy2(repository / "scripts/with-git-environment.py", entry)
+    package = tmp_path / "src/h2h_dev_tools"
+    package.mkdir(parents=True)
+    for name in ("source_loader.py", "git_environment.py"):
+        shutil.copy2(repository / "src/h2h_dev_tools" / name, package / name)
+    loaded = tmp_path / "source-loaded"
+    initializer = package / "__init__.py"
+    current = (
+        "from pathlib import Path\n"
+        f"Path({str(loaded)!r}).write_text('verified source')\n"
+    ).encode()
+    stale = b"raise RuntimeError('STALE PACKAGE CACHE')\n".ljust(len(current), b" ")
+    initializer.write_bytes(stale)
+    timestamp = initializer.stat().st_mtime_ns
+    cache = py_compile.compile(
+        str(initializer),
+        cfile=str(
+            package / "__pycache__" / f"__init__.{sys.implementation.cache_tag}.pyc"
+        ),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    assert cache is not None
+    initializer.write_bytes(current)
+    os.utime(initializer, ns=(timestamp, timestamp))
+    cached = Path(cache).read_bytes()
+    ordinary = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            f"import sys; sys.path.insert(0, {str(package.parent)!r}); import h2h_dev_tools",
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert ordinary.returncode != 0 and "STALE PACKAGE CACHE" in ordinary.stderr
+    assert not loaded.exists()
+    child = tmp_path / "child-started"
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            str(entry),
+            "--repository",
+            str(tmp_path),
+            "--",
+            sys.executable,
+            "-I",
+            "-c",
+            f"from pathlib import Path; Path({str(child)!r}).write_text('child'); raise SystemExit(7)",
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert loaded.read_text() == "verified source"
+    assert child.read_text() == "child"
+    assert Path(cache).read_bytes() == cached
+
+
+@pytest.mark.parametrize("callback_status", [0, 7])
+def test_documented_offline_entry_runs_real_callback_and_cleans_environment(
+    tmp_path: Path, callback_status: int
+) -> None:
+    repository = tmp_path / "consumer checkout"
+    repository.mkdir()
+    (repository / ".venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+    (repository / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+        '[project]\nname = "documented-offline-fixture"\nversion = "1.0.0"\n'
+        '[tool.hatch.build.targets.wheel]\npackages = ["src/documented_fixture"]\n'
+        '[tool.h2h-dev-tools]\ncomponents = ["offline-wheel"]\n'
+    )
+    package = repository / "src/documented_fixture"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('VALUE = "candidate wheel"\n')
+    bundle.sync_bundle(repository)
+    entry = _documented_utility_entry(repository, "offline_wheel")
+    evidence = tmp_path / "callback.json"
+    callback = repository / "smoke.py"
+    callback.write_text(
+        "import json, sys\nfrom pathlib import Path\nimport documented_fixture\n"
+        "assert sys.flags.isolated\n"
+        "assert documented_fixture.VALUE == 'candidate wheel'\n"
+        "assert Path(documented_fixture.__file__).is_relative_to(Path(sys.prefix))\n"
+        "assert sys.argv[2] == '--literal=$value with spaces'\n"
+        "Path(sys.argv[1]).write_text(json.dumps({'prefix': sys.prefix, 'cwd': str(Path.cwd())}))\n"
+        f"raise SystemExit({callback_status})\n"
+    )
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            str(entry),
+            "--repository",
+            str(repository),
+            "--smoke-script",
+            "smoke.py",
+            "--",
+            str(evidence),
+            "--literal=$value with spaces",
+        ),
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == (1 if callback_status else 0), (
+        result.stdout + result.stderr
+    )
+    observed = json.loads(evidence.read_text())
+    assert not Path(observed["cwd"]).is_relative_to(repository)
+    assert not Path(observed["cwd"]).exists()
+    assert not Path(observed["prefix"]).exists()
+    assert not (repository / "dist").exists()

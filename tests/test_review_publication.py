@@ -6,9 +6,12 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
+
+from h2h_dev_tools import code_review, review_execution
 
 PUBLICATION_PROBE = r"""
 import os
@@ -29,8 +32,9 @@ previous = {number: signal.getsignal(number) for number in
 original_unlink = Path.unlink
 original_failure = OSError('original publication failure')
 rollback_signals = []
+staging = None
 def interrupt_unlink(self, *args, **kwargs):
-    if self == receipt and self.exists():
+    if self == staging and self.exists():
         for _ in range(2):
             rollback_signals.append(number)
             os.kill(os.getpid(), number)
@@ -39,7 +43,8 @@ if scenario == 'failed-rollback':
     Path.unlink = interrupt_unlink
 try:
     with code_review._publication(receipt) as publication:
-        receipt.write_text('validated fixture evidence')
+        staging = publication.staging
+        staging.write_text('validated fixture evidence')
         if scenario == 'failed-rollback':
             raise original_failure
         publication.complete(time.monotonic() + 10)
@@ -107,3 +112,89 @@ def test_postcommit_signal_preserves_completed_evidence(tmp_path: Path) -> None:
     result, receipt = _publication_probe(tmp_path, "after-commit", "SIGTERM")
     assert result.returncode == -signal.SIGTERM, result.stdout + result.stderr
     assert receipt.read_text() == "validated fixture evidence"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "expired-before-commit",
+        "rename-failed",
+        "renamed-then-error",
+        "renamed-then-late-return",
+    ],
+)
+def test_terminal_publication_has_one_canonical_commitpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    original_replace = os.replace
+    clock = time.monotonic
+    offset = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: clock() + offset)
+    deadline = time.monotonic() + 10
+    replacements: list[Path] = []
+    failure = OSError("injected terminal rename failure")
+
+    def replace(source: Path, destination: Path) -> None:
+        nonlocal offset
+        assert not receipt.exists(), "Canonical evidence must be absent before commit"
+        assert destination == receipt and source.parent == receipt.parent
+        assert time.monotonic() < deadline
+        if boundary == "rename-failed":
+            raise failure
+        original_replace(source, destination)
+        replacements.append(destination)
+        if boundary == "renamed-then-error":
+            raise failure
+        offset = 1000.0
+
+    monkeypatch.setattr(os, "replace", replace)
+    caught: BaseException | None = None
+    try:
+        with code_review._publication(receipt) as publication:
+            publication.staging.write_text("validated evidence")
+            assert not receipt.exists()
+            publication.complete(deadline)
+            if boundary == "expired-before-commit":
+                offset = 1000.0
+    except (OSError, review_execution.ExecutionError) as error:
+        caught = error
+    if boundary == "expired-before-commit":
+        assert isinstance(caught, review_execution.ExecutionError)
+        assert not replacements and not receipt.exists()
+    elif boundary == "rename-failed":
+        assert caught is failure
+        assert not replacements and not receipt.exists()
+    else:
+        assert replacements == [receipt]
+        assert receipt.read_text() == "validated evidence"
+        assert caught is (failure if boundary == "renamed-then-error" else None)
+        if boundary == "renamed-then-late-return":
+            # The last syscall began in budget and committed. Its delayed return
+            # is not a new fallible validation/rollback phase.
+            assert time.monotonic() > deadline
+    assert list(tmp_path.iterdir()) == ([receipt] if receipt.exists() else [])
+
+
+def test_failed_old_receipt_withdrawal_cannot_admit_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text("previous completed evidence")
+    failure = OSError("previous evidence cannot be withdrawn")
+    original_unlink = Path.unlink
+    admitted = False
+
+    def unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path == receipt:
+            raise failure
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(OSError) as raised:
+        with code_review._publication(receipt):
+            admitted = True
+    assert raised.value is failure
+    assert not admitted
+    assert receipt.read_text() == "previous completed evidence"
+    assert list(tmp_path.iterdir()) == [receipt]

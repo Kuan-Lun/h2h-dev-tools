@@ -385,7 +385,8 @@ subprocess.Popen = observe_popen
 @contextmanager
 def review(repository, command, environment):
     environment['H2H_REVIEW_DEADLINE'] = str(deadline)
-    with code_review._publication(state / 'review-receipt'):
+    with code_review._publication(state / 'review-receipt') as publication:
+        publication.staging.write_text('provisional evidence')
         yield 0
         assert receipt.read_text() == 'owned_tree_empty\\n'
         if scenario == 'signal':
@@ -537,7 +538,7 @@ def review(repository, command, environment):
         hard_deadline=deadline)
     with code_review._publication(state / 'passing-review') as publication:
         with tempfile.TemporaryDirectory(prefix='pending-', dir=state):
-            (state / 'passing-review').write_text('provisional candidate')
+            publication.staging.write_text('provisional candidate')
             yield status
             if fault == 'revoke':
                 process.report_diagnostic = report
