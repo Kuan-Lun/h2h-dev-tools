@@ -2374,6 +2374,151 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
                 owner.process.stdout.close()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Real terminal stdout backpressure")
+@pytest.mark.parametrize("operation", ["merge", "no-op"])
+@pytest.mark.parametrize("transport", ["full", "closed", "normal", "signal"])
+def test_success_output_cannot_hold_workflow_admission(
+    tmp_path: Path, operation: str, transport: str
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True)
+    ready = tmp_path / "last-git-owner-clean.json"
+    release = tmp_path / "release-output-fixture"
+    receipts = tmp_path / "receipts.tsv"
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    record_workflow_receipts(root, receipts)
+    fill = root / "scripts/terminal-output-fixture.py"
+    fill.write_text(
+        "import json, os, sys, time\nfrom pathlib import Path\n"
+        "receipt = Path(sys.argv[1])\n"
+        "assert receipt.read_text() == 'owned_tree_empty\\n'\n"
+        "filled = 0\n"
+        + (
+            "os.set_blocking(1, False)\n"
+            "try:\n"
+            "    while True: filled += os.write(1, b'x')\n"
+            "except BlockingIOError:\n    pass\n"
+            "finally:\n    os.set_blocking(1, True)\n"
+            if transport == "full"
+            else ""
+        )
+        + f"Path({str(ready)!r}).write_text(json.dumps(dict(receipt=str(receipt), filled=filled)))\n"
+        + "deadline = time.monotonic() + 5\n"
+        + f"while not Path({str(release)!r}).exists():\n"
+        + "    assert time.monotonic() < deadline\n    time.sleep(0.01)\n"
+    )
+    shell = root / "src/h2h_dev_tools/git-flow-merge.sh"
+    terminal_status = '    [[ "$owner_cleanup_failed" -eq 0 ]] || return 125\n'
+    source = shell.read_text()
+    assert source.count(terminal_status) == 1
+    # Git's own output and cleanup finish before the pipe stops draining. The
+    # injected leaf stays in this fixture's owned group and restores FD flags.
+    shell.write_text(
+        source.replace(
+            terminal_status,
+            terminal_status
+            + '    if [[ "$status" -eq 0 && " $* " == *" branch -d "* ]]; then\n'
+            + '        "$merge_python" "$repository_root/scripts/terminal-output-fixture.py" "$active_cleanup_receipt"\n'
+            + "    fi\n",
+        )
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: isolate terminal success output")
+    task = git(root, "rev-parse", "task")
+    if operation == "no-op":
+        git(root, "branch", "-f", "master", "task")
+    deadline = time.monotonic() + 15
+    with (
+        process.controlled_termination_signals() as controller,
+        (tmp_path / "stderr").open("wb") as errors,
+    ):
+        owner: process.OwnedProcess | None = None
+        clean = False
+        try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    process.ProcessCommand(
+                        "terminal completion output fixture",
+                        ("scripts/git-flow-merge.sh",),
+                        root,
+                        environment=os.environ | {"TMPDIR": str(exports)},
+                        stdout=subprocess.PIPE,
+                        stderr=errors,
+                    ),
+                    deadline=deadline,
+                    signal_controller=controller,
+                )
+            wrapper = owner.process
+            assert wrapper.stdout is not None
+            while not ready.exists():
+                assert wrapper.poll() is None, (tmp_path / "stderr").read_text()
+                assert time.monotonic() < deadline - 6
+                time.sleep(0.01)
+            observed = json.loads(ready.read_text())
+            assert Path(observed["receipt"]).read_text() == "owned_tree_empty\n"
+            if transport == "full":
+                assert observed["filled"] > 0
+            if transport == "closed":
+                wrapper.stdout.close()
+            if transport == "signal":
+                wrapper.send_signal(signal.SIGTERM)
+            release.touch()
+            # This wait deliberately does not drain stdout or rescue the owner.
+            status = wrapper.wait(timeout=5)
+            assert status == (143 if transport == "signal" else 0)
+            assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+            assert process.close_owner(owner, deadline=deadline)
+            clean = True
+            with pytest.raises(ProcessLookupError):
+                os.killpg(wrapper.pid, 0)
+            assert not (root / ".git/h2h-merge-workflow.lock").exists()
+            assert not list(exports.glob("h2h-process-scope-*"))
+            assert not list(exports.glob("h2h-merge-owner.*"))
+            assert not (root / ".git/MERGE_HEAD").exists()
+            assert git(root, "branch", "--show-current") == "master"
+            assert git(root, "branch", "--list", "task") == ""
+            assert git(root, "status", "--porcelain") == ""
+            head = git(root, "rev-parse", "master")
+            if operation == "merge":
+                assert git(root, "show", "-s", "--format=%P", head).split() == [
+                    base,
+                    task,
+                ]
+                expected = f"Merged task into master at {head}\n"
+            else:
+                assert head == task
+                expected = f"Cleaned up no-op task task already contained in master at {task}\n"
+            if transport == "normal":
+                assert wrapper.stdout.read().decode().count(expected) == 1
+                assert expected not in (tmp_path / "stderr").read_text()
+            recorded = [line.split("\t") for line in receipts.read_text().splitlines()]
+            assert recorded[-1][0] == "release"
+            (tmp_path / "terminal-output-proof.json").write_text(
+                json.dumps(
+                    {
+                        "operation": operation,
+                        "transport": transport,
+                        "status": status,
+                        "last_git_receipt_proven": True,
+                        "tree_empty_before_rescue": True,
+                        "admission_released": True,
+                        "master": head,
+                        "task_deleted": True,
+                    }
+                )
+            )
+        finally:
+            release.touch()
+            if owner is not None and not clean:
+                with controller.defer():
+                    empty = process.terminate_owned_tree(owner, deadline=deadline)
+                    closed = process.close_owner(owner, deadline=deadline)
+                    assert empty and closed, "Completion fixture cleanup is unproven"
+            if owner is not None and owner.process.stdout is not None:
+                owner.process.stdout.close()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
 @pytest.mark.parametrize("missing_python", [False, True])
 def test_failed_gate_recovers_without_waiting_for_diagnostic_reader(

@@ -25,6 +25,46 @@ from h2h_dev_tools import (
 )
 
 
+@pytest.mark.parametrize("completion", [False, True])
+@pytest.mark.parametrize("unknown_cleanup", [False, True])
+def test_workflow_output_requires_writer_cleanup_before_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion: bool,
+    unknown_cleanup: bool,
+) -> None:
+    receipt = tmp_path / "cleanup"
+    messages: list[str] = []
+    stream = io.StringIO()
+
+    @contextmanager
+    def destination(
+        descriptor: int, mode: str, *, encoding: str, closefd: bool
+    ) -> Iterator[io.StringIO]:
+        assert (descriptor, mode, encoding, closefd) == (3, "w", "utf-8", False)
+        yield stream
+
+    def report(message: str) -> None:
+        assert sys.stderr is stream
+        assert not receipt.exists()
+        messages.append(message)
+        if unknown_cleanup:
+            raise process.ProcessOwnershipError("Writer cleanup is unknown")
+
+    monkeypatch.setattr(os, "fdopen", destination)
+    monkeypatch.setattr(process, "report_diagnostic", report)
+    status = merge_command._workflow_diagnostic(
+        "finished", receipt, completion=completion
+    )
+    assert messages == ["finished" if completion else "git-flow-merge: finished"]
+    if unknown_cleanup:
+        assert status == process.TERMINATION_FAILED_EXIT_CODE
+        assert not receipt.exists()
+    else:
+        assert status == 0
+        assert receipt.read_text() == "owned_tree_empty\n"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
 @pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
 @pytest.mark.parametrize("prefilled", [False, True])
