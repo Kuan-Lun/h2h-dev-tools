@@ -63,6 +63,24 @@
 [small-cls]: https://google.github.io/eng-practices/review/developer/small-cls.html
 [review-standard]: https://google.github.io/eng-practices/review/reviewer/standard.html
 
+## 長時間命令與終態處理
+
+- 長時間命令沿用既有 canonical process owner，由 host／工具層等待最外層受管理
+  命令終止。代理不得定時讀取未完成的進度 log、中間結果或審查輸出，也不得
+  把相同輪詢轉交另一個模型。工具可持續保存輸出，供人工查看與終態後診斷；
+  不為監看進度建立第二套 runner 或通知服務。
+- Host 有完成事件時以事件恢復後續工作；沒有時，等待或必要輪詢留在工具程式
+  內，不以模型反覆呼叫狀態查詢代替。工具的等待期間屆滿或傳回部分輸出不等於
+  命令終止，不據此定時解讀進度；不得把這種等待宣稱為 callback 或零 token。
+- 命令終止後才讀取最終結果，區分成功、失敗、中斷及 cleanup 未證明，並核對
+  exit status、實際 candidate identity、owned cleanup 與 recovery。成功字串、
+  結果檔存在或單一 child／reviewer 完成都不是整段 workflow 的終態證明；已成功
+  建立的 merge commit 不因後續失敗回滾，未知 cleanup 仍保留既有 scope 與材料。
+- 使用者明確要求查詢，或收到需要介入的 approval、錯誤、中斷等事件時，可作
+  必要檢查。既有 absolute deadline、訊號處理、admission 及 nested cleanup 監督
+  持續由工具執行，不依賴模型讀取進度、不增加原預算。Review 子程序仍固定
+  `notify=[]`；它禁止外部通知子程序，不能拿來取代 host 的完成事件機制。
+
 ## 工具責任
 
 - 本專案擁有跨 H2H repository 的開發工具、可安裝 CLI 與可重建工具快照。
