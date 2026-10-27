@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from h2h_dev_tools import version_policy
+from h2h_dev_tools import process, version_policy
 from h2h_dev_tools.dependency_manifest import dependency_manifest
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -629,3 +635,189 @@ def test_index_without_active_merge_rejects_every_environment_parent(
         version_policy._candidate(
             argparse.Namespace(index=True, base=None, candidate="HEAD")
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX CR/CRLF metadata path names")
+@pytest.mark.parametrize("suffix", ["ordinary", "with\rCR", "with\r\nCRLF"])
+@pytest.mark.parametrize("runtime_change", [False, True], ids=["valid", "missing-bump"])
+def test_release_gate_preserves_linked_metadata_path_bytes(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    runtime_change: bool,
+) -> None:
+    # A linked primary's MERGE_HEAD lives in the original repository's common
+    # metadata. Giving only the linked checkout a CR name would miss this bug.
+    common = repository.with_name("metadata-" + suffix)
+    repository.rename(common)
+    monkeypatch.chdir(common)
+    write_project(common, "0.1.0")
+    shutil.copytree(
+        _ROOT / "src/h2h_dev_tools",
+        common / "src/h2h_dev_tools",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    scripts = common / "scripts"
+    scripts.mkdir()
+    for name in ("release-gate.py", "check-version.py"):
+        shutil.copy2(_ROOT / "scripts" / name, scripts / name)
+    # Exercise the actual gate and version entry. Only the subsequent business
+    # profile/docs commands are fixtures; they must not run on version failure.
+    (scripts / "check_change_scope.py").write_text(
+        "print('documentation')\n", encoding="utf-8"
+    )
+    marker = common.parent / "documentation-ran"
+    (scripts / "check-docs.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_bytes(b'checked')\n",
+        encoding="utf-8",
+    )
+    base = commit(common, "chore: prepare real release entries")
+    git(common, "update-ref", "refs/heads/master", base)
+    changed = common / ("src/tool.py" if runtime_change else "README.md")
+    changed.write_text("fixture change\n", encoding="utf-8")
+    task = commit(common, "fix: change behavior" if runtime_change else "docs: explain")
+    primary = common.parent / "linked-primary"
+    git(common, "worktree", "add", str(primary), "master")
+    git(primary, "merge", "--no-ff", "--no-commit", "task")
+    tree = git(primary, "write-tree")
+    merge_head_record = subprocess.run(
+        ("git", "rev-parse", "--git-path", "MERGE_HEAD"),
+        cwd=primary,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert merge_head_record.endswith(b"\n")
+    merge_head = Path(os.fsdecode(merge_head_record[:-1]))
+    assert merge_head.is_file()
+    assert merge_head.read_bytes() == task.encode("ascii") + b"\n"
+
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        status = process.run_command(
+            process.ProcessCommand(
+                "Real linked release gate",
+                (sys.executable, "scripts/release-gate.py"),
+                primary,
+                stdout=stdout,
+                stderr=stderr,
+            ),
+            hard_deadline=time.monotonic() + 30,
+            termination_reserve_seconds=6,
+        )
+        stdout.seek(0)
+        stderr.seek(0)
+        output, errors = stdout.read(), stderr.read()
+    if runtime_change:
+        assert status == 1, (output, errors)
+        assert b"release surface changed without a project version bump" in errors
+        assert not marker.exists()
+    else:
+        assert status == 0, (output, errors)
+        assert b"Verified documentation merge candidate " + tree.encode() in output
+        assert marker.read_bytes() == b"checked"
+    assert git(primary, "rev-parse", "HEAD") == base
+    assert git(primary, "rev-parse", "task") == task
+    assert git(primary, "write-tree") == tree
+    assert git(primary, "diff", "--name-only") == ""
+    assert merge_head.read_bytes() == task.encode("ascii") + b"\n"
+
+
+@pytest.mark.parametrize(
+    "record,terminated",
+    [
+        pytest.param(
+            b"metadata-\xff/MERGE_HEAD\n",
+            True,
+            id="non-utf8",
+            marks=pytest.mark.skipif(
+                os.name != "posix", reason="POSIX filesystem surrogateescape contract"
+            ),
+        ),
+        pytest.param(b"metadata\r\npart/MERGE_HEAD\n", True, id="crlf"),
+        pytest.param(b"metadata/MERGE_HEAD\n", True, id="ordinary"),
+        pytest.param(b"metadata/MERGE_HEAD", False, id="missing-terminator"),
+    ],
+)
+def test_index_git_path_preserves_raw_record(
+    monkeypatch: pytest.MonkeyPatch, record: bytes, terminated: bool
+) -> None:
+    base, task, tree = "1" * 40, "2" * 40, "3" * 40
+    path = Path(os.fsdecode(record[:-1] if terminated else record))
+    replies = {
+        ("rev-parse", "--verify", "HEAD^{commit}"): base.encode() + b"\n",
+        ("rev-parse", "--git-path", "MERGE_HEAD"): record,
+        ("rev-parse", "--verify", f"{task}^{{commit}}"): task.encode() + b"\n",
+        ("write-tree",): tree.encode() + b"\n",
+    }
+
+    def run(
+        command: tuple[str, ...], **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
+        arguments = command[1:]
+        while arguments[:1] == ("-c",):
+            arguments = arguments[2:]
+        output = replies[arguments]
+        # Model subprocess's real universal-newline decoder, rather than
+        # returning bytes to a caller that requested text. Real linked-worktree
+        # coverage above complements this host-filesystem-independent case.
+        value: str | bytes = output
+        if kwargs.get("text"):
+            value = io.TextIOWrapper(
+                io.BytesIO(output), encoding=kwargs.get("encoding") or "utf-8"
+            ).read()
+        return subprocess.CompletedProcess(command, 0, stdout=value)
+
+    def read_text(actual: Path, **_kwargs: Any) -> str:
+        assert actual == path
+        return task + "\n"
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(Path, "is_file", lambda actual: actual == path)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    arguments = argparse.Namespace(index=True, base=None, candidate="HEAD")
+    if terminated:
+        assert version_policy._candidate(arguments) == (base, tree, f"{base}..{task}")
+    else:
+        with pytest.raises(ValueError, match="terminate"):
+            version_policy._candidate(arguments)
+
+
+@pytest.mark.parametrize(
+    "output_encoding,subject",
+    [("UTF-8", "docs: 丁"), ("ISO-8859-1", "docs: café")],
+)
+def test_git_commit_text_is_independent_of_locale(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_encoding: str,
+    subject: str,
+) -> None:
+    write_project(repository, "0.1.0")
+    base = commit(repository, "chore: prepare release metadata")
+    git(repository, "config", "i18n.logOutputEncoding", output_encoding)
+    (repository / "README.md").write_bytes(b"documentation\n")
+    git(repository, "add", ".")
+    message = subject + "\n\nA legitimate Unicode commit body: " + subject
+    # Capture the fixture commit as bytes too: native Windows must reach the
+    # policy boundary instead of failing in this test's setup decoder.
+    subprocess.run(
+        ("git", "commit", "-m", message),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    task = git(repository, "rev-parse", "HEAD")
+    configuration = (repository / ".git/config").read_bytes()
+    original_run = subprocess.run
+
+    def cp1252_run(
+        command: tuple[str, ...], **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
+        if kwargs.get("text"):
+            kwargs.setdefault("encoding", "cp1252")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", cp1252_run)
+    assert version_policy._git("show", "-s", "--format=%s", task) == subject
+    assert version_policy._git("show", "-s", "--format=%B", task) == message
+    version_policy.validate(base, task, task)
+    assert (repository / ".git/config").read_bytes() == configuration

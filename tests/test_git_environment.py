@@ -214,7 +214,7 @@ def test_windows_cli_waits_for_the_test_child_within_its_job(
         "Git-isolated test command",
         (
             sys.executable,
-            str(ROOT / "src/h2h_dev_tools/git_environment.py"),
+            str(ROOT / "scripts/with-git-environment.py"),
             "--repository",
             str(ROOT),
             "--",
@@ -245,7 +245,7 @@ def test_test_child_replaces_launcher_and_preserves_its_exit_status(
     child = subprocess.Popen(
         (
             sys.executable,
-            str(ROOT / "src/h2h_dev_tools/git_environment.py"),
+            str(ROOT / "scripts/with-git-environment.py"),
             "--repository",
             str(ROOT),
             "--",
@@ -286,6 +286,9 @@ def test_full_gate_isolates_pytest_from_a_real_linked_worktree_hook(
     scripts.mkdir()
     shutil.copy2(ROOT / "scripts/check-full.sh", scripts / "check-full.sh")
     shutil.copy2(ROOT / "scripts/run-pytest.py", scripts / "run-pytest.py")
+    shutil.copy2(
+        ROOT / "scripts/with-git-environment.py", scripts / "with-git-environment.py"
+    )
     source = candidate / "src/h2h_dev_tools"
     shutil.copytree(
         ROOT / "src/h2h_dev_tools",

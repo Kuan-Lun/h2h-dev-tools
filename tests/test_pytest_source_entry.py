@@ -26,7 +26,7 @@ def _checkout(tmp_path: Path, module: str) -> tuple[Path, dict[str, str]]:
     )
     scripts = root / "scripts"
     scripts.mkdir()
-    for name in ("check-full.sh", "run-pytest.py"):
+    for name in ("check-full.sh", "run-pytest.py", "with-git-environment.py"):
         shutil.copy2(_ROOT / "scripts" / name, scripts / name)
     (scripts / "check-fast.sh").write_text("#!/bin/sh\nexit 0\n")
     (scripts / "check-fast.sh").chmod(0o755)

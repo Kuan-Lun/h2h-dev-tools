@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -80,6 +81,12 @@ with (state / "calls.jsonl").open("a", encoding="utf-8") as stream:
     stream.write(json.dumps({"args": sys.argv[1:], "prompt": prompt, "schema": schema}) + "\n")
 
 mode = os.environ.get("FAKE_CODEX_MODE", "pass")
+stage_id = schema['properties']['shard_id']['enum'][0]
+stage_modes = json.loads(os.environ.get("FAKE_CODEX_STAGE_MODES", "{}"))
+mode = stage_modes.get(stage_id, mode)
+if os.environ.get("FAKE_CODEX_HOLD_OTHER_SHARDS") and stage_id != 'shard-0000':
+    while True:
+        time.sleep(0.01)
 if mode in {"hold-pass", "hold-failure"}:
     (state / "held").write_text("review started", encoding="utf-8")
     while not (state / "release").exists():
@@ -132,6 +139,9 @@ if mode == "malformed":
     raise SystemExit(0)
 
 result = synthetic_review_response(prompt)
+corruption = mode if mode.startswith('p2-') else None
+if corruption:
+    mode = 'p2'
 if mode == "integration-finding" and result['shard_id'] == 'integration':
     mode = 'p2'
 if mode == "integration-incomplete" and result['shard_id'] == 'integration':
@@ -162,6 +172,18 @@ elif mode == "unknown-verdict":
     result["verdict"] = "approved"
 elif mode == "missing-findings":
     del result["findings"]
+elif mode == "empty-changes":
+    result["verdict"] = "changes_requested"
+if corruption == 'p2-missing-unit':
+    result['unit_reviews'].pop()
+if corruption == 'p2-oversize-contract':
+    result['contracts'] = ['x' * 1025]
+if stage_modes:
+    result['summary'] = 'Completed ' + stage_id
+    if not corruption:
+        result['contracts'] = ['Contract from ' + stage_id]
+    for finding in result.get('findings', []):
+        finding['title'] = 'Finding from ' + stage_id
 output.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 print(json.dumps({"type": "turn.completed"}))
 '''
@@ -636,6 +658,94 @@ def test_explicit_failed_rerun_invalidates_the_previous_pass(
     assert len(repo.calls()) == 2
 
 
+@pytest.mark.parametrize("alias_kind", ["file", "directory"])
+def test_review_preserves_separate_metadata_path_and_shared_lock(
+    review_repository: ReviewRepository, tmp_path: Path, alias_kind: str
+) -> None:
+    import fcntl
+
+    repo = review_repository
+    common = tmp_path / "metadata \t"
+    repo.git("init", "--separate-git-dir", str(common))
+    alias = tmp_path / "metadata"
+    if alias_kind == "directory":
+        alias.mkdir()
+        sentinel = alias / "unrelated.txt"
+    else:
+        sentinel = alias
+    sentinel.write_bytes(b"Unrelated metadata alias must remain untouched.\n")
+    sentinel_bytes = sentinel.read_bytes()
+    alias_identity = alias.stat()
+
+    _assert_passed(repo.review("run", "--index"))
+    receipts = list((common / "h2h-review/receipts").glob("*.json"))
+    assert len(receipts) == 1, "Evidence must use the actual Git common directory"
+    receipt = receipts[0]
+    lock = common / "h2h-review/locks" / receipt.stem
+    lock_identity = lock.stat()
+    assert len(list((common / "h2h-review/runs").iterdir())) == 1
+    _assert_passed(repo.review("verify", "--index"))
+
+    linked_path = tmp_path / "linked"
+    repo.git("worktree", "add", "--detach", str(linked_path), "HEAD")
+    linked = ReviewRepository(
+        linked_path, repo.state, repo.environment, repo.implementation
+    )
+    linked.git("merge", "--no-ff", "--no-commit", "task/example")
+    with _held_review(repo, "hold-pass") as owner:
+        assert not receipt.exists(), "An admitted rerun must revoke the real receipt"
+        with lock.open("rb") as stream, pytest.raises(BlockingIOError):
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _assert_blocked(linked.review("verify", "--index"))
+        competing = linked.review("run", "--index")
+        _assert_blocked(competing)
+        assert "already running" in competing.stderr.lower()
+        assert len(repo.calls()) == 2, "The shared lock must reject a second reviewer"
+        (repo.state / "release").touch()
+        stdout, stderr = owner.communicate(timeout=5)
+        assert owner.returncode == 0, stdout + stderr
+    _assert_passed(linked.review("verify", "--index"))
+    _assert_blocked(linked.review("run", "--index", mode="p2"))
+    assert not receipt.exists()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert len(repo.calls()) == 3
+    assert (lock.stat().st_dev, lock.stat().st_ino) == (
+        lock_identity.st_dev,
+        lock_identity.st_ino,
+    ), "All checkouts must retain the same lock inode"
+    assert (alias.stat().st_dev, alias.stat().st_ino) == (
+        alias_identity.st_dev,
+        alias_identity.st_ino,
+    )
+    assert sentinel.read_bytes() == sentinel_bytes
+    if alias_kind == "directory":
+        assert list(alias.iterdir()) == [sentinel]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX raw filesystem path bytes")
+@pytest.mark.parametrize("path_bytes", [b"/metadata \t\n", b"/metadata-\xff"])
+def test_review_metadata_path_uses_filesystem_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path_bytes: bytes
+) -> None:
+    def git_output(repository: Path, *arguments: str) -> bytes:
+        assert repository == tmp_path
+        assert arguments == ("rev-parse", "--path-format=absolute", "--git-common-dir")
+        return path_bytes + b"\n"
+
+    monkeypatch.setattr(review_execution, "git_output", git_output)
+    directory = code_review.Reviewer(tmp_path)._directory()
+    assert os.fsencode(directory.parent) == path_bytes
+    assert directory.name == "h2h-review"
+
+
+def test_review_metadata_path_rejects_an_unterminated_git_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(review_execution, "git_output", lambda *_: b"/metadata ")
+    with pytest.raises(code_review.ReviewError, match=r"terminate.*record"):
+        code_review.Reviewer(tmp_path)._directory()
+
+
 @pytest.mark.parametrize("index", [False, True])
 def test_review_verification_rejects_a_different_expected_tree(
     review_repository: ReviewRepository, index: bool
@@ -1019,7 +1129,14 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     try:
         started = time.monotonic()
         with pytest.raises(process.ProcessOwnershipError, match=r"cleanup.*proven"):
-            reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
+            reviewer._run(
+                target,
+                index=True,
+                revision="HEAD",
+                timeout=10,
+                model=None,
+                destination=repo.state / "prepared.json",
+            )
         assert time.monotonic() - started < 10
         assert len(review_processes) == 1
         assert review_processes[0].poll() == 0
@@ -1146,7 +1263,16 @@ def _write_fixture_receipt(
         "plan_digest": plan.fingerprint,
         "stages": stages,
     }
-    reviewer._write_receipt(target, result, "fixture", None, state, execution=execution)
+    # Deliberate synthetic fixture authority, not a production publication entry.
+    reviewer._write_receipt(
+        target,
+        result,
+        "fixture",
+        None,
+        state,
+        execution=execution,
+        destination=reviewer._receipt_path(target),
+    )
 
 
 def test_reviewer_instances_keep_roots_and_evidence_separate(tmp_path: Path) -> None:
@@ -1176,7 +1302,9 @@ def test_windows_offline_verification_does_not_require_codex_or_posix_locks(
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
     _write_fixture_receipt(reviewer, target, repo.state)
-    monkeypatch.setattr(code_review, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(
+        code_review, "os", SimpleNamespace(name="nt", fsdecode=os.fsdecode)
+    )
     with reviewer._review_lock(target, exclusive=False):
         assert reviewer._verify(target).exists()
     with pytest.raises(code_review.ReviewError, match="requires POSIX"):
@@ -1342,7 +1470,14 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
     signal.signal(signal_number, unprotected_signal)
     try:
         with pytest.raises(code_review.ReviewError, match="interrupted by signal"):
-            reviewer._run(target, index=True, revision="HEAD", timeout=8, model=None)
+            reviewer._run(
+                target,
+                index=True,
+                revision="HEAD",
+                timeout=8,
+                model=None,
+                destination=repo.state / "prepared.json",
+            )
         assert len(owned) == 1
         child = owned[0]
         assert cleanup_started == [child.pid]
@@ -1580,6 +1715,154 @@ def test_baseline_classifier_only_falls_back_for_clean_git_query_failure(
                 pytest.fail("Unknown cleanup cannot become a new full review")
         assert caught.value is unknown
     assert injected == [("cat-file", "blob", historical_blob)]
+
+
+@pytest.mark.parametrize(
+    ("boundary", "failure_kind"),
+    [
+        ("metadata", "timeout"),
+        ("blobs", "descendants"),
+        ("metadata", "size"),
+        ("planning", "deadline"),
+        ("metadata", "git"),
+        ("blobs", "git"),
+        ("metadata", "ownership"),
+        ("blobs", "ownership"),
+    ],
+)
+def test_historical_plan_execution_failure_cannot_admit_a_fallback_review(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    failure_kind: str,
+) -> None:
+    repo = review_repository
+    baseline_commit, baseline_path = _merge_full_baseline(repo)
+    baseline_bytes = baseline_path.read_bytes()
+    historical_tree = repo.git("rev-parse", f"{baseline_commit}^{{tree}}")
+    _next_candidate(repo)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    receipt = reviewer._receipt_path(target)
+    calls_before = len(repo.calls())
+    build = review_plan.build_plan
+    git_output = review_execution.git_output
+    clock = time.monotonic
+    offset = 0.0
+    historical = False
+    injected: list[str] = []
+    local_cutoffs: list[float] = []
+    failure = (
+        process.ProcessOwnershipError("Historical query cleanup is unknown")
+        if failure_kind == "ownership"
+        else review_execution.ExecutionError(
+            {
+                "timeout": "Historical Git query deadline expired",
+                "descendants": "Historical Git query descendants needed cleanup",
+                "size": "Historical Git output exceeds review memory budget",
+            }.get(failure_kind, "Historical execution failed")
+        )
+    )
+
+    def plan(
+        repository: Path,
+        plan_target: dict[str, Any],
+        scope: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> review_plan.Plan:
+        nonlocal historical, offset
+        historical = plan_target["tree"] == historical_tree
+        try:
+            if historical and boundary == "planning":
+                # Expire only the existing local 120-second history-read slice;
+                # the original aggregate review deadline is still unexpired.
+                local_cutoffs.append(deadline)
+                assert 0 < deadline - clock() <= 120
+                offset = 121.0
+                remaining = review_execution.remaining()
+                assert remaining is not None and remaining > 0
+                injected.append("local-deadline")
+            return build(repository, plan_target, scope, deadline=deadline)
+        finally:
+            historical = False
+            offset = 0.0
+
+    def read(
+        repository: Path,
+        *arguments: str,
+        deadline: float | None = None,
+        input_bytes: bytes | None = None,
+        max_output_bytes: int | None = None,
+    ) -> bytes:
+        selected = (
+            arguments[:1] == ("ls-tree",)
+            if boundary == "metadata"
+            else boundary == "blobs" and arguments == ("cat-file", "--batch")
+        )
+        if historical and selected:
+            injected.append(boundary)
+            if failure_kind == "git":
+                # Preserve the normal fully owned nonzero-query fallback.
+                return git_output(
+                    repository, "cat-file", "blob", "0" * 40, deadline=deadline
+                )
+            raise failure
+        return git_output(
+            repository,
+            *arguments,
+            deadline=deadline,
+            input_bytes=input_bytes,
+            max_output_bytes=max_output_bytes,
+        )
+
+    monkeypatch.setattr(review_plan, "build_plan", plan)
+    monkeypatch.setattr(review_execution, "git_output", read)
+    monkeypatch.setattr(time, "monotonic", lambda: clock() + offset)
+    monkeypatch.setattr(sys, "argv", ["review-code.py", "run", "--index"])
+    for name in ("PATH", "FAKE_CODEX_STATE", "FAKE_CODEX_SCOPE_PARENT"):
+        monkeypatch.setenv(name, repo.environment[name])
+    outcome: SystemExit | None = None
+    try:
+        code_review.main(repo.path)
+    except SystemExit as error:
+        outcome = error
+    (repo.state / "history-execution-proof.json").write_text(
+        json.dumps(
+            {
+                "boundary": boundary,
+                "failure_kind": failure_kind,
+                "exit_code": None if outcome is None else outcome.code,
+                "cause_type": None
+                if outcome is None
+                else type(outcome.__cause__).__name__,
+                "new_reviewer_calls": len(repo.calls()) - calls_before,
+                "canonical_receipt_exists": receipt.exists(),
+                "injected": injected,
+                "historical_local_deadlines": local_cutoffs,
+            }
+        )
+    )
+    assert injected
+    assert baseline_path.read_bytes() == baseline_bytes
+    if failure_kind == "git":
+        assert outcome is None
+        assert len(repo.calls()) > calls_before
+        assert _candidate_receipt(repo)[1]["scope"] == "repository"
+        _assert_passed(repo.review("verify", "--index"))
+    else:
+        assert outcome is not None, "Historical execution failure became a full review"
+        assert len(repo.calls()) == calls_before, "Failed history admitted a reviewer"
+        assert not receipt.exists(), "Failed history published canonical evidence"
+        expected = (
+            process.TERMINATION_FAILED_EXIT_CODE if failure_kind == "ownership" else 1
+        )
+        assert outcome.code == expected
+        if failure_kind == "deadline":
+            assert isinstance(outcome.__cause__, review_execution.ExecutionError)
+            assert "deadline" in str(outcome.__cause__)
+        else:
+            assert outcome.__cause__ is failure
 
 
 @pytest.mark.parametrize(
@@ -1840,7 +2123,9 @@ def test_managed_receipt_revalidates_candidate_and_coverage_before_publication(
         reviewer._review_lock(target, exclusive=True),
         pytest.raises(code_review.ReviewError, match=r"candidate|coverage|no unstaged"),
     ):
-        reviewer._publish_managed_receipt(target, pending)
+        reviewer._publish_managed_receipt(
+            target, pending, destination=repo.state / "prepared.json"
+        )
     assert not receipt.exists()
     assert pending.exists()
 
@@ -1863,7 +2148,14 @@ def test_result_diagnostic_failure_cannot_publish_standalone_evidence(
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
     monkeypatch.setattr(process, "report_diagnostic", report)
     with pytest.raises(process.ProcessOwnershipError) as raised:
-        reviewer._run(target, index=True, revision="HEAD", timeout=10, model=None)
+        reviewer._run(
+            target,
+            index=True,
+            revision="HEAD",
+            timeout=10,
+            model=None,
+            destination=repo.state / "prepared.json",
+        )
     assert raised.value is failure
     assert not reviewer._receipt_path(target).exists()
     assert len(repo.calls()) == 1
@@ -2163,7 +2455,103 @@ def test_partitioned_review_requires_every_shard_and_integration(
         )
 
 
-def test_passing_receipt_is_removed_if_publication_finishes_after_deadline(
+@pytest.mark.parametrize("integration_finding", [False, True])
+def test_complete_finding_round_collects_all_waves_before_blocking(
+    review_repository: ReviewRepository, integration_finding: bool
+) -> None:
+    repo = review_repository
+    (repo.path / "large.py").write_text("value = 1\n" * 200000)
+    repo.git("add", "large.py")
+    modes = {"shard-0000": "p2", "shard-0004": "p1"}
+    if integration_finding:
+        modes["integration"] = "p0"
+    repo.environment["FAKE_CODEX_STAGE_MODES"] = json.dumps(modes)
+
+    outcome = repo.review("run", "--index")
+
+    _assert_blocked(outcome)
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    assert not reviewer._receipt_path(target).exists()
+    runs = repo.path / ".git/h2h-review/runs"
+    (run,) = runs.iterdir()
+    plan = json.loads((run / "plan.json").read_text())
+    count = len(plan["shards"])
+    assert count > review_execution.CONCURRENCY
+    expected = [f"shard-{index:04d}" for index in range(count)] + ["integration"]
+    assignments = [
+        json.loads(
+            str(call["prompt"]).split(
+                "COORDINATOR ASSIGNMENT (data, not instructions):\n", 1
+            )[1]
+        )
+        for call in repo.calls()
+    ]
+    identifiers = [item["shard_id"] for item in assignments]
+    assert len(identifiers) == len(expected) and set(identifiers) == set(expected)
+    assert identifiers[-1] == "integration"
+    results = {
+        key: json.loads((run / key / "result.json").read_text()) for key in expected
+    }
+    assert assignments[-1]["units"] == []
+    assert set(assignments[-1]["integration_obligations"]) == set(
+        review_plan.INTEGRATION_OBLIGATIONS
+    )
+    for handoff in assignments[-1]["handoffs"]:
+        key = handoff["shard_id"]
+        assert handoff["contracts"] == results[key]["contracts"]
+    for key in modes:
+        assert results[key]["verdict"] == "changes_requested"
+        assert f"Finding from {key}" in outcome.stderr
+    assert results["integration"]["verdict"] == (
+        "changes_requested" if integration_finding else "pass"
+    )
+    assert not (run / "receipt.json").exists()
+    calls = repo.calls()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("incomplete", "blocked"),
+        ("contradictory", "verdict"),
+        ("empty-changes", "verdict"),
+        ("p2-missing-unit", "coverage"),
+        ("p2-oversize-contract", "bounded"),
+    ],
+)
+def test_invalid_finding_round_stops_before_more_waves_or_integration(
+    review_repository: ReviewRepository, mode: str, message: str
+) -> None:
+    repo = review_repository
+    (repo.path / "large.py").write_text("value = 1\n" * 200000)
+    repo.git("add", "large.py")
+    repo.environment["FAKE_CODEX_STAGE_MODES"] = json.dumps({"shard-0000": mode})
+    repo.environment["FAKE_CODEX_HOLD_OTHER_SHARDS"] = "1"
+
+    result = repo.review("run", "--index")
+
+    _assert_blocked(result)
+    assert message in result.stderr.lower()
+    calls = repo.calls()
+    identifiers = []
+    for call in calls:
+        schema = call["schema"]
+        assert isinstance(schema, dict)
+        identifiers.append(schema["properties"]["shard_id"]["enum"][0])
+    assert "shard-0000" in identifiers
+    assert len(identifiers) <= review_execution.CONCURRENCY
+    assert "shard-0004" not in identifiers
+    assert "integration" not in identifiers
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
+
+
+def test_staged_receipt_is_removed_if_preparation_finishes_after_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from h2h_dev_tools import review_execution
@@ -2175,6 +2563,7 @@ def test_passing_receipt_is_removed_if_publication_finishes_after_deadline(
     path = reviewer._receipt_path(target)
     document = json.loads(path.read_text())
     path.unlink()
+    staging = tmp_path / "prepared.json"
     original = os.replace
     renamed = []
 
@@ -2193,8 +2582,10 @@ def test_passing_receipt_is_removed_if_publication_finishes_after_deadline(
                 None,
                 repo.state,
                 execution=document["execution"],
+                destination=staging,
             )
-    assert renamed == [path]
+    assert renamed == [staging]
+    assert not staging.exists()
     assert not path.exists()
 
 
@@ -2339,11 +2730,11 @@ def test_offline_verify_rechecks_authority_after_evidence_validation(
 
 
 @pytest.mark.parametrize("boundary", ["write-return", "ancestor-exit", "run-return"])
-def test_standalone_completion_failure_revokes_published_receipt(
+def test_standalone_precommit_failure_prevents_canonical_receipt(
     review_repository: ReviewRepository, boundary: str
 ) -> None:
     repo = review_repository
-    marker = repo.state / "publication-reached"
+    marker = repo.state / "precommit-boundary-reached"
     injection = (
         "import time\nfrom contextlib import contextmanager\n"
         "from h2h_dev_tools import code_review, process\n"
@@ -2362,10 +2753,15 @@ def test_standalone_completion_failure_revokes_published_receipt(
         )
     elif boundary == "ancestor-exit":
         injection += (
+            "prepared = False\nwrite = code_review.Reviewer._write_receipt\n"
+            "def prepare(self, *args, **kwargs):\n"
+            "    global prepared\n    result = write(self, *args, **kwargs)\n"
+            "    prepared = True\n    return result\n"
+            "code_review.Reviewer._write_receipt = prepare\n"
             "original = code_review.Reviewer._select_coverage\n"
             "@contextmanager\ndef coverage(self, target, **kwargs):\n"
             "    with original(self, target, **kwargs) as value: yield value\n"
-            "    if self._receipt_path(target).exists(): expire()\n"
+            "    if prepared: expire()\n"
             "code_review.Reviewer._select_coverage = coverage\n"
         )
     else:
@@ -2391,14 +2787,14 @@ def test_standalone_completion_failure_revokes_published_receipt(
 @pytest.mark.parametrize(
     "boundary", ["publish-return", "pending-cleanup", "cleanup-proof"]
 )
-def test_managed_completion_failure_revokes_published_receipt(
+def test_managed_precommit_failure_prevents_canonical_receipt(
     review_repository: ReviewRepository, boundary: str, tmp_path: Path
 ) -> None:
     repo = review_repository
     classifier = repo.path / "scripts/check_change_scope.py"
     classifier.write_text("print('full')\n")
     repo.git("add", "scripts/check_change_scope.py")
-    marker = repo.state / "publication-reached"
+    marker = repo.state / "precommit-boundary-reached"
     cleanup = tmp_path / "owner-cleanup"
     package = (repo.path / repo.implementation).parent
     script = (
@@ -2414,8 +2810,8 @@ def test_managed_completion_failure_revokes_published_receipt(
     if boundary == "publish-return":
         script += (
             "original = code_review.Reviewer._publish_managed_receipt\n"
-            "def publish(self, *args):\n"
-            "    result = original(self, *args)\n    expire()\n    return result\n"
+            "def publish(self, *args, **kwargs):\n"
+            "    result = original(self, *args, **kwargs)\n    expire()\n    return result\n"
             "code_review.Reviewer._publish_managed_receipt = publish\n"
         )
     elif boundary == "pending-cleanup":
@@ -2473,11 +2869,11 @@ def test_managed_completion_failure_revokes_published_receipt(
 
 @pytest.mark.parametrize("boundary", ["write-return", "run-return"])
 @pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM", "SIGHUP"])
-def test_standalone_publication_signal_revokes_receipt(
+def test_standalone_precommit_signal_prevents_canonical_receipt(
     review_repository: ReviewRepository, boundary: str, signal_name: str
 ) -> None:
     repo = review_repository
-    marker = repo.state / "signal-after-publication"
+    marker = repo.state / "signal-before-canonical-commit"
     injection = (
         "import os, signal\n"
         "from h2h_dev_tools import code_review, process\n"
@@ -2511,8 +2907,8 @@ def test_standalone_publication_signal_revokes_receipt(
     assert marker.exists(), result.stdout + result.stderr
     assert repo.calls(), "The real owned reviewer must finish before interruption"
     _assert_blocked(result)
-    # This is a real signal after atomic publication, not an injected exception.
-    # Offline verification must reject the failed invocation after its lock exits.
+    # This is a real signal after staging, before the terminal canonical rename.
+    # Offline verification must reject the incomplete preparation after lock exit.
     _assert_blocked(repo.review("verify", "--index"))
     reviewer = code_review.Reviewer(repo.path)
     assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
@@ -2523,14 +2919,14 @@ def test_standalone_publication_signal_revokes_receipt(
 @pytest.mark.parametrize(
     "boundary", ["publish-return", "pending-cleanup", "cleanup-proof"]
 )
-def test_managed_publication_signal_revokes_receipt(
+def test_managed_precommit_signal_prevents_canonical_receipt(
     review_repository: ReviewRepository, signal_name: str, boundary: str, tmp_path: Path
 ) -> None:
     repo = review_repository
     classifier = repo.path / "scripts/check_change_scope.py"
     classifier.write_text("print('full')\n")
     repo.git("add", "scripts/check_change_scope.py")
-    marker = repo.state / "publication-signal"
+    marker = repo.state / "precommit-signal"
     cleanup = tmp_path / "owner-cleanup"
     package = (repo.path / repo.implementation).parent
     script = (
@@ -2547,8 +2943,8 @@ def test_managed_publication_signal_revokes_receipt(
     if boundary == "publish-return":
         script += (
             "original = code_review.Reviewer._publish_managed_receipt\n"
-            "def publish(self, *args):\n"
-            "    result = original(self, *args)\n    interrupt()\n    return result\n"
+            "def publish(self, *args, **kwargs):\n"
+            "    result = original(self, *args, **kwargs)\n    interrupt()\n    return result\n"
             "code_review.Reviewer._publish_managed_receipt = publish\n"
         )
     elif boundary == "pending-cleanup":
@@ -2602,8 +2998,8 @@ def test_managed_publication_signal_revokes_receipt(
     reviewer = code_review.Reviewer(repo.path)
     receipt = reviewer._receipt_path(reviewer._target(index=True))
     verification = repo.review("verify", "--index")
-    # Record the real consequence before the negative assertion: OLD SIGTERM/HUP
-    # kills the owner with a passing receipt that the unchanged verifier accepts.
+    # Record the real precommit outcome before asserting that no canonical
+    # evidence became visible; process cleanup proof remains a separate authority.
     (repo.state / "signal-proof.json").write_text(
         json.dumps(
             {
@@ -2795,8 +3191,204 @@ def test_planning_obeys_the_active_phase_deadline(
             revision="HEAD",
             timeout=900,
             model=None,
+            destination=repo.state / "prepared.json",
             started=started,
         )
     assert observed == [cutoff]
     assert not repo.calls(), "Planning must be bounded before Codex admission"
     assert not reviewer._receipt_path(target).exists()
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["standalone", "managed"])
+def test_non_utf8_metadata_receipt_round_trips_through_publication(
+    review_repository: ReviewRepository, tmp_path: Path, managed: bool
+) -> None:
+    repo = review_repository
+    if managed:
+        (repo.path / "scripts/check_change_scope.py").write_text("print('full')\n")
+        repo.git("add", "scripts/check_change_scope.py")
+    common = Path(os.fsdecode(os.fsencode(tmp_path) + b"/metadata-\xff"))
+    try:
+        common.mkdir()
+    except OSError as error:
+        if error.errno == errno.EILSEQ:
+            pytest.skip("The host filesystem rejects non-UTF-8 filename bytes")
+        raise
+    initialized = subprocess.run(
+        ("git", "init", "--separate-git-dir", str(common)),
+        cwd=repo.path,
+        env=repo.environment,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    # Human diagnostics need not expose undecodable raw bytes to this text fixture.
+    repo.environment["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+    arguments = [
+        sys.executable,
+        "scripts/review-code.py",
+        "run",
+        "--index",
+        "--timeout-seconds",
+        "60",
+    ]
+    cleanup = tmp_path / "owner-cleanup"
+    if managed:
+        arguments = [
+            sys.executable,
+            "-I",
+            "-B",
+            str((repo.path / repo.implementation).with_name("merge_command.py")),
+            "--review",
+            "--cleanup-receipt",
+            str(cleanup),
+            str(repo.path),
+            "--",
+            *arguments,
+        ]
+
+    def run(mode: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            arguments,
+            cwd=repo.path,
+            env=repo.environment
+            | {"FAKE_CODEX_MODE": mode, "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "60"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+
+    _assert_passed(run("pass"))
+    receipts = list((common / "h2h-review/receipts").glob("*.json"))
+    assert len(receipts) == 1
+    document = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert Path(document["run_directory"]).is_relative_to(common / "h2h-review/runs")
+    assert b"metadata-\xff" in os.fsencode(document["run_directory"])
+    _assert_passed(repo.review("verify", "--index"))
+    if managed:
+        assert cleanup.read_text() == "owned_tree_empty\n"
+    _assert_blocked(run("p2"))
+    assert not receipts[0].exists()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert len(repo.calls()) == 2
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["standalone", "managed"])
+def test_incomplete_publication_remains_unverifiable_if_stage_removal_fails(
+    review_repository: ReviewRepository, tmp_path: Path, managed: bool
+) -> None:
+    repo = review_repository
+    if managed:
+        (repo.path / "scripts/check_change_scope.py").write_text("print('full')\n")
+        repo.git("add", "scripts/check_change_scope.py")
+    marker = repo.state / "publication-reached"
+    failed_cleanup = repo.state / "unlink-failed"
+    injection = (
+        "import time\nfrom h2h_dev_tools import code_review\n"
+        "clock = time.monotonic\noffset = 0\n"
+        "time.monotonic = lambda: clock() + offset\n"
+        "original_unlink = Path.unlink\nblocked_paths = set()\n"
+        "def unlink(path, *, missing_ok=False):\n"
+        "    if path in blocked_paths and path.exists():\n"
+        f"        Path({str(failed_cleanup)!r}).touch()\n"
+        "        raise OSError('injected persistent receipt cleanup failure')\n"
+        "    return original_unlink(path, missing_ok=missing_ok)\n"
+        "Path.unlink = unlink\n"
+        f"original = code_review.Reviewer.{('_publish_managed_receipt' if managed else '_write_receipt')}\n"
+        "def late(self, *args, **kwargs):\n"
+        "    global offset\n"
+        "    path = original(self, *args, **kwargs)\n"
+        "    blocked_paths.add(path)\n"
+        f"    Path({str(marker)!r}).touch()\n"
+        "    offset = 1000\n"
+        "    return path\n"
+        f"code_review.Reviewer.{('_publish_managed_receipt' if managed else '_write_receipt')} = late\n"
+    )
+    cleanup = tmp_path / "owner-cleanup"
+    if managed:
+        package = (repo.path / repo.implementation).parent
+        script = (
+            "import runpy\nfrom pathlib import Path\n"
+            f"package = Path({str(package)!r})\n"
+            "runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')\n"
+            + injection
+            + "from h2h_dev_tools import merge_command\nraise SystemExit(merge_command.main())\n"
+        )
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                script,
+                "--review",
+                "--cleanup-receipt",
+                str(cleanup),
+                str(repo.path),
+                "--",
+                sys.executable,
+                "scripts/review-code.py",
+                "run",
+                "--index",
+                "--timeout-seconds",
+                "60",
+            ),
+            cwd=repo.path,
+            env=repo.environment | {"H2H_CODE_REVIEW_TIMEOUT_SECONDS": "60"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    else:
+        entry = repo.path / "scripts/review-code.py"
+        entry.write_text(
+            entry.read_text().replace("main(root)\n", injection + "main(root)\n")
+        )
+        repo.git("add", "scripts/review-code.py")
+        result = repo.review("run", "--index", "--timeout-seconds", "60")
+    assert marker.exists() and failed_cleanup.exists(), result.stdout + result.stderr
+    _assert_blocked(result)
+    reviewer = code_review.Reviewer(repo.path)
+    receipt = reviewer._receipt_path(reviewer._target(index=True))
+    verification = repo.review("verify", "--index")
+    (repo.state / "failed-revocation-proof.json").write_text(
+        json.dumps(
+            {
+                "run_returncode": result.returncode,
+                "receipt_exists": receipt.exists(),
+                "verify_returncode": verification.returncode,
+                "cleanup_receipt_exists": cleanup.exists(),
+            }
+        )
+    )
+    assert not receipt.exists(), "An incomplete attempt must never become canonical"
+    _assert_blocked(verification)
+    assert len(repo.calls()) == 1, "Offline verify must not launch a reviewer"
+
+
+def test_receipt_json_preserves_filesystem_surrogates(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    directory = repo.state
+    original_str = Path.__str__
+    wire_path = original_str(directory) + os.fsdecode(b"/metadata-\xff")
+
+    def directory_text(path: Path) -> str:
+        return wire_path if path is directory else original_str(path)
+
+    # APFS rejects such filenames, so isolate the wire representation here.
+    # Child paths retain real filesystem identity; the real POSIX path case
+    # above separately exercises Git, pending publication and revocation.
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "__str__", directory_text)
+        _write_fixture_receipt(reviewer, target, directory)
+    receipt = reviewer._receipt_path(target)
+    document = json.loads(receipt.read_text(encoding="utf-8"))
+    assert os.fsencode(document["run_directory"]) == os.fsencode(wire_path)
+    assert reviewer._verify(target) == receipt

@@ -5,9 +5,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import pytest
 from test_merge_workflow import _PASS_REVIEW, fixture_repository, git
@@ -1252,23 +1255,28 @@ def test_merge_preview_rejects_failed_or_malformed_output(
     original = subprocess.run
 
     def run(
-        command: tuple[str, ...], *, capture_output: bool, check: bool
+        command: tuple[str, ...], *, stdout: BinaryIO, stderr: BinaryIO, check: bool
     ) -> subprocess.CompletedProcess[bytes]:
         if "merge-tree" in command:
             if failure == "unsupported":
-                return subprocess.CompletedProcess(
-                    command, 129, b"", b"unknown option write-tree"
-                )
+                os.write(stderr.fileno(), b"unknown option write-tree")
+                return subprocess.CompletedProcess(command, 129)
             output = primary.encode() + (
                 b"\0" if failure == "not-tree" else b"unterminated"
             )
-            return subprocess.CompletedProcess(command, 0, output, b"")
-        return original(command, capture_output=capture_output, check=check)
+            os.write(stdout.fileno(), output)
+            return subprocess.CompletedProcess(command, 0)
+        return original(command, stdout=stdout, stderr=stderr, check=check)
 
     before = state.read_bytes()
+    expected_error = {
+        "unsupported": "unknown option write-tree",
+        "incomplete": "did not return one complete tree object",
+        "not-tree": "result is not a tree object",
+    }[failure]
     with monkeypatch.context() as context:
         context.setattr(subprocess, "run", run)
-        with pytest.raises(admission.AdmissionError, match=r"preview|Preview"):
+        with pytest.raises(admission.AdmissionError, match=expected_error):
             admission.begin(state, cleanup=False)
     assert state.read_bytes() == before
     assert git(root, "rev-parse", "HEAD") == primary
@@ -1499,3 +1507,48 @@ def test_capture_exports_only_a_mergeable_owned_tree(
     assert not (root / ".git/MERGE_HEAD").exists()
     admission.recover_restore(state)
     admission.release(state)
+
+
+def test_git_capture_reads_fixed_extents_before_callback_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_temporary_file = tempfile.TemporaryFile
+    streams: list[BinaryIO] = []
+    requested_sizes: list[int] = []
+    expected_stdout = b"query result\n"
+    expected_stderr = b"query diagnostic\n"
+
+    @contextmanager
+    def growing_spool() -> Iterator[BinaryIO]:
+        with original_temporary_file() as stream:
+            streams.append(stream)
+            original_read = stream.read
+
+            def append_then_read(size: int = -1) -> bytes:
+                requested_sizes.append(size)
+                position = stream.tell()
+                stream.seek(0, os.SEEK_END)
+                stream.write(b"late callback output\n")
+                stream.seek(position)
+                return original_read(size)
+
+            monkeypatch.setattr(stream, "read", append_then_read)
+            yield stream
+
+    def completed_git(
+        command: tuple[str, ...], *, stdout: BinaryIO, stderr: BinaryIO, check: bool
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert not check
+        stdout.write(expected_stdout)
+        stderr.write(expected_stderr)
+        stdout.flush()
+        stderr.flush()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", growing_spool)
+    monkeypatch.setattr(subprocess, "run", completed_git)
+    result = admission._capture_git(tmp_path, "status", "--porcelain=v1")
+    assert result.stdout == expected_stdout
+    assert result.stderr == expected_stderr
+    assert requested_sizes == [len(expected_stdout), len(expected_stderr)]
+    assert len(streams) == 2 and all(stream.closed for stream in streams)

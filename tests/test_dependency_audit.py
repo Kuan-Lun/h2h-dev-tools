@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import tomllib
+from pathlib import Path
 from typing import Any
 
 import pytest
+from test_release_policy import commit, write_project
+from test_release_policy import repository as repository
 
-from h2h_dev_tools import dependency_audit
+from h2h_dev_tools import dependency_audit, version_policy
 
 
 def test_python_inventory_includes_build_runtime_optional_and_groups() -> None:
@@ -86,3 +91,75 @@ def test_npm_range_compatibility_is_queried_separately(
         dependency_audit._audit_node("fixture", ">=1")["latest_satisfies"] is expected
     )
     assert calls[-1] == ("npm", "view", "fixture@>=1", "version", "--json")
+
+
+def _use_cp1252_default_text_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    read_text, write_text = Path.read_text, Path.write_text
+
+    def read(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> str:
+        return read_text(
+            path, encoding=encoding or "cp1252", errors=errors, newline=newline
+        )
+
+    def write(
+        path: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        return write_text(
+            path, data, encoding=encoding or "cp1252", errors=errors, newline=newline
+        )
+
+    # Real filesystem I/O under a controlled default codec; explicit encodings
+    # still work normally. Assertions inspect bytes and the actual validator,
+    # not the implementation's write_text keyword arguments.
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(Path, "write_text", write)
+
+
+@pytest.mark.parametrize("note", ["café", "中文審查"])
+def test_audit_receipt_is_utf8_independent_of_locale(
+    repository: Path, monkeypatch: pytest.MonkeyPatch, note: str
+) -> None:
+    write_project(repository, "0.1.0")
+    with monkeypatch.context() as locale_patch:
+        _use_cp1252_default_text_io(locale_patch)
+        locale_patch.setattr(sys, "argv", ["audit-dependencies", "--review-note", note])
+        assert dependency_audit.main() == 0
+    raw = (repository / ".release/dependency-audit.json").read_bytes()
+    assert json.loads(raw)["review"]["note"] == note
+    assert note.encode("utf-8") in raw
+    raw.decode("utf-8")
+    tree = commit(repository, "test: retain generated Unicode audit")
+    document = tomllib.loads(
+        (repository / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    version_policy._validate_audit(tree, document, "0.1.0")
+
+
+def test_audit_package_json_uses_utf8(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_project(repository, "0.1.0")
+    package = {"description": "丁", "devDependencies": {}}
+    (repository / "package.json").write_bytes(
+        json.dumps(package, ensure_ascii=False).encode("utf-8")
+    )
+    with monkeypatch.context() as locale_patch:
+        _use_cp1252_default_text_io(locale_patch)
+        locale_patch.setattr(
+            sys, "argv", ["audit-dependencies", "--review-note", "Checked fixture"]
+        )
+        assert dependency_audit.main() == 0
+    tree = commit(repository, "test: retain UTF-8 package audit")
+    document = tomllib.loads(
+        (repository / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    version_policy._validate_audit(tree, document, "0.1.0")

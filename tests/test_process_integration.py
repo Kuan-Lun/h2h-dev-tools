@@ -8,7 +8,8 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -171,6 +172,59 @@ def _source_bootstrap(package: Path) -> str:
     )
 
 
+@contextmanager
+def _diagnostic_launcher(
+    command: process.ProcessCommand, *, deadline: float
+) -> Iterator[process.OwnedProcess]:
+    with process.controlled_termination_signals() as controller:
+        owner: process.OwnedProcess | None = None
+        try:
+            with controller.defer():
+                owner = process.start_owned_process(
+                    command, deadline=deadline, signal_controller=controller
+                )
+            yield owner
+        finally:
+            # A failed oracle may need rescue; a successful body must already
+            # have proved the complete tree empty without sending any signal.
+            failure = sys.exception()
+            with controller.defer():
+                if owner is not None:
+                    if failure is not None:
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
+                    scope = owner.posix_scope
+                    if scope is not None:
+                        assert not scope.capability.directory.exists()
+                        if scope.parent is not None:
+                            with scope.parent.locked(deadline=deadline):
+                                assert not (
+                                    scope.parent.directory
+                                    / "pending"
+                                    / scope.capability.token
+                                ).exists()
+
+
+def _assert_diagnostic_cleanup(owner: process.OwnedProcess, *, deadline: float) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(owner.process.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("Diagnostic launcher/writer group survived")
+        scope = owner.posix_scope
+        assert scope is not None
+        assert not scope.has_pending(deadline=deadline), (
+            "Diagnostic nested cleanup obligations remain"
+        )
+    # This only observes absence and seals admission; it does not terminate a
+    # surviving writer. Windows retains the corresponding whole-Job proof.
+    assert process.wait_for_owned_tree_exit(
+        owner, deadline=deadline, poll_deadline=time.monotonic()
+    )
+
+
 @pytest.mark.parametrize("standard_output", [False, True])
 @pytest.mark.parametrize(
     "poisoned_source_package", ["process.py", "_process_scope.py"], indirect=True
@@ -195,19 +249,21 @@ def test_full_diagnostic_pipe_preserves_completion_and_blocking_mode(
         "raise SystemExit(7)\n"
     )
     read_descriptor, write_descriptor = os.pipe()
+    # Retain the original 5s leader wait and 5s failure-only rescue envelope.
+    deadline = time.monotonic() + 10
     try:
-        child = subprocess.Popen(
+        command = process.ProcessCommand(
+            "full diagnostic pipe",
             (sys.executable, "-I", "-B", "-c", script),
+            tmp_path,
             stdout=write_descriptor if standard_output else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL if standard_output else write_descriptor,
         )
-        try:
-            assert child.wait(timeout=5) == 7
+        with _diagnostic_launcher(command, deadline=deadline) as owner:
+            assert owner.process.wait(timeout=5) == 7
             assert marker.read_text() == "True"
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=5)
+            assert os.get_blocking(write_descriptor)
+            _assert_diagnostic_cleanup(owner, deadline=deadline)
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
@@ -251,38 +307,128 @@ def test_full_diagnostic_pipe_cannot_delay_owned_cleanup(
         "raise SystemExit(status)\n"
     )
     read_descriptor, write_descriptor = os.pipe()
-    group: int | None = None
+    # Preserve the original ready/leader/rescue stages, each bounded by 5s.
+    # The inner command still owns its original 3s timeout and 1s reserve.
+    deadline = time.monotonic() + 15
     try:
-        owner = subprocess.Popen(
+        command = process.ProcessCommand(
+            "diagnostic cleanup under backpressure",
             (sys.executable, "-I", "-B", "-c", script),
+            tmp_path,
             stdout=write_descriptor if standard_output else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL if standard_output else write_descriptor,
-            cwd=tmp_path,
-            start_new_session=True,
         )
-        try:
-            deadline = time.monotonic() + 5
+        with _diagnostic_launcher(command, deadline=deadline) as owner:
+            ready_deadline = time.monotonic() + 5
             while not ready.exists():
-                assert owner.poll() is None
-                assert time.monotonic() < deadline, "The child did not fill its pipe"
+                assert owner.process.poll() is None
+                assert time.monotonic() < ready_deadline, (
+                    "The child did not fill its pipe"
+                )
                 time.sleep(0.01)
             group = int(ready.read_text())
             if trigger == "cancel":
-                owner.send_signal(signal.SIGTERM)
+                owner.process.send_signal(signal.SIGTERM)
             expected = 143 if trigger == "cancel" else process.TIMEOUT_EXIT_CODE
-            assert owner.wait(timeout=5) == expected
+            assert owner.process.wait(timeout=5) == expected
             assert completed.read_text() == str(expected)
             with pytest.raises(ProcessLookupError):
                 os.killpg(group, 0)
             assert os.get_blocking(write_descriptor)
-        finally:
-            for identifier in (group, owner.pid):
-                if identifier is not None:
-                    try:
-                        os.killpg(identifier, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            owner.wait(timeout=5)
+            _assert_diagnostic_cleanup(owner, deadline=deadline)
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real process group and scope ledger")
+@pytest.mark.parametrize("remaining", ["writer", "obligation"])
+def test_diagnostic_cleanup_oracle_rejects_remaining_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remaining: str
+) -> None:
+    from h2h_dev_tools import _process_scope as scopes
+
+    ready = tmp_path / "writer-ready"
+    completed = tmp_path / "launcher-completed"
+    writer = (
+        "import os\nfrom pathlib import Path\n"
+        "os.set_blocking(1, False)\n"
+        "try:\n"
+        "    while True: os.write(1, b'x' * 8192)\n"
+        "except BlockingIOError:\n    pass\n"
+        "finally:\n    os.set_blocking(1, True)\n"
+        f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+        "os.write(1, b'x' * 8192)\n"
+    )
+    script = (
+        "import subprocess, sys, time\nfrom pathlib import Path\n"
+        f"subprocess.Popen((sys.executable, '-I', '-B', '-c', {writer!r}))\n"
+        "deadline = time.monotonic() + 5\n"
+        f"while not Path({str(ready)!r}).exists():\n"
+        "    assert time.monotonic() < deadline\n"
+        "    time.sleep(.01)\n"
+        f"Path({str(completed)!r}).write_text('0')\n"
+        if remaining == "writer"
+        else "pass"
+    )
+    read_descriptor, write_descriptor = os.pipe()
+    deadline = time.monotonic() + 10
+    owner: process.OwnedProcess | None = None
+    try:
+        command = process.ProcessCommand(
+            "diagnostic oracle negative control",
+            (sys.executable, "-I", "-B", "-c", script),
+            tmp_path,
+            stdout=write_descriptor,
+            stderr=subprocess.DEVNULL,
+        )
+        message = (
+            "Diagnostic launcher/writer group survived"
+            if remaining == "writer"
+            else "Diagnostic nested cleanup obligations remain"
+        )
+        # Only this exact oracle rejection is expected. Cleanup in the context's
+        # finally cannot create a passing observation or satisfy this match.
+        with pytest.raises(AssertionError, match=message):
+            with _diagnostic_launcher(command, deadline=deadline) as owner:
+                scope = owner.posix_scope
+                assert scope is not None
+                assert owner.process.wait(timeout=5) == 0
+                if remaining == "writer":
+                    # The old leader/status/marker oracle would pass here, even
+                    # though the actual same-group writer cannot finish its write.
+                    assert completed.read_text() == "0"
+                    writer_pid = int(ready.read_text())
+                    assert writer_pid != owner.process.pid
+                    assert os.getpgid(writer_pid) == owner.process.pid
+                    os.kill(writer_pid, 0)
+                    _assert_diagnostic_cleanup(owner, deadline=deadline)
+                else:
+                    nested: scopes.PosixScope | None = None
+                    with process.controlled_termination_signals() as controller:
+                        try:
+                            with (
+                                controller.defer(),
+                                monkeypatch.context() as environment,
+                            ):
+                                environment.setenv(
+                                    scopes.ENVIRONMENT_KEY, scope.capability.encode()
+                                )
+                                nested = scopes.PosixScope.create(deadline=deadline)
+                            _assert_diagnostic_cleanup(owner, deadline=deadline)
+                        finally:
+                            with controller.defer():
+                                if nested is not None:
+                                    # This fixture registered a real obligation but
+                                    # never admitted a process. Discharge it only
+                                    # after the oracle has had to reject it.
+                                    nested.proven_empty = True
+                                    nested.close(deadline=deadline)
+        assert owner is not None and owner.process.poll() is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
+        assert owner.posix_scope is not None
+        assert not owner.posix_scope.capability.directory.exists()
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
