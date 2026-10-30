@@ -593,13 +593,37 @@ A checkout that cannot preserve an executable parent initializer's mode cannot
 reuse that receipt; verify it in a supported POSIX checkout instead. This does not
 normalize filesystem modes or claim native Windows validation of executable
 initializers. The default timeout is 900 seconds
-(`--timeout-seconds` accepts 1..3600). Set `H2H_CODE_REVIEW_TIMEOUT_SECONDS=3600`
+(`--timeout-seconds` accepts 1..14400). Set `H2H_CODE_REVIEW_TIMEOUT_SECONDS=14400`
 when invoking `scripts/git-flow-merge.sh` to allow a longer first repository
 review; the same CLI validation applies. Old Core `h2hdb-review` receipts are not
 converted: run the new review to establish evidence for the current implementation.
 V3 also rejects V2 evidence and partial-run continuation. Updating the shared reviewer
 closure requires a fresh full-repository baseline in every updated consumer; historical
 receipts remain historical evidence, and are never rewritten into new coverage.
+
+Before starting Codex, review records its unit count, assigned bytes, shard count,
+concurrency, queued waves and remaining execution capacity in `time-budget.json`
+inside the Git metadata run directory. `--min-shard-seconds` optionally declares a
+per-shard planning estimate (0..14400; default 0 means no estimate). A plan needs
+`ceil(shards / 4) * estimate` seconds after elapsed preparation and the existing
+integration, cleanup and publication reservations. Insufficient capacity fails
+before any reviewer is admitted. The check runs again after CLI probing and prompt
+preparation, using the same absolute deadline. It neither extends the deadline nor
+sets a separate timeout per shard, and it does not guarantee completion or infer
+model throughput from byte counts. With no estimate, capacity is still recorded;
+the existing aggregate deadline remains the execution limit.
+
+For a large first review, supply an estimate based on completed-run observations:
+
+```bash
+H2H_CODE_REVIEW_TIMEOUT_SECONDS=14400 \
+H2H_CODE_REVIEW_MIN_SHARD_SECONDS=900 scripts/git-flow-merge.sh
+```
+
+The merge entry forwards the estimate to the same reviewer CLI. For example,
+54 shards require 14 waves and at least 12600 seconds with this estimate; a
+one-hour budget is rejected before spending review tokens. These diagnostics are
+planning data, not passing review evidence; partial runs are still not resumed.
 
 A deterministic plan binds every tracked path, mode, blob and text byte range.
 Fresh-context shards contain at most 32 units, each at most 64 KiB, packed into

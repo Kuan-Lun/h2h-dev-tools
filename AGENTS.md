@@ -315,8 +315,15 @@
 - Online review 目前限 POSIX，逾時或中斷會清理 Codex process group；刻意脫離
   group 的 descendants 不在保證內。Windows 可執行 offline verify；未驗證
   Windows Job Object review lifecycle 前不得聲稱支援 Windows online review。
-  預設 900 秒，`run --timeout-seconds` 只接受 1..3600 秒；merge 可透過
+  預設 900 秒，`run --timeout-seconds` 只接受 1..14400 秒；merge 可透過
   `H2H_CODE_REVIEW_TIMEOUT_SECONDS` 明確傳入同一上限。
+- Reviewer 啟動前記錄完整單元、bytes、分片、並行波次及扣除既有保留與已耗
+  準備時間後的執行容量。`--min-shard-seconds` 可明列每片規劃估計（0..14400；
+  預設 0 表示未提供估計），merge 由 `H2H_CODE_REVIEW_MIN_SHARD_SECONDS` 傳入。
+  估計按全部 `ceil(shards/4)` 波次計算，不足時在 reviewer admission 前拒絕；
+  CLI 探測與 prompt 準備後再次以原 absolute deadline 核對。不自動加長期限、
+  不新增逐片 timeout、不以 byte 數冒充模型速度或保證完成時間；大型首次審查
+  應依已完成執行的觀察明確設定估計。此預檢不改變完整輪次與 evidence 規則。
 - Merge 的 review stage 先以獨立 owned process group 完成分類；確認該組清空
   後，只有 full profile 才要求 local review 入口、取得 candidate lock 並啟動
   reviewer。純文件不要求 local review 入口或 Codex。Reviewer 驗證 parent PID、

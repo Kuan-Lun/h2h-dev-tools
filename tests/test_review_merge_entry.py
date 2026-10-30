@@ -13,9 +13,10 @@ _ENTRY = (
 )
 
 
-@pytest.mark.parametrize("timeout", [None, "3600"])
+@pytest.mark.parametrize("timeout", [None, "3600", "14400"])
+@pytest.mark.parametrize("estimate", [None, "900"])
 def test_merge_review_passes_explicit_deadline_to_reviewer(
-    tmp_path: Path, timeout: str | None
+    tmp_path: Path, timeout: str | None, estimate: str | None
 ) -> None:
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -28,8 +29,11 @@ def test_merge_review_passes_explicit_deadline_to_reviewer(
     (local_bin / "python").symlink_to(sys.executable)
     environment = os.environ.copy()
     environment.pop("H2H_CODE_REVIEW_TIMEOUT_SECONDS", None)
+    environment.pop("H2H_CODE_REVIEW_MIN_SHARD_SECONDS", None)
     if timeout is not None:
         environment["H2H_CODE_REVIEW_TIMEOUT_SECONDS"] = timeout
+    if estimate is not None:
+        environment["H2H_CODE_REVIEW_MIN_SHARD_SECONDS"] = estimate
     result = subprocess.run(
         ("bash", str(_ENTRY), str(tmp_path)),
         env=environment,
@@ -37,9 +41,12 @@ def test_merge_review_passes_explicit_deadline_to_reviewer(
         capture_output=True,
         text=True,
     )
-    assert json.loads(result.stdout) == [
+    expected = [
         "run",
         "--index",
         "--timeout-seconds",
         timeout or "900",
     ]
+    if estimate is not None:
+        expected.extend(("--min-shard-seconds", estimate))
+    assert json.loads(result.stdout) == expected
