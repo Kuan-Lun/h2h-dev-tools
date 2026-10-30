@@ -87,6 +87,7 @@ def test_npm_range_compatibility_is_queried_separately(
         )
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(dependency_audit, "_npm_command", lambda: ("npm",))
     assert (
         dependency_audit._audit_node("fixture", ">=1")["latest_satisfies"] is expected
     )
