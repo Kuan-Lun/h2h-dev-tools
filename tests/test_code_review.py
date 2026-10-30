@@ -1645,6 +1645,9 @@ def test_first_review_covers_existing_repository_and_verifies_before_merge(
     assert "For EACH unit_reviews entry, related_paths MUST include EVERY" in prompt
     assert "Repeat shared paths in every applicable unit entry" in prompt
     assert "Read those sources before attesting" in prompt
+    assert "exact repository-relative Git" in prompt
+    assert "Verify additional references" in prompt
+    assert ".venv/site-packages dependencies" in prompt
     assert "defects introduced by this complete change" not in prompt
     _, receipt = _candidate_receipt(repo)
     assert receipt["schema_version"] == 3
