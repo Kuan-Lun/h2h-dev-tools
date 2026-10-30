@@ -3990,7 +3990,7 @@ def test_release_gate_rejects_drift_during_final_review_verification(
         assert "Verified full merge candidate" not in result.stdout
 
 
-@pytest.mark.parametrize("timeout", [1, 20])
+@pytest.mark.parametrize("timeout", [1, 20, 40])
 def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: int
 ) -> None:
@@ -4016,12 +4016,18 @@ def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
         timeout=timeout + 20,
     )
     assert result.returncode != 0, result.stdout + result.stderr
-    assert time.monotonic() - started < timeout + 10, result.stdout + result.stderr
+    # A 20-second multi-shard plan has only four seconds for integration,
+    # less than its existing six-second cleanup reserve. Preflight must reject
+    # that plan before CLI probing. Forty seconds admits the stalled probe;
+    # retain its original thirty-second elapsed bound to exercise the shorter
+    # CLI-version deadline rather than merely waiting for the aggregate limit.
+    elapsed_limit = min(timeout + 10, 30)
+    assert time.monotonic() - started < elapsed_limit, result.stdout + result.stderr
     assert git(root, "branch", "--show-current") == "task"
     assert not (root / ".git/MERGE_HEAD").exists()
     assert not list((root / ".git/h2h-review").glob("receipts/*.json"))
     assert "owned_tree_empty=True" in result.stdout + result.stderr
-    if timeout == 20:
+    if timeout == 40:
         import fcntl
 
         assert marker.exists(), (
@@ -4029,6 +4035,10 @@ def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
         )
         with lock.open("a") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    else:
+        assert not marker.exists(), result.stdout + result.stderr
+        if timeout == 20:
+            assert "cannot admit shards and integration cleanup" in result.stderr
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX merge wrapper cancellation")
