@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-26T14:54:36+00:00",
+  "checked_at": "2026-10-30T10:08:48+00:00",
   "manifest_sha256": "aa20257539103591105ade67f7411e0eaff74f1ae5ce1d94a1bd0763f654f9c7",
   "node": [
     {
@@ -10,12 +10,12 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.10.0",
+  "project_version": "0.10.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
       "group": "build",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -70,7 +70,7 @@
     {
       "declared": "hatchling>=1.32.0",
       "group": "optional:dev",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -81,7 +81,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.4.0",
+      "latest": "2.4.1",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -92,7 +92,7 @@
     {
       "declared": "pytest>=9.1.1",
       "group": "optional:dev",
-      "latest": "9.1.1",
+      "latest": "9.2.0",
       "latest_satisfies": true,
       "name": "pytest",
       "python_3_14": true,
@@ -114,7 +114,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.2",
+      "latest": "0.17.3",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -124,7 +124,7 @@
     }
   ],
   "review": {
-    "note": "Release 0.10.0 reuses the human review of official release notes and registry metadata performed on 2026-10-26 at approximately 10:59 UTC for these exact versions: hatchling 1.32.4, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, ruff 0.17.2, markdownlint-cli2 0.24.0. The source dependency manifest and requires-python >=3.14 are unchanged. That historical research found all stable latest versions within the existing lower-bound-only requirements; no stable latest was outside the bounds. This release generator independently queries current PyPI/npm metadata. Generated versions, Python eligibility and bounds results must still match the reviewed set before release approval; any drift is retained for additional human review and blocks the release handoff. Non-yanked artifact Requires-Python metadata admitted Python 3.14 in the reviewed snapshot; distlib omits Requires-Python but declares Python 3.14, while pytest-xdist lacks an explicit 3.14 classifier. Metadata eligibility is not native-platform or runtime-test evidence. hatchling: Version 1.32.4 restores the build-hook generic interface and corrects whitespace around version metadata. The 1.32.0 metadata default is 2.5. No new build hook or dependency-bound change is proposed. Official notes: https://hatch.pypa.io/dev/history/hatchling/. distlib: Version 0.4.4 corrects launcher errors and Python executable detection, and strengthens archive containment using data_filter. The 0.4.5 heading is explicitly unreleased. Native Windows launcher validation remains separate. Official notes: https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib. packaging: Version 26.3 adds VersionRange, supports metadata 2.6, fixes requirement/marker normalization and exceptions, and requires Python >=3.9. Existing PEP 440/508 parser use does not identify a required bound change. Official notes: https://packaging.pypa.io/en/stable/changelog.html. build: Version 1.6.1 fixes a Windows symlink-probe regression. Version 1.6.0 removes BuildBackendException.exc_info, adds CLI build/report features and deprecates project_wheel_metadata. Existing release workflow uses the build CLI; no dependency upgrade is requested. Official notes: https://build.pypa.io/en/stable/changelog.html. mypy: Version 2.4.0 enables the native parser, supports Python 3.15, ignores legacy for/with variable type comments, and drops accelerated macOS x86_64 wheels. CPython 3.14 macOS arm64 wheels are present. Existing strict checks remain the required compatibility evidence; none ran in this research. Official notes: https://mypy.readthedocs.io/en/stable/changelog.html. pytest: Version 9.1.1 fixes RaisesGroup diagnostics, indirect fixture parametrization, parametrization typing and initial conftest discovery. Existing source-authoritative pytest entry remains required; no gate/test outcome is inferred from these notes. Official notes: https://docs.pytest.org/en/stable/changelog.html. pytest-xdist: Version 3.8.0 adds loadscope reordering controls. Requires-Python >=3.9 admits 3.14 but metadata does not explicitly classify Python 3.14. Actual local-worker source/ownership validation remains separate; this task does not alter worker policy. Official notes: https://pytest-xdist.readthedocs.io/en/latest/changelog.html. ruff: Version 0.17.2 fixes starred type-variable syntax handling and false positives, and marks comment-deleting fixes unsafe. Existing py314 formatter/lint settings should remain unchanged; this research did not rerun the fast gate. Official notes: https://github.com/astral-sh/ruff/releases/tag/0.17.2. markdownlint-cli2: Version 0.24.0 updates dependencies including markdownlint. Fresh npm metadata requires Node >=22. This is compatible with the established Node 24 toolchain; no Node or package installation occurred here. Official notes: https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md. The user approved the 0.10.0 breaking terminal-publication contract: all candidate, coverage, ancestor-unwind, owned-cleanup, deadline and pending-signal checks precede the final atomic canonical receipt rename; a successful terminal commit is not rolled back merely because its syscall returns after the deadline or a later interruption occurs. Post-commit invocation failure still blocks that merge. This batch also contains complete-round finding collection, Git metadata path/JSON serialization fixes, outer I/O failure handling and verified source-entry documentation/callers. No dependency or bound change is required by the reviewed dependency evidence. The unchanged local Markdown tool is 0.23.3 under Node 24; reviewing latest 0.24.0 does not assert it was installed or tested. The true non-UTF8 filename Linux end-to-end cases have not run: macOS rejects those filenames with EILSEQ, while direct serialization/reader/verify regressions are separately recorded; no Linux coverage is inferred from the audit. No fast/full/formal result is inferred from metadata research.",
+    "note": "Release 0.10.1 adds optional review schedule capacity estimation and permits explicitly requested aggregate review timeouts up to 14400 seconds. The default 900 seconds, source/coverage authority, complete-round review, owned cleanup, and terminal publication contracts are unchanged. No dependency declarations or Python requirement bounds change.\n\nOn 2026-10-30, reviewed current PyPI and npm metadata and official release notes. Reviewed latest set: hatchling 1.33.0, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.1, pytest 9.2.0, pytest-xdist 3.8.0, ruff 0.17.3, markdownlint-cli2 0.24.0. Every latest version is admitted by the existing lower-bound-only requirements; no latest stable version is excluded. All Python packages have non-yanked artifacts whose Requires-Python metadata admits 3.14. Distlib omits Requires-Python but explicitly classifies Python 3.14; pytest-xdist admits 3.14 through >=3.9 without a 3.14 classifier. This is eligibility evidence, not proof of runtime or native-platform compatibility. Mypy supplies macOS arm64 CPython 3.14 wheels. The npm engine requirement is Node >=22, satisfied by the established Node 24 toolchain.\n\nHatchling 1.33.0 adds official Python 3.15 support; the preceding 1.32.4 restores the build-hook generic interface. The backend and current build contract need no bound change. Source: https://hatch.pypa.io/dev/history/hatchling/.\nDistlib 0.4.4 is unchanged from the human-reviewed 0.10.0 audit: launcher and executable-detection fixes and archive containment checks; Windows execution is separate evidence. Source: https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib.\nPackaging 26.3 adds VersionRange and metadata 2.6 support and corrects requirement/marker normalization; Python >=3.9 includes 3.14. Existing PEP 440/508 parser use remains appropriate. Source: https://packaging.pypa.io/en/stable/changelog.html.\nBuild 1.6.1 corrects a Windows symlink-probe regression. The 1.6.0 removal of BuildBackendException.exc_info and deprecation of project_wheel_metadata do not affect this project's build CLI use. Source: https://build.pypa.io/en/stable/changelog.html.\nMypy 2.4 uses a native parser and supports Python 3.15; 2.4.1 corrects overload handling in two-phase checking and mypyc nested-function setup, and requires ast-serialize >=0.12.1. Reviewed the official tagged CHANGELOG and comparison because the default documentation heading still highlights 2.4.0. No new upper bound is justified; strict type checks remain necessary. Sources: https://mypy.readthedocs.io/en/stable/changelog.html and https://github.com/python/mypy/compare/v2.4.0...v2.4.1.\nPytest 9.2.0 changes invalid configuration-path errors, makes optional parametrization arguments keyword-only, classifies plugin-import failures, and uses checked-hash assertion bytecode. Its fixture and CallSpec deprecations do not themselves justify excluding this release. The existing source-authoritative pytest loader and worker checks remain required; this audit does not claim those passed on 9.2.0. Source: https://docs.pytest.org/en/stable/changelog.html.\nPytest-xdist 3.8.0 adds loadscope reordering controls. No worker-policy change or bound change is needed for this scheduling feature. Source: https://pytest-xdist.readthedocs.io/en/stable/changelog.html.\nRuff 0.17.3 fixes incorrect UP032 f-string conversions and improves formatter output/lexing performance; its new shared-clock-mock rule is preview. Existing lint settings and py314 target are retained. Source: https://github.com/astral-sh/ruff/releases/tag/0.17.3.\nMarkdownlint-cli2 0.24.0 updates dependencies including markdownlint, with Node >=22. Source: https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md.\n\nResearch does not upgrade installed dependencies or assert that latest versions passed gates. The current environment still has hatchling 1.32.4, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.0, pytest 9.1.1, pytest-xdist 3.8.0, ruff 0.17.1 and markdownlint-cli2 0.23.3. Test, full-gate and review evidence are recorded independently. The audit generator must query the same reviewed latest set before this release is accepted; any drift requires additional review.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
