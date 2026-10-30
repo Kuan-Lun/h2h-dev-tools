@@ -14,6 +14,16 @@ from h2h_dev_tools import process
 
 
 @pytest.fixture(autouse=True)
+def isolated_review_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disposable reviews own their estimates, independent of the parent merge."""
+    for name in (
+        "H2H_CODE_REVIEW_TIMEOUT_SECONDS",
+        "H2H_CODE_REVIEW_MIN_SHARD_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_git_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     """Disposable repositories own their config; keep Git-local authority intact."""
     for name in tuple(os.environ):
