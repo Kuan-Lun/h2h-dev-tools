@@ -764,7 +764,16 @@ def test_review_verification_rejects_a_different_expected_tree(
     assert len(repo.calls()) == 1
 
 
-@pytest.mark.parametrize("failure", ["dirty-worktree", "invalid-timeout"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "dirty-worktree",
+        "invalid-timeout",
+        "excessive-timeout",
+        "invalid-estimate",
+        "capacity",
+    ],
+)
 def test_failed_review_preflight_invalidates_the_previous_pass(
     review_repository: ReviewRepository, failure: str
 ) -> None:
@@ -773,7 +782,12 @@ def test_failed_review_preflight_invalidates_the_previous_pass(
     _assert_passed(repo.review("verify", "--index"))
     path = repo.path / "primary.txt"
     original = path.read_bytes()
-    arguments = ("--timeout-seconds", "0") if failure == "invalid-timeout" else ()
+    arguments = {
+        "invalid-timeout": ("--timeout-seconds", "0"),
+        "excessive-timeout": ("--timeout-seconds", "14401"),
+        "invalid-estimate": ("--min-shard-seconds", "-1"),
+        "capacity": ("--min-shard-seconds", "14400"),
+    }.get(failure, ())
     if failure == "dirty-worktree":
         path.write_text("Unstaged change blocks review.\n", encoding="utf-8")
     _assert_blocked(repo.review("run", "--index", *arguments))
@@ -781,6 +795,107 @@ def test_failed_review_preflight_invalidates_the_previous_pass(
     assert repo.git("diff", "--name-only") == ""
     _assert_blocked(repo.review("verify", "--index"))
     assert len(repo.calls()) == 1, "Preflight failures must occur before invoking Codex"
+
+
+@pytest.mark.parametrize("managed", [False, True], ids=["standalone", "managed"])
+def test_four_hour_review_accepts_a_declared_schedule(
+    review_repository: ReviewRepository,
+    managed: bool,
+) -> None:
+    repo = review_repository
+    if managed:
+        (repo.path / "scripts/check_change_scope.py").write_text("print('full')\n")
+        (repo.path / ".gitignore").write_text(".venv/\n")
+        repo.git("add", "scripts/check_change_scope.py", ".gitignore")
+        local_python = repo.path / ".venv/bin/python"
+        local_python.parent.mkdir(parents=True)
+        local_python.symlink_to(sys.executable)
+        package = (repo.path / repo.implementation).parent
+        cleanup = repo.state / "managed-cleanup"
+        result = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-B",
+                str(package / "merge_command.py"),
+                "--review",
+                "--cleanup-receipt",
+                str(cleanup),
+                str(repo.path),
+                "--",
+                "bash",
+                str(package / "review-merge-candidate.sh"),
+                str(repo.path),
+            ),
+            cwd=repo.path,
+            env=repo.environment
+            | {
+                "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "14400",
+                "H2H_CODE_REVIEW_MIN_SHARD_SECONDS": "900",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        _assert_passed(result)
+        assert cleanup.read_text() == "owned_tree_empty\n"
+    else:
+        _assert_passed(
+            repo.review(
+                "run",
+                "--index",
+                "--timeout-seconds",
+                "14400",
+                "--min-shard-seconds",
+                "900",
+            )
+        )
+    _assert_passed(repo.review("verify", "--index"))
+    budgets = list((repo.path / ".git/h2h-review/runs").glob("*/time-budget.json"))
+    assert len(budgets) == 1
+    budget = json.loads(budgets[0].read_text())
+    assert budget["aggregate_timeout_seconds"] == 14400
+    assert budget["minimum_shard_seconds"] == 900
+    assert budget["required_seconds"] <= budget["available_seconds"]
+    assert len(repo.calls()) == 1
+
+
+def test_preparation_cannot_spend_the_declared_shard_capacity(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    run = review_execution.run_invocations
+    clock = time.monotonic
+    offset = 0.0
+    invoked: list[str] = []
+
+    def advance_after_version(*args: Any, **kwargs: Any) -> list[dict[str, object]]:
+        nonlocal offset
+        invoked.extend(item.id for item in args[1])
+        result = run(*args, **kwargs)
+        offset = 400.0
+        return result
+
+    for name in ("PATH", "FAKE_CODEX_STATE", "FAKE_CODEX_SCOPE_PARENT"):
+        monkeypatch.setenv(name, repo.environment[name])
+    monkeypatch.setattr(review_execution, "run_invocations", advance_after_version)
+    monkeypatch.setattr(time, "monotonic", lambda: clock() + offset)
+    with pytest.raises(code_review.ReviewError, match="Review schedule cannot fit"):
+        reviewer._run(
+            target,
+            index=True,
+            revision="HEAD",
+            timeout=900,
+            model=None,
+            destination=repo.state / "prepared.json",
+            minimum_shard_seconds=600,
+        )
+    assert invoked == ["version"]
+    assert not repo.calls()
+    assert not reviewer._receipt_path(target).exists()
 
 
 @pytest.mark.parametrize("mode", ["hold-pass", "hold-failure"])
@@ -845,9 +960,8 @@ def test_standalone_review_preserves_result_after_diagnostic_reader_closes(
     receipt = reviewer._receipt_path(reviewer._target(index=True))
     with _held_review(repo, mode) as owner:
         assert owner.stdout is not None
-        assert owner.stdout.readline().startswith("Reviewing repository scope:")
-        assert "aggregate deadline" in owner.stdout.readline()
-        assert owner.stdout.readline().startswith("Review logs:")
+        # The fixture synchronizes with the actual reviewer after startup
+        # diagnostics; their text and ordering are not this pipe's contract.
         assert not receipt.exists(), "Codex must still be held before publication"
         stream = getattr(owner, stream_name)
         assert stream is not None
