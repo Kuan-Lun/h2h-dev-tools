@@ -1534,3 +1534,32 @@ def test_duplicate_source_references_are_rejected(
         result["unit_reviews"][0]["related_paths"] = ["decode.py", "decode.py"]
     with pytest.raises(planning.PlanError, match="Malformed"):
         coverage.validate_attestation(result, plan, 0)
+
+
+@pytest.mark.parametrize("integration", [False, True])
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "/checkout/decode.py",
+        ".venv/lib/python3.14/site-packages/dependency.py",
+        "missing.schema.json",
+        "decode.py:12",
+        "decode.py/",
+    ],
+)
+def test_unknown_source_citations_remain_rejected_with_specific_diagnostics(
+    repository: Path, integration: bool, reference: str
+) -> None:
+    plan = _plan(repository)
+    result = _passing(plan, 0)
+    entries = result["integration_reviews" if integration else "unit_reviews"]
+    field = "source_paths" if integration else "related_paths"
+    entries[0][field] = [reference]
+    with pytest.raises(
+        planning.PlanError, match="exact candidate or declared historical"
+    ) as error:
+        coverage.validate_attestation(result, plan, 0)
+    assert repr(reference) in str(error.value)
+    # No normalization, omission or mutation may turn a rejected citation into
+    # accepted candidate coverage.
+    assert entries[0][field] == [reference]
