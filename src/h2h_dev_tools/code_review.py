@@ -1347,7 +1347,10 @@ def main(repository: Path) -> None:
                 "--min-shard-seconds",
                 type=int,
                 default=0,
-                help="per-shard planning estimate; 0 reports capacity without an estimate",
+                help=(
+                    "per-shard planning estimate; "
+                    "0 reports capacity without an estimate"
+                ),
             )
             sub.add_argument("--model")
             sub.add_argument(
