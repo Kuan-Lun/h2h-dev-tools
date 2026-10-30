@@ -885,6 +885,12 @@ the version-bound audit evidence:
   --review-note "Release notes and compatibility validation results"
 ```
 
+Node audits resolve npm from `PATH`. Standard Windows `npm.cmd` installations
+use their adjacent Node executable (or Node from `PATH`), `npm-prefix.js` and
+`npm-cli.js` directly, including npm's configured global-prefix selection.
+Package specifications remain literal arguments without shell interpretation.
+A batch launcher missing these standard JS entries is rejected explicitly.
+
 GitHub's `publish.yml` workflow uses PyPI Trusted Publishing with environment
 `pypi`. Normal default-branch pushes publish only when the version increases over
 the whole push. Creating the branch does not publish. The first release can use

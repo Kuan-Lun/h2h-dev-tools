@@ -11,6 +11,7 @@ on:
       - src/h2h_dev_tools/source_loader.py
       - src/h2h_dev_tools/pytest_source.py
       - src/h2h_dev_tools/executable_fixture.py
+      - src/h2h_dev_tools/dependency_audit.py
       - scripts/run-pytest.py
       - scripts/with-git-environment.py
       - scripts/build-and-verify-distributions.py
@@ -20,6 +21,7 @@ on:
       - tests/test_pytest_source_entry.py
       - tests/test_pytest_source.py
       - tests/test_executable_fixture.py
+      - tests/test_dependency_audit_npm.py
       - tests/test_build_distributions.py
       - pyproject.toml
       - .github/workflows/windows-process.yml
@@ -37,6 +39,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
       - name: Install project-local test environment
         run: |
           python -m venv .venv
@@ -50,3 +55,4 @@ jobs:
           tests/test_merge_paths.py
           tests/test_pytest_source.py tests/test_executable_fixture.py
           tests/test_build_distributions.py
+          tests/test_dependency_audit_npm.py
