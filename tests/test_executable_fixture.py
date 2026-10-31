@@ -6,11 +6,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import venv
 import zipfile
 from pathlib import Path
 
 import pytest
+from distlib.util import FileOperator  # type: ignore[import-untyped]  # Upstream has no typing metadata.
 
 from h2h_dev_tools import bundle_verify, executable_fixture
 
@@ -33,7 +35,7 @@ def test_python_fixture_executes_with_spaced_venv_and_payload_paths(
         "import json, os, sys\n"
         "print(json.dumps({'argv':sys.argv, 'file':__file__, 'cwd':os.getcwd(), "
         "'prefix':sys.prefix, 'executable':sys.executable, 'input':sys.stdin.read(), "
-        "'pid':os.getpid()}))\n"
+        "'pid':os.getpid(), 'literal':'%(module)s 100% 測試'}))\n"
         f"raise SystemExit({status})\n"
     )
     executable = executable_fixture.write_python_executable(
@@ -82,6 +84,7 @@ def test_python_fixture_executes_with_spaced_venv_and_payload_paths(
     assert Path(result["prefix"]) == environment.resolve()
     assert result["executable"] == str(interpreter)
     assert result["input"] == "input bytes\n"
+    assert result["literal"] == "%(module)s 100% 測試"
 
 
 @pytest.mark.skipif(
@@ -126,6 +129,21 @@ def test_fixture_replaces_only_its_explicit_files(tmp_path: Path) -> None:
 def test_test_support_is_explicit_and_outside_production_review_closure() -> None:
     assert "executable_fixture.py" in bundle_verify.component_files(["test-support"])
     assert "executable_fixture.py" not in bundle_verify.component_files(["code-review"])
+
+
+def test_launcher_generation_failure_cleans_temporary_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_write(self: object, path: str, data: bytes) -> None:
+        raise PermissionError("fixture-generation-denied")
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(FileOperator, "write_binary_file", fail_write)
+    with pytest.raises(PermissionError, match="fixture-generation-denied"):
+        executable_fixture._windows_launcher(
+            "raise SystemExit(0)\n", Path(sys.executable)
+        )
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Native Windows console code-page oracle")
@@ -190,8 +208,6 @@ def test_windows_generation_failure_keeps_existing_fixture_and_unrelated_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Exercise ScriptMaker's real failure path, not a replacement launcher.
-    from distlib.util import FileOperator  # type: ignore[import-untyped]  # Upstream has no typing metadata.
-
     def fail_write(self: object, path: str, data: bytes) -> None:
         raise PermissionError("fixture-generation-denied")
 

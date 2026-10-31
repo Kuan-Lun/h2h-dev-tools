@@ -1,30 +1,7 @@
 name: Windows process ownership
 
 on:
-  push:
-    paths:
-      - src/h2h_dev_tools/process.py
-      - src/h2h_dev_tools/_process_diagnostic.py
-      - src/h2h_dev_tools/_process_scope.py
-      - src/h2h_dev_tools/git_environment.py
-      - src/h2h_dev_tools/merge_admission.py
-      - src/h2h_dev_tools/source_loader.py
-      - src/h2h_dev_tools/pytest_source.py
-      - src/h2h_dev_tools/executable_fixture.py
-      - src/h2h_dev_tools/dependency_audit.py
-      - scripts/run-pytest.py
-      - scripts/with-git-environment.py
-      - scripts/build-and-verify-distributions.py
-      - tests/test_process*.py
-      - tests/test_git_environment.py
-      - tests/test_merge_paths.py
-      - tests/test_pytest_source_entry.py
-      - tests/test_pytest_source.py
-      - tests/test_executable_fixture.py
-      - tests/test_dependency_audit_npm.py
-      - tests/test_build_distributions.py
-      - pyproject.toml
-      - .github/workflows/windows-process.yml
+  workflow_call:
   workflow_dispatch:
 
 permissions:

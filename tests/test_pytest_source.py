@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import py_compile
@@ -155,6 +156,17 @@ def _poison_pytest_cache(
     assert len(caches) == 1, warm.stdout + warm.stderr
     conftest.write_bytes(current)
     os.utime(conftest, ns=(timestamp, timestamp))
+    # Pytest 9.2 uses checked source hashes instead of timestamp/size headers.
+    # Model an untrusted cache whose header matches the candidate while its code
+    # still comes from the old source; the control must actually execute it.
+    cache = caches[0]
+    poisoned = cache.read_bytes()
+    flags = int.from_bytes(poisoned[4:8], "little")
+    assert flags in {0, 1, 3}, f"Unknown Python cache flags: {flags}"
+    if flags & 1:
+        cache.write_bytes(
+            poisoned[:8] + importlib.util.source_hash(current) + poisoned[16:]
+        )
 
 
 @pytest.mark.parametrize("layout", ["source", "snapshot"])

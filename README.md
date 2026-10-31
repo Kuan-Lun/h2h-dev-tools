@@ -898,6 +898,11 @@ GitHub's `publish.yml` workflow uses PyPI Trusted Publishing with environment
 the whole push. Creating the branch does not publish. The first release can use
 an explicitly authorized workflow dispatch with the exact project version; it
 still requires the default branch and builds and verifies distributions first.
+Both paths require the same commit's native Windows platform checks to pass
+before the publish job can start. The reusable `windows-process.yml` job also
+runs on relevant task-branch pushes without publishing; its standalone manual
+dispatch only validates the platform. Failed, cancelled or skipped prerequisites
+block publication.
 The PyPI publisher must match owner `Kuan-Lun`, repository `h2h-dev-tools`, workflow
 `publish.yml` and environment `pypi`. Configuring this workflow does not execute a
 release or validate the remote publisher configuration.
