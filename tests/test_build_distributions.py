@@ -125,7 +125,9 @@ def test_offline_inventory_rejects_members_outside_distribution(
 def _write_record(dependency: Path, members: list[str]) -> None:
     output = StringIO(newline="")
     csv.writer(output).writerows((member, "", "") for member in members)
-    (dependency / "packaging-1.0.dist-info/RECORD").write_text(output.getvalue())
+    (dependency / "packaging-1.0.dist-info/RECORD").write_text(
+        output.getvalue(), encoding="utf-8", newline=""
+    )
 
 
 @pytest.fixture

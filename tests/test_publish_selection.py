@@ -46,3 +46,19 @@ def test_workflow_limits_publication_to_default_branch_and_publish_job() -> None
     assert "id-token: write" in publish
     assert "BEFORE_SHA: ${{ github.event.before }}" in validate
     assert "REQUESTED_VERSION: ${{ inputs.version }}" in validate
+    assert "    needs: [validate, windows-checks]\n" in publish
+    assert "    if: needs.validate.outputs.publish == 'true'\n" in publish
+    assert "uses: ./.github/workflows/windows-process.yml" in validate
+
+
+def test_windows_validation_has_one_reusable_job_before_publication() -> None:
+    platform = (_ROOT / ".github/workflows/windows-process.yml").read_text()
+    publish = (_ROOT / ".github/workflows/publish.yml").read_text()
+    assert "  workflow_call:\n" in platform
+    assert "  push:\n" not in platform
+    assert "continue-on-error:" not in platform + publish
+    assert "always()" not in publish
+    assert "tests/test_merge_paths.py" in platform
+    assert "tests/test_pytest_source.py" in platform
+    assert "tests/test_executable_fixture.py" in platform
+    assert "tests/test_build_distributions.py" in platform
