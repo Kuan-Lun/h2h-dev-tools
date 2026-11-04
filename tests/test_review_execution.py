@@ -399,15 +399,19 @@ def test_orphan_group_exit_waits_for_actual_reap_after_native_eperm(
         owner: process.OwnedProcess | None = None
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "known no-descendant exit",
-                        (sys.executable, "-I", "-S", "-c", "pass"),
-                        tmp_path,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "known no-descendant exit",
+                            (sys.executable, "-I", "-S", "-c", "pass"),
+                            tmp_path,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             # Observe real exit without consuming the child's wait status. No
             # sleep duration is used as evidence that the process has exited.
             status = None
@@ -427,9 +431,16 @@ def test_orphan_group_exit_waits_for_actual_reap_after_native_eperm(
                     real_killpg(group, number)
                 except PermissionError:
                     observations.append("permission-denied")
-                    # Real OS reaping causes the next probe to observe ESRCH.
-                    # Re-raise the genuine first result to the fixture oracle.
+                    # wait() observes status while retaining the leader. Only
+                    # canonical native group proof may retire that identity.
                     assert owner.process.wait(timeout=deadline - time.monotonic()) == 0
+                    receipt = os.waitid(
+                        os.P_PID, group, os.WEXITED | os.WNOWAIT | os.WNOHANG
+                    )
+                    assert receipt is not None and receipt.si_pid == group
+                    assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+                    # Re-raise the genuine first result; the fixture's next
+                    # independent probe must observe the actual OS retirement.
                     raise
                 except ProcessLookupError:
                     observations.append("absent")
@@ -474,7 +485,7 @@ def test_orphan_group_exit_requires_absence_within_original_deadline(
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="XNU orphan-group fixture")
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
-@pytest.mark.parametrize("boundary", ["launch", "cleanup"])
+@pytest.mark.parametrize("boundary", ["launch", "cleanup", "retained-error"])
 def test_orphan_fixture_cleans_up_when_launch_handoff_is_interrupted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int, boundary: str
 ) -> None:
@@ -499,8 +510,12 @@ def test_orphan_fixture_cleans_up_when_launch_handoff_is_interrupted(
         owner = original(phase, deadline=deadline, signal_controller=signal_controller)
         owners.append((owner, deadline))
         controllers.append(signal_controller)
-        if boundary == "launch":
+        if boundary in {"launch", "retained-error"}:
             send_signal(signal_controller)
+        if boundary == "retained-error":
+            failure = process.ProcessOwnershipError("retained fixture owner")
+            failure.owner = owner
+            raise failure
         return owner
 
     def record_close(
@@ -556,6 +571,7 @@ def test_orphan_fixture_cleans_up_when_launch_handoff_is_interrupted(
 
 def test_unexpected_registered_nested_owner_death_cannot_prove_cleanup(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import json
     import subprocess
@@ -567,13 +583,25 @@ def test_unexpected_registered_nested_owner_death_cannot_prove_cleanup(
         os.environ, TMPDIR=str(tmp_path), TMP=str(tmp_path), TEMP=str(tmp_path)
     )
     environment.pop("H2H_PRIVATE_POSIX_PROCESS_SCOPE", None)
+    release = tmp_path / "fixture-release"
+    leaf_source = (
+        "from pathlib import Path\nimport time\n"
+        "while not Path('fixture-release').exists(): time.sleep(.01)\n"
+    )
+    killpg = os.killpg
+
+    def observe_group(group: int, number: int) -> None:
+        assert number == 0, "Fixture must not signal an unowned historical group"
+        killpg(group, number)
+
+    monkeypatch.setattr(os, "killpg", observe_group)
     nested = tmp_path / "nested.py"
     nested.write_text(
         "import os,runpy,sys,time\nfrom pathlib import Path\n"
         f"package=Path({str(package)!r})\n"
         'runpy.run_path(str(package/"source_loader.py"))["load_package"](package,"h2h_dev_tools")\n'
         "from h2h_dev_tools import process\n"
-        'owner=process.start_owned_process(process.ProcessCommand("nested leaf", (sys.executable,"-c","import time; time.sleep(60)"), Path.cwd()), deadline=time.monotonic()+30, signal_controller=None)\n'
+        f'owner=process.start_owned_process(process.ProcessCommand("nested leaf", (sys.executable,"-c",{leaf_source!r}), Path.cwd()), deadline=time.monotonic()+30, signal_controller=None)\n'
         'Path("leaf-pid").write_text(str(owner.process.pid))\n'
         "os._exit(0)\n"
     )
@@ -590,17 +618,22 @@ def test_unexpected_registered_nested_owner_death_cannot_prove_cleanup(
         "else:\n"
         ' raise AssertionError("Unproven nested obligation accepted")\n'
     )
-    with (tmp_path / "outer.log").open("wb") as output:
-        child = subprocess.Popen(
-            (sys.executable, "-I", str(outer)),
-            cwd=tmp_path,
-            env=environment,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    with (
+        (tmp_path / "outer.log").open("wb") as output,
+        process.controlled_termination_signals() as controller,
+    ):
+        child: subprocess.Popen[bytes] | None = None
         leaf: int | None = None
         try:
+            with controller.defer():
+                child = subprocess.Popen(
+                    (sys.executable, "-I", str(outer)),
+                    cwd=tmp_path,
+                    env=environment,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
             assert child.wait(timeout=15) == 0, (tmp_path / "outer.log").read_text()
             leaf = int((tmp_path / "leaf-pid").read_text())
             assert json.loads((tmp_path / "outcome.json").read_text()) == {
@@ -610,17 +643,70 @@ def test_unexpected_registered_nested_owner_death_cannot_prove_cleanup(
             assert list(tmp_path.glob("h2h-process-scope-*/pending/*"))
             os.kill(leaf, 0)  # Outer group exit did NOT prove its nested leaf gone.
         finally:
-            if leaf is None and (tmp_path / "leaf-pid").exists():
-                leaf = int((tmp_path / "leaf-pid").read_text())
-            for group in [child.pid, *([] if leaf is None else [leaf])]:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            child.wait(timeout=5)
-            until = time.monotonic() + 5
-            if leaf is not None:
-                _wait_for_orphan_group_exit(leaf, deadline=until)
+            with controller.defer():
+                # This fixed orphan exits cooperatively. Its recorded PID is an
+                # observation only, never rescue authority after its owner died.
+                release.touch()
+                if child is not None:
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        # Popen retains its direct waitable child's PID until
+                        # wait/communicate reaps it; no group identity is assumed.
+                        child.terminate()
+                        child.wait(timeout=5)
+                if leaf is None and (tmp_path / "leaf-pid").exists():
+                    leaf = int((tmp_path / "leaf-pid").read_text())
+                until = time.monotonic() + 5
+                if leaf is not None:
+                    _wait_for_orphan_group_exit(leaf, deadline=until)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_isolated_orphan_fixture_closes_direct_child_after_launch_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int
+) -> None:
+    import subprocess
+
+    original = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+
+    def interrupt(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        child = original(*args, **kwargs)
+        children.append(child)
+        os.kill(os.getpid(), signum)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", interrupt)
+    expected = (
+        KeyboardInterrupt if signum == signal.SIGINT else process.RunnerSignalInterrupt
+    )
+    try:
+        with process.controlled_termination_signals(), pytest.raises(expected):
+            test_unexpected_registered_nested_owner_death_cannot_prove_cleanup(
+                tmp_path, monkeypatch
+            )
+        assert len(children) == 1
+        child = children[0]
+        assert child.returncode is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(child.pid, os.WNOHANG)
+        assert (tmp_path / "fixture-release").exists()
+    finally:
+        # The direct, unreaped Popen is this control's independent authority.
+        # An orphan descendant only sees its fixed cooperation marker.
+        with process.controlled_termination_signals() as controller:
+            with controller.defer():
+                (tmp_path / "fixture-release").touch()
+                for child in children:
+                    if child.poll() is None:
+                        child.terminate()
+                    child.wait(timeout=5)
+                leaf = tmp_path / "leaf-pid"
+                if leaf.exists():
+                    _wait_for_orphan_group_exit(
+                        int(leaf.read_text()), deadline=time.monotonic() + 5
+                    )
 
 
 @pytest.mark.parametrize("during", ["spawn-return", "prompt-export"])
@@ -736,6 +822,8 @@ def test_one_busy_admission_cannot_starve_other_review_cleanup(
             signal.signal(signal.SIGTERM, stop)
             (root / f"ready-{index}").touch()
             while True:
+                if (root / "fixture-release").exists():
+                    break
                 if index == 0 and (root / "release-failure").exists():
                     raise SystemExit(7)
                 time.sleep(.01)
@@ -783,12 +871,17 @@ def test_one_busy_admission_cannot_starve_other_review_cleanup(
                 # Fixture rescue has its own authority, after recording failure.
                 # It cannot contribute evidence to the failed scheduler run.
                 until = time.monotonic() + 10
+                (root / "fixture-release").touch()
                 for owner in owners:
                     scope = owner.posix_scope
                     if scope is not None and scope.capability.directory.exists():
                         assert process.terminate_owned_tree(owner, deadline=until)
-                        scope.close(deadline=until)
-                    owner.process.wait(timeout=5)
+                        assert process.close_owner(owner, deadline=until)
+                (root / "rescued.json").write_text(json.dumps({
+                    "identities_retired": all(owner.process._identity_retired for owner in owners),
+                    "pidfds_closed": all(owner.process._pidfd is None for owner in owners),
+                    "scopes_removed": all(not owner.posix_scope.capability.directory.exists() for owner in owners),
+                }))
             '''
         ),
         encoding="utf-8",
@@ -822,6 +915,11 @@ def test_one_busy_admission_cannot_starve_other_review_cleanup(
     assert report["peer_terms"] == [True, True], report
     assert report["peer_empty"] == [True, True], report
     assert report["peer_scopes_removed"] == [True, True], report
+    assert json.loads((root / "rescued.json").read_text()) == {
+        "identities_retired": True,
+        "pidfds_closed": True,
+        "scopes_removed": True,
+    }
 
 
 @pytest.mark.parametrize("fail_first_close", [False, True])
@@ -1002,8 +1100,16 @@ def test_completed_review_owner_uses_phase_budget_for_scope_lock(
                 assert scope.capability.directory.exists()
                 assert not scope.proven_empty
                 assert owners[0].process.poll() == 0
-                with pytest.raises(ProcessLookupError):
-                    os.killpg(owners[0].process.pid, 0)
+                # An invalid ledger forbids retirement even after exit. The
+                # actual leader must remain waitable until fixture repair.
+                receipt = os.waitid(
+                    os.P_PID,
+                    owners[0].process.pid,
+                    os.WEXITED | os.WNOWAIT | os.WNOHANG,
+                )
+                assert receipt is not None
+                assert receipt.si_pid == owners[0].process.pid
+                assert receipt.si_code == os.CLD_EXITED and receipt.si_status == 0
             else:
                 # Before fixture rescue: both real process absence and the
                 # canonical scope/parent-obligation closure must already hold.

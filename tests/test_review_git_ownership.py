@@ -185,18 +185,22 @@ def test_review_git_query_rejects_fsmonitor_descendant_before_return(
         closed = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "Review Git query fixture",
-                        (sys.executable, "-I", "-S", "-B", str(driver)),
-                        root,
-                        environment | {"TMPDIR": str(scopes)},
-                        output,
-                        output,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "Review Git query fixture",
+                            (sys.executable, "-I", "-S", "-B", str(driver)),
+                            root,
+                            environment | {"TMPDIR": str(scopes)},
+                            output,
+                            output,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             if query == "cancel":
                 ready_deadline = time.monotonic() + 5
                 while not pid_file.exists():
@@ -212,9 +216,10 @@ def test_review_git_query_rejects_fsmonitor_descendant_before_return(
                 assert "deadline" in observed["error"]
             if query == "cancel":
                 assert "RunnerSignalInterrupt" in observed["error"]
-            assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
-            assert process.close_owner(owner, deadline=deadline)
-            closed = True
+            with controller.defer():
+                assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+                assert process.close_owner(owner, deadline=deadline)
+                closed = True
             assert list(scopes.glob("h2h-process-scope-*")) == []
         finally:
             # Rescue happens only after the query's own post-cleanup assertions.
@@ -386,15 +391,18 @@ def test_capture_closure_cannot_extend_the_query_deadline(
 
 @pytest.mark.skipif(os.name != "posix", reason="Signal at the fixture launch boundary")
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("boundary", ["launch", "retained-error", "cleanup"])
 def test_git_query_fixture_closes_owner_when_launch_handoff_is_interrupted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     signum: int,
+    boundary: str,
 ) -> None:
     original = process.start_owned_process
     close = process.close_owner
     owners: list[tuple[process.OwnedProcess, float]] = []
     closed: list[tuple[process.OwnedProcess, float, bool]] = []
+    controllers: list[process.SignalController] = []
 
     def interrupt(
         phase: process.ProcessCommand,
@@ -404,7 +412,14 @@ def test_git_query_fixture_closes_owner_when_launch_handoff_is_interrupted(
     ) -> process.OwnedProcess:
         owner = original(phase, deadline=deadline, signal_controller=signal_controller)
         owners.append((owner, deadline))
-        os.kill(os.getpid(), signum)
+        assert signal_controller is not None
+        controllers.append(signal_controller)
+        if boundary != "cleanup":
+            os.kill(os.getpid(), signum)
+        if boundary == "retained-error":
+            failure = process.ProcessOwnershipError("retained Git fixture owner")
+            failure.owner = owner
+            raise failure
         return owner
 
     def record_close(
@@ -415,6 +430,9 @@ def test_git_query_fixture_closes_owner_when_launch_handoff_is_interrupted(
     ) -> bool:
         result = close(owner, deadline=deadline, diagnostic=diagnostic)
         closed.append((owner, deadline, result))
+        if boundary == "cleanup":
+            assert controllers[0].defer_depth > 0
+            os.kill(os.getpid(), signum)
         return result
 
     monkeypatch.setattr(process, "start_owned_process", interrupt)

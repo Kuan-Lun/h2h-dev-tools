@@ -777,7 +777,30 @@ The low-level process launch API is silent and accepts file-backed stdout/stderr
 Its caller must defer signals until it owns the returned process. `run_command`
 provides that lifecycle, reserves cleanup time, rejects surviving descendants and
 verifies the final absolute deadline. Local callers select their budgets and
-signals. POSIX children that deliberately detach and Docker-daemon-owned resources
+signals. POSIX owners must come from `start_owned_process`; wrapping an arbitrary
+`Popen` does not establish group ownership. The returned process reports exit
+status through `wait`, `poll` and `communicate` while retaining its waitable leader.
+Cleanup retains that identity until nested obligations are empty. macOS uses
+`libproc`'s kernel-locked inventory of live and zombie group members before reaping
+the leader. Linux uses a retained pidfd with process-group scope; after reaping,
+signals and absence queries still address the original kernel identity, even if
+its numeric PID is reused. No `ps` or `/proc` enumeration proves group absence.
+Complete cleanup retires all signalling authority, including repeated cleanup
+calls. `close_owner` closes the native handle before releasing the scope ledger.
+Do not reap an owned child separately with `os.waitpid`; lost waitable identity
+fails closed without signalling the old group number.
+This requires `waitid(WNOWAIT)`, default `SIGCHLD` handling, and either macOS
+with native `libproc` access or Linux 6.9+ with process-group pidfd signalling.
+Unsupported capabilities are rejected before launching a command. These native
+operations stay within the existing ownership obligation and original deadline;
+they create no helper process or new session after admission closes.
+If Linux cannot acquire the native handle after the command has started, the
+existing owner closes admission and attempts bounded nested cleanup using the
+original deadline. It retains the waitable leader and scope because group
+absence cannot be proven without that handle. The resulting
+`ProcessOwnershipError.owner` exposes the retained owner for inspection;
+other ownership errors may leave this attribute as `None`.
+POSIX children that deliberately detach and Docker-daemon-owned resources
 are outside the owned-tree guarantee. Canonical nested commands are registered
 before their separate POSIX sessions start. Closing admission prevents a new
 phase from racing cleanup; an outer owner cannot send SIGKILL to its inner owner

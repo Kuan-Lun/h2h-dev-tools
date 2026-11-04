@@ -29,6 +29,7 @@ from pathlib import Path
 import runpy
 import signal
 import sys
+import threading
 import time
 
 package, directory, scenario, level_text, depth_text = sys.argv[1:]
@@ -42,13 +43,17 @@ def record(path, value):
     temporary.replace(root / path)
 
 record(name + ".identity.json", {"pid": os.getpid(), "pgid": os.getpgrp()})
+release = root / "fixture-release"
+if release.exists():
+    raise SystemExit(0)
 if level == depth:
     if scenario.startswith("exit-"):
         raise SystemExit(int(scenario.removeprefix("exit-")))
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     (root / "leaf-ready").touch()
-    while True:
+    while not release.exists():
         time.sleep(0.01)
+    raise SystemExit(0)
 
 package = Path(package)
 sys.path.insert(0, str(package.parent))
@@ -56,6 +61,48 @@ runpy.run_path(str(package / "source_loader.py"))["load_package"](
     package, "h2h_dev_tools"
 )
 from h2h_dev_tools import process
+
+control_finished = threading.Event()
+control_threads = []
+if scenario == "cancel-paused" and level == 0:
+    original_start = process.start_owned_process
+    def start_with_pause_control(phase, *, deadline, signal_controller):
+        owner = original_start(
+            phase, deadline=deadline, signal_controller=signal_controller)
+        def pause_inner():
+            paused = False
+            try:
+                while not (root / "pause-inner").exists():
+                    if release.exists() or control_finished.is_set():
+                        return
+                    time.sleep(.001)
+                # The original native handle belongs to this creating owner.
+                # Never resolve a PID from the fixture's historical inventory.
+                owner.process.send_signal(signal.SIGSTOP)
+                paused = True
+                (root / "inner-paused").touch()
+                while not (root / "cancellation-delivered").exists():
+                    if release.exists():
+                        return
+                    time.sleep(.001)
+                time.sleep(.4)
+            finally:
+                if paused:
+                    owner.process.send_signal(signal.SIGCONT)
+                    (root / "inner-resumed").touch()
+        worker = threading.Thread(target=pause_inner)
+        control_threads.append(worker)
+        worker.start()
+        return owner
+    process.start_owned_process = start_with_pause_control
+if scenario == "killed-owner" and level == 1:
+    def kill_self_when_requested():
+        while not (root / "kill-inner").exists():
+            if release.exists():
+                return
+            time.sleep(.001)
+        os.kill(os.getpid(), signal.SIGKILL)
+    threading.Thread(target=kill_self_when_requested, daemon=True).start()
 
 # Delay real metadata operations without changing any ownership deadline.
 metadata_mode = os.environ.get("H2H_TEST_METADATA_WINDOW")
@@ -113,6 +160,8 @@ try:
         signal.signal(signal.SIGTERM, lambda *_: (root / "gap-term").touch())
         (root / "between-phases").touch()
         while not (root / "admit-next-phase").exists():
+            if release.exists():
+                raise SystemExit(0)
             time.sleep(0.01)
         status = process.run_command(phase, hard_deadline=None)
     elif scenario == "scope-lock" and level == 1:
@@ -129,7 +178,7 @@ try:
                     (root / "scope-lock-held").touch()
                     # A stopped owner can hold a genuine flock indefinitely.
                     # Outer cleanup still owes a bounded, unproven result.
-                    while True:
+                    while not release.exists():
                         time.sleep(0.01)
                 yield
         _process_scope._Capability.locked = hold_parent_registration_lock
@@ -140,6 +189,8 @@ try:
             def start_after_actual_signal(command):
                 (root / "registered-before-spawn").touch()
                 while controller.pending_signal is None:
+                    if release.exists():
+                        raise ValueError("fixture released before spawn")
                     time.sleep(0.01)
                 return original_start(command)
             process._start_posix_process = start_after_actual_signal
@@ -163,6 +214,11 @@ except process.ProcessOwnershipError as error:
         "nul-env-key", "nul-env-value", "invalid-env-value-type",
     }:
         result["cause"] = type(error.__cause__).__name__
+finally:
+    control_finished.set()
+    for worker in control_threads:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
 record(name + ".result.json", result)
 raise SystemExit(status)
 """
@@ -186,6 +242,7 @@ def _alive(pid: int) -> bool:
 class _Probe:
     root: Path
     owner: subprocess.Popen[bytes]
+    processes_proven_empty: bool = False
 
     def wait_for(self, filename: str) -> None:
         deadline = time.monotonic() + 15
@@ -221,6 +278,7 @@ class _Probe:
         for identity in self.identities().values():
             with pytest.raises(ProcessLookupError):
                 os.killpg(identity.pgid, 0)
+        self.processes_proven_empty = True
 
     def assert_no_scopes(self) -> None:
         assert not list((self.root / "scopes").glob("h2h-process-scope-*")), self.log()
@@ -248,43 +306,51 @@ def _probe(
     if metadata_window is not None:
         environment["H2H_TEST_METADATA_WINDOW"] = metadata_window
     package = Path(process.__file__).resolve().parent
-    with (tmp_path / "owner.log").open("wb") as output:
-        owner = subprocess.Popen(
-            (
-                sys.executable,
-                "-I",
-                str(script),
-                str(package),
-                str(tmp_path),
-                scenario,
-                "0",
-                str(depth),
-            ),
-            env=environment,
-            cwd=tmp_path,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        probe = _Probe(tmp_path, owner)
+    with (
+        (tmp_path / "owner.log").open("wb") as output,
+        process.controlled_termination_signals() as controller,
+    ):
+        probe: _Probe | None = None
         try:
+            with controller.defer():
+                owner = subprocess.Popen(
+                    (
+                        sys.executable,
+                        "-I",
+                        str(script),
+                        str(package),
+                        str(tmp_path),
+                        scenario,
+                        "0",
+                        str(depth),
+                    ),
+                    env=environment,
+                    cwd=tmp_path,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                probe = _Probe(tmp_path, owner)
             yield probe
         finally:
-            # No cleanup claim is synthesized. Even a failed regression must
-            # terminate every recorded real group and verify each PID is gone.
-            identities = probe.identities()
-            for group in {owner.pid, *(item.pgid for item in identities.values())}:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            owner.wait(timeout=5)
-            deadline = time.monotonic() + 8
-            survivors = [item.pid for item in identities.values() if _alive(item.pid)]
-            while survivors and time.monotonic() < deadline:
-                time.sleep(0.02)
-                survivors = [pid for pid in survivors if _alive(pid)]
-            assert not survivors, f"Probe cleanup failed for PIDs {survivors}"
+            with controller.defer():
+                if probe is not None and not probe.processes_proven_empty:
+                    # A historical PID/PGID grants no signal authority. These
+                    # fixed actors release only on this failure-rescue marker;
+                    # normal assertions must prove exit before it is written.
+                    (tmp_path / "fixture-release").touch()
+                    probe.owner.wait(timeout=5)
+                    deadline = time.monotonic() + 8
+                    while True:
+                        survivors = [
+                            item.pid
+                            for item in probe.identities().values()
+                            if _alive(item.pid)
+                        ]
+                        if not survivors or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.02)
+                    assert not survivors, f"Probe actors survived release: {survivors}"
 
 
 @pytest.mark.parametrize("delay_inner", [False, True])
@@ -292,19 +358,23 @@ def _probe(
 def test_outer_cancellation_waits_for_nested_session_cleanup(
     tmp_path: Path, delay_inner: bool, depth: int
 ) -> None:
-    with _probe(tmp_path, scenario="cancel", depth=depth) as probe:
+    scenario = "cancel-paused" if delay_inner else "cancel"
+    with _probe(tmp_path, scenario=scenario, depth=depth) as probe:
         probe.wait_for("leaf-ready")
-        inner = probe.identities()["owner1"]
         if delay_inner:
-            os.kill(inner.pid, signal.SIGSTOP)
+            (tmp_path / "pause-inner").touch()
+            probe.wait_for("inner-paused")
         started = time.monotonic()
         probe.owner.send_signal(signal.SIGTERM)
         if delay_inner:
-            # Real descheduling, not an altered cleanup grace or mocked result.
-            time.sleep(0.4)
-            os.kill(inner.pid, signal.SIGCONT)
+            # The creating owner holds the real STOP for 0.4s after cancellation,
+            # then resumes through the same native identity even on failure.
+            (tmp_path / "cancellation-delivered").touch()
         assert probe.owner.wait(timeout=10) == 143, probe.log()
         assert time.monotonic() - started < 8
+        if delay_inner:
+            assert (tmp_path / "inner-resumed").exists()
+            assert time.monotonic() - started >= 0.4
         assert probe.result()["kind"] == "interrupted"
         assert len(probe.identities()) == depth + 1
         probe.assert_all_exited()
@@ -379,7 +449,7 @@ def test_killed_nested_owner_cannot_publish_empty_tree(tmp_path: Path) -> None:
         probe.wait_for("leaf-ready")
         identities = probe.identities()
         started = time.monotonic()
-        os.kill(identities["owner1"].pid, signal.SIGKILL)
+        (tmp_path / "kill-inner").touch()
         assert probe.owner.wait(timeout=10) == 125, probe.log()
         assert time.monotonic() - started < 8
         assert probe.result() == {
@@ -434,3 +504,69 @@ def test_cancellation_cannot_leave_unowned_scope_metadata(
             observed = json.loads(marker.read_text())
             assert observed["parent_pending"] == 1
             assert observed["local_names"] == ["lock", "pending", "token"]
+
+
+def test_probe_does_not_rescue_or_signal_after_complete_process_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    killpg = os.killpg
+
+    def reject_historical_signal(group: int, number: int) -> None:
+        assert number == 0, "completed probe signalled a historical PGID"
+        killpg(group, number)
+
+    monkeypatch.setattr(os, "killpg", reject_historical_signal)
+    with _probe(tmp_path, scenario="exit-0") as probe:
+        assert probe.owner.wait(timeout=10) == 0, probe.log()
+        probe.assert_all_exited()
+        probe.assert_no_scopes()
+        assert not (tmp_path / "fixture-release").exists()
+    assert probe.processes_proven_empty
+    assert not (tmp_path / "fixture-release").exists()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "ready"),
+    [
+        ("cancel", "leaf-ready"),
+        ("cancel-paused", "inner-paused"),
+        ("phases", "between-phases"),
+        ("startup", "registered-before-spawn"),
+        ("scope-lock", "scope-lock-held"),
+    ],
+)
+def test_failed_probe_releases_fixed_actors_without_historical_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, ready: str
+) -> None:
+    killpg = os.killpg
+    probe: _Probe | None = None
+
+    def reject_historical_signal(group: int, number: int) -> None:
+        assert number == 0, "failed probe guessed signal authority from a PGID"
+        killpg(group, number)
+
+    monkeypatch.setattr(os, "killpg", reject_historical_signal)
+    try:
+        with pytest.raises(AssertionError, match="injected fixture assertion"):
+            with _probe(tmp_path, scenario=scenario) as probe:
+                if scenario == "cancel-paused":
+                    probe.wait_for("leaf-ready")
+                    (tmp_path / "pause-inner").touch()
+                probe.wait_for(ready)
+                assert not (tmp_path / "fixture-release").exists()
+                assert not probe.processes_proven_empty
+                raise AssertionError("injected fixture assertion before cleanup")
+        assert (tmp_path / "fixture-release").exists()
+        assert probe is not None
+        probe.assert_all_exited()
+        probe.assert_no_scopes()
+    finally:
+        # Keep this negative control safe against the old teardown: that path
+        # is rejected before its numeric kill and never writes the release.
+        if probe is not None and not probe.processes_proven_empty:
+            (tmp_path / "fixture-release").touch()
+            deadline = time.monotonic() + 8
+            probe.owner.wait(timeout=max(0, deadline - time.monotonic()))
+            while any(_alive(item.pid) for item in probe.identities().values()):
+                assert time.monotonic() < deadline, probe.log()
+                time.sleep(0.01)

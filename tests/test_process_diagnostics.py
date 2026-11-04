@@ -365,15 +365,19 @@ def test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The actual parent's force-kill boundary observes the leaf's OS reap."""
+    from h2h_dev_tools._process_posix import PinnedProcess
+
     read_fd, write_fd = os.pipe()
     _fill_pipe(write_fd)
     os.set_blocking(write_fd, True)
     deadline = time.monotonic() + 8
     owner = None
     kill_observations: list[bool] = []
-    real_killpg = os.killpg
+    real_signal_group = PinnedProcess.signal_group
 
-    def observe_killpg(group: int, number: int) -> None:
+    def observe_signal_group(
+        child: PinnedProcess, number: int, *, send: Callable[[int, int], None]
+    ) -> None:
         if number == signal.SIGKILL:
             marker = tmp_path / "reaped.json"
             kill_observations.append(marker.exists())
@@ -381,31 +385,35 @@ def test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
             # prevents deliberately orphaning a real leaf in the negative run.
             while not marker.exists() and time.monotonic() < deadline - 1:
                 time.sleep(0.001)
-        real_killpg(group, number)
+        real_signal_group(child, number, send=send)
 
     try:
         with process.controlled_termination_signals() as controller:
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            "terminal diagnostic scope probe",
-                            (
-                                sys.executable,
-                                "-I",
-                                "-B",
-                                "-c",
-                                _SCOPED_ACTOR,
-                                str(Path(process.__file__).resolve().parent),
-                                str(tmp_path),
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                "terminal diagnostic scope probe",
+                                (
+                                    sys.executable,
+                                    "-I",
+                                    "-B",
+                                    "-c",
+                                    _SCOPED_ACTOR,
+                                    str(Path(process.__file__).resolve().parent),
+                                    str(tmp_path),
+                                ),
+                                tmp_path,
+                                stdout=write_fd,
+                                stderr=write_fd,
                             ),
-                            tmp_path,
-                            stdout=write_fd,
-                            stderr=write_fd,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as error:
+                        owner = error.owner
+                        raise
                 while not (tmp_path / "admitted.json").exists():
                     assert owner.process.poll() is None
                     assert time.monotonic() < deadline - 3
@@ -414,7 +422,11 @@ def test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
                     # Exercise the post-grace branch directly; no production grace
                     # or total deadline is increased to make the test pass.
                     boundary.setattr(process, "TERMINATION_GRACE_SECONDS", 0)
-                    boundary.setattr(os, "killpg", observe_killpg)
+                    # Observe the shared boundary without replacing either
+                    # platform's native sender (Darwin killpg or Linux pidfd).
+                    boundary.setattr(
+                        PinnedProcess, "signal_group", observe_signal_group
+                    )
                     assert process.terminate_owned_tree(owner, deadline=deadline)
                 assert process.close_owner(owner, deadline=deadline)
                 owner = None
@@ -635,7 +647,7 @@ def test_registered_unlaunched_diagnostic_closes_with_original_deadline(
         real_close(parent, deadline=deadline)
 
 
-@pytest.mark.parametrize("failure", ["launch", "body"])
+@pytest.mark.parametrize("failure", ["launch", "body", "retained-error"])
 @pytest.mark.parametrize("signal_number", [signal.SIGINT, signal.SIGTERM])
 def test_terminal_writer_fixture_cleans_before_restoring_signal_handlers(
     tmp_path: Path,
@@ -670,8 +682,12 @@ def test_terminal_writer_fixture_cleans_before_restoring_signal_handlers(
         assert signal_controller.defer_depth > 0
         owner = start(command, deadline=deadline, signal_controller=signal_controller)
         owners.append((owner, deadline))
-        if failure == "launch":
+        if failure in {"launch", "retained-error"}:
             os.kill(os.getpid(), signal_number)
+        if failure == "retained-error":
+            error = process.ProcessOwnershipError("retained diagnostic fixture owner")
+            error.owner = owner
+            raise error
         return owner
 
     def interrupt_cleanup(

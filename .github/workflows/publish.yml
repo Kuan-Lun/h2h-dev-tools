@@ -6,6 +6,7 @@ on:
       - src/h2h_dev_tools/process.py
       - src/h2h_dev_tools/_process_diagnostic.py
       - src/h2h_dev_tools/_process_scope.py
+      - src/h2h_dev_tools/_process_posix.py
       - src/h2h_dev_tools/git_environment.py
       - src/h2h_dev_tools/merge_admission.py
       - src/h2h_dev_tools/source_loader.py
