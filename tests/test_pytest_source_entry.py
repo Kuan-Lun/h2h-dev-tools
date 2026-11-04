@@ -107,6 +107,38 @@ def _run(
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="The full gate uses a POSIX shell")
+@pytest.mark.parametrize("inherited_options", ["--collect-only", "-k test_candidate"])
+def test_full_gate_executes_all_tests_despite_inherited_pytest_options(
+    tmp_path: Path, inherited_options: str
+) -> None:
+    root, environment = _checkout(tmp_path, "process")
+    (root / "test_required_failure.py").write_text(
+        "from pathlib import Path\n"
+        "def test_required_failure():\n"
+        "    Path('required-test-executed').touch()\n"
+        "    assert False, 'full gate must execute this test'\n"
+    )
+    environment["PYTEST_ADDOPTS"] = inherited_options
+    manual = _run(
+        root,
+        environment,
+        sys.executable,
+        "scripts/run-pytest.py",
+        "-p",
+        "no:cacheprovider",
+    )
+    assert manual.returncode == 0, manual.stdout + manual.stderr
+    assert not (root / "required-test-executed").exists()
+
+    gate = _run(root, environment, "bash", "scripts/check-full.sh")
+
+    assert gate.returncode == 1, gate.stdout + gate.stderr
+    assert "full gate must execute this test" in gate.stdout + gate.stderr
+    assert (root / "required-test-executed").is_file()
+    assert not (root / "build-reached").exists()
+
+
 @pytest.mark.parametrize("module", ["version_policy", "process"])
 @pytest.mark.parametrize(
     "entry",
