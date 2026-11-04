@@ -35,10 +35,16 @@ def test_wait_retains_group_identity_until_cleanup_and_retires_all_signals(
         tmp_path,
     )
     with process.controlled_termination_signals() as controller:
-        owner = process.start_owned_process(
-            command, deadline=deadline, signal_controller=controller
-        )
+        owner: process.OwnedProcess | None = None
         try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             assert owner.process.wait(timeout=wait_timeout) == exit_code
             receipt = os.waitid(
                 os.P_PID, owner.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
@@ -59,9 +65,11 @@ def test_wait_retains_group_identity_until_cleanup_and_retires_all_signals(
                 assert owner.process.poll() == exit_code
             assert process.close_owner(owner, deadline=deadline)
         finally:
-            scope = owner.posix_scope
-            if scope is not None and scope.capability.directory.exists():
-                with controller.defer():
+            with controller.defer():
+                if owner is not None and (
+                    owner.posix_scope is None
+                    or owner.posix_scope.capability.directory.exists()
+                ):
                     assert process.terminate_owned_tree(owner, deadline=deadline)
                     assert process.close_owner(owner, deadline=deadline)
 
@@ -87,26 +95,34 @@ def test_unbounded_wait_allows_concurrent_group_signals_and_canonical_retirement
     results: list[int] = []
 
     with process.controlled_termination_signals() as controller:
-        owner = process.start_owned_process(
-            command, deadline=deadline, signal_controller=controller
-        )
-        assert isinstance(owner.process, PinnedProcess)
-
-        def observe(kind: int, pid: int, options: int) -> Any:
-            if pid == owner.process.pid and not options & os.WNOHANG:
-                entered.set()
-            return original_waitid(kind, pid, options)
-
-        def wait() -> None:
-            try:
-                results.append(owner.process.wait())
-            except BaseException as error:
-                errors.append(error)
-
-        monkeypatch.setattr(os, "waitid", observe)
-        waiter = threading.Thread(target=wait, daemon=True)
-        waiter.start()
+        owner: process.OwnedProcess | None = None
+        waiter: threading.Thread | None = None
         try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
+            assert isinstance(owner.process, PinnedProcess)
+
+            def observe(kind: int, pid: int, options: int) -> Any:
+                if pid == owner.process.pid and not options & os.WNOHANG:
+                    entered.set()
+                return original_waitid(kind, pid, options)
+
+            def wait() -> None:
+                try:
+                    results.append(owner.process.wait())
+                except BaseException as error:
+                    errors.append(error)
+
+            monkeypatch.setattr(os, "waitid", observe)
+            waiter = threading.Thread(target=wait, daemon=True)
+            with controller.defer():
+                waiter.start()
             assert entered.wait(2)
             if stopped:
                 while time.monotonic() < deadline:
@@ -138,11 +154,14 @@ def test_unbounded_wait_allows_concurrent_group_signals_and_canonical_retirement
             with controller.defer():
                 # Continue a stopped leaf even if an earlier assertion failed,
                 # so its ordinary TERM cleanup can make progress.
-                owner.process.signal_group(signal.SIGCONT, send=os.killpg)
-                assert process.terminate_owned_tree(owner, deadline=deadline)
-                waiter.join(2)
-                assert not waiter.is_alive()
-                assert process.close_owner(owner, deadline=deadline)
+                if owner is not None:
+                    assert isinstance(owner.process, PinnedProcess)
+                    owner.process.signal_group(signal.SIGCONT, send=os.killpg)
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                    if waiter is not None and waiter.ident is not None:
+                        waiter.join(2)
+                        assert not waiter.is_alive()
+                    assert process.close_owner(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX interruptible blocking wait")
@@ -162,26 +181,34 @@ def test_signal_interrupt_clears_blocking_observation_before_owned_cleanup(
     sent = threading.Event()
     original_waitid = os.waitid
     with process.controlled_termination_signals() as controller:
-        owner = process.start_owned_process(
-            command, deadline=deadline, signal_controller=controller
-        )
-        assert isinstance(owner.process, PinnedProcess)
-
-        def observe(kind: int, pid: int, options: int) -> Any:
-            if pid == owner.process.pid and not options & os.WNOHANG:
-                entered.set()
-            return original_waitid(kind, pid, options)
-
-        def interrupt() -> None:
-            if entered.wait(2):
-                time.sleep(0.02)
-                sent.set()
-                os.kill(os.getpid(), number)
-
-        monkeypatch.setattr(os, "waitid", observe)
-        sender = threading.Thread(target=interrupt)
-        sender.start()
+        owner: process.OwnedProcess | None = None
+        sender: threading.Thread | None = None
         try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
+            assert isinstance(owner.process, PinnedProcess)
+
+            def observe(kind: int, pid: int, options: int) -> Any:
+                if pid == owner.process.pid and not options & os.WNOHANG:
+                    entered.set()
+                return original_waitid(kind, pid, options)
+
+            def interrupt() -> None:
+                if entered.wait(2):
+                    time.sleep(0.02)
+                    sent.set()
+                    os.kill(os.getpid(), number)
+
+            monkeypatch.setattr(os, "waitid", observe)
+            sender = threading.Thread(target=interrupt)
+            with controller.defer():
+                sender.start()
             expected = (
                 KeyboardInterrupt
                 if number == signal.SIGINT
@@ -193,11 +220,13 @@ def test_signal_interrupt_clears_blocking_observation_before_owned_cleanup(
             assert not owner.process._blocking_observers
             assert owner.process.poll() is None
         finally:
-            sender.join(3)
-            assert not sender.is_alive()
             with controller.defer():
-                assert process.terminate_owned_tree(owner, deadline=deadline)
-                assert process.close_owner(owner, deadline=deadline)
+                if sender is not None and sender.ident is not None:
+                    sender.join(3)
+                    assert not sender.is_alive()
+                if owner is not None:
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX retained waitable identity")
@@ -209,16 +238,23 @@ def test_foreign_reap_rejects_signals_and_retains_cleanup_responsibility(
         "foreign reap", (sys.executable, "-I", "-S", "-c", "pass"), tmp_path
     )
     with process.controlled_termination_signals() as controller:
-        owner = process.start_owned_process(
-            command, deadline=deadline, signal_controller=controller
-        )
-        scope = owner.posix_scope
-        assert scope is not None
+        owner: process.OwnedProcess | None = None
         manually_reaped = False
         try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
+            scope = owner.posix_scope
+            assert scope is not None
             assert owner.process.wait(timeout=3) == 0
-            assert os.waitpid(owner.process.pid, 0)[0] == owner.process.pid
-            manually_reaped = True
+            with controller.defer():
+                assert os.waitpid(owner.process.pid, 0)[0] == owner.process.pid
+                manually_reaped = True
             with monkeypatch.context() as boundary:
 
                 def forbid_unowned_signal(group: int, number: int) -> None:
@@ -233,18 +269,22 @@ def test_foreign_reap_rejects_signals_and_retains_cleanup_responsibility(
         finally:
             # This fixture deliberately violates the owner API. Its fixed leaf
             # has no descendants; only that independent fact permits rescue.
-            if manually_reaped:
-                assert not scope.has_pending(deadline=deadline)
-                scope.proven_empty = True
-                # Independent fixture-only proof: this deliberately reaped leaf
-                # cannot have descendants; release its retained native handle.
-                from h2h_dev_tools._process_posix import PinnedProcess
+            with controller.defer():
+                if owner is not None:
+                    scope = owner.posix_scope
+                    assert scope is not None
+                    if manually_reaped:
+                        assert not scope.has_pending(deadline=deadline)
+                        scope.proven_empty = True
+                        # Independent fixture-only proof: this deliberately reaped
+                        # leaf cannot have descendants; release its native handle.
+                        from h2h_dev_tools._process_posix import PinnedProcess
 
-                assert isinstance(owner.process, PinnedProcess)
-                owner.process._identity_retired = True
-            else:
-                assert process.terminate_owned_tree(owner, deadline=deadline)
-            assert process.close_owner(owner, deadline=deadline)
+                        assert isinstance(owner.process, PinnedProcess)
+                        owner.process._identity_retired = True
+                    else:
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX scope ledger locks")
@@ -410,9 +450,13 @@ def _diagnostic_launcher(
         owner: process.OwnedProcess | None = None
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    command, deadline=deadline, signal_controller=controller
-                )
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             yield owner
         finally:
             # A failed oracle may need rescue; a successful body must already
@@ -797,9 +841,13 @@ def test_low_level_launch_does_not_pollute_callers_output(
         owner: process.OwnedProcess | None = None
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    command, deadline=deadline, signal_controller=controller
-                )
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             assert owner.process.wait(timeout=5) == 0
             assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
         finally:
@@ -855,6 +903,9 @@ def test_direct_api_defers_signal_until_spawned_process_has_an_owner(
     tmp_path: Path,
     signal_number: int,
 ) -> None:
+    from h2h_dev_tools import _process_posix as native
+    from h2h_dev_tools import _process_scope as scope_module
+
     command = process.ProcessCommand(
         "signal during ownership handoff",
         (sys.executable, "-c", "import time; time.sleep(60)"),
@@ -862,8 +913,12 @@ def test_direct_api_defers_signal_until_spawned_process_has_an_owner(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    deadline = time.monotonic() + 10
     launch = process._start_posix_process
-    children: list[subprocess.Popen[bytes]] = []
+    create_scope = scope_module.PosixScope.create
+    scopes: list[scope_module.PosixScope] = []
+    owners: list[process.OwnedProcess] = []
+    cleanup_verified = False
     previous_handler = signal.getsignal(signal_number)
 
     def unprotected_signal(_signal_number: int, _frame: object) -> None:
@@ -873,15 +928,34 @@ def test_direct_api_defers_signal_until_spawned_process_has_an_owner(
     # than deliver a default SIGTERM to the entire pytest runner.
     signal.signal(signal_number, unprotected_signal)
 
+    def capture_scope(*, deadline: float) -> scope_module.PosixScope:
+        scope = create_scope(deadline=deadline)
+        scopes.append(scope)
+        return scope
+
     def launch_then_signal(phase: process.ProcessCommand) -> subprocess.Popen[bytes]:
-        child = launch(phase)
-        children.append(child)
+        assert phase.environment is not None
+        scope = next(
+            item
+            for item in scopes
+            if item.capability.encode()
+            == phase.environment[scope_module.ENVIRONMENT_KEY]
+        )
+        try:
+            child = launch(phase)
+        except native.AcquisitionError as error:
+            owners.append(process.OwnedProcess(error.process, posix_scope=scope))
+            raise
+        # Preserve the actual scope and native handle even if a broken caller
+        # is interrupted before start_owned_process can return its owner.
+        owners.append(process.OwnedProcess(child, posix_scope=scope))
         # Interrupt precisely after OS process creation but before returning its
         # handle to start_owned_process/run_command. The API must close this gap.
         os.kill(os.getpid(), signal_number)
         return child
 
     monkeypatch.setattr(process, "_start_posix_process", launch_then_signal)
+    monkeypatch.setattr(scope_module.PosixScope, "create", capture_scope)
     try:
         expected = (
             KeyboardInterrupt
@@ -889,21 +963,125 @@ def test_direct_api_defers_signal_until_spawned_process_has_an_owner(
             else process.RunnerSignalInterrupt
         )
         with pytest.raises(expected) as caught:
-            process.run_command(command, hard_deadline=time.monotonic() + 10)
+            process.run_command(command, hard_deadline=deadline)
         if isinstance(caught.value, process.RunnerSignalInterrupt):
             assert caught.value.signal_number == signal_number
-        assert len(children) == 1
-        assert children[0].poll() is not None
+        assert len(owners) == 1
+        owner = owners[0]
+        assert owner.process.poll() is not None
+        assert isinstance(owner.process, native.PinnedProcess)
+        assert owner.process._identity_retired
+        assert owner.process._pidfd is None
         with pytest.raises(ProcessLookupError):
-            os.killpg(children[0].pid, 0)
+            os.killpg(owner.process.pid, 0)
+        assert owner.posix_scope is not None
+        assert not owner.posix_scope.capability.directory.exists()
+        cleanup_verified = True
         assert signal.getsignal(signal_number) is unprotected_signal
     finally:
-        signal.signal(signal_number, previous_handler)
-        # Keep the regression safe even if an implementation leaks the child.
-        for child in children:
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait(timeout=5)
+        try:
+            if not cleanup_verified:
+                with process.controlled_termination_signals() as controller:
+                    with controller.defer():
+                        for owner in owners:
+                            # An observed exit still retains the leader/pidfd.
+                            # Retire the entire group and close its actual scope.
+                            assert process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                            assert process.close_owner(owner, deadline=deadline)
+        finally:
+            signal.signal(signal_number, previous_handler)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Native owner failure-only rescue")
+@pytest.mark.parametrize("already_exited", [False, True])
+def test_direct_api_fixture_rescues_live_and_waitable_native_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_exited: bool
+) -> None:
+    from h2h_dev_tools import _process_posix as native
+    from h2h_dev_tools import _process_scope as scopes
+
+    launch = process._start_posix_process
+    create_scope = scopes.PosixScope.create
+    close = process.close_owner
+    children: list[native.PinnedProcess] = []
+    recorded_scopes: list[tuple[scopes.PosixScope, float]] = []
+    closed: list[process.OwnedProcess] = []
+
+    def record_scope(*, deadline: float) -> scopes.PosixScope:
+        scope = create_scope(deadline=deadline)
+        recorded_scopes.append((scope, deadline))
+        return scope
+
+    def start_leaf(phase: process.ProcessCommand) -> subprocess.Popen[bytes]:
+        if already_exited:
+            phase = process.ProcessCommand(
+                phase.label,
+                (sys.executable, "-I", "-S", "-c", "pass"),
+                phase.cwd,
+                phase.environment,
+                phase.stdout,
+                phase.stderr,
+            )
+        child = launch(phase)
+        assert isinstance(child, native.PinnedProcess)
+        children.append(child)
+        if already_exited:
+            assert child.wait(timeout=3) == 0  # WNOWAIT leaves identity retained.
+        return child
+
+    def omit_cleanup(
+        phase: process.ProcessCommand, *, hard_deadline: float | None
+    ) -> int:
+        assert hard_deadline is not None
+        with process.controlled_termination_signals() as controller:
+            with controller.defer():
+                process.start_owned_process(
+                    phase, deadline=hard_deadline, signal_controller=controller
+                )
+        pytest.fail("the injected launch signal was not delivered")
+
+    def record_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        result = close(owner, deadline=deadline, diagnostic=diagnostic)
+        if result:
+            closed.append(owner)
+        return result
+
+    monkeypatch.setattr(scopes.PosixScope, "create", record_scope)
+    monkeypatch.setattr(process, "_start_posix_process", start_leaf)
+    monkeypatch.setattr(process, "run_command", omit_cleanup)
+    monkeypatch.setattr(process, "close_owner", record_close)
+    try:
+        # The production oracle must fail before its own rescue. That rescue
+        # must then finish the real native lifecycle, even for an exited leader.
+        with pytest.raises(AssertionError):
+            test_direct_api_defers_signal_until_spawned_process_has_an_owner(
+                monkeypatch, tmp_path, signal.SIGTERM
+            )
+        assert len(children) == len(recorded_scopes) == len(closed) == 1
+        child = children[0]
+        scope, _ = recorded_scopes[0]
+        assert closed[0].process is child and closed[0].posix_scope is scope
+        assert child._identity_retired and child._pidfd is None
+        assert scope.proven_empty and not scope.capability.directory.exists()
+        with pytest.raises(ChildProcessError):
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    finally:
+        with process.controlled_termination_signals() as controller:
+            with controller.defer():
+                for child, (scope, deadline) in zip(
+                    children, recorded_scopes, strict=True
+                ):
+                    if scope.capability.directory.exists() or child._pidfd is not None:
+                        owner = process.OwnedProcess(child, posix_scope=scope)
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert close(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX parent ledger contention")
@@ -987,15 +1165,68 @@ def test_normal_exit_closes_parent_obligation_with_remaining_cleanup_budget(
             scope = owner.posix_scope
             assert scope is not None
             if scope.capability.directory.exists():
-                assert process.terminate_owned_tree(
-                    owner, deadline=time.monotonic() + 2
-                )
-                scope.close(deadline=time.monotonic() + 2)
+                rescue_deadline = time.monotonic() + 2
+                assert process.terminate_owned_tree(owner, deadline=rescue_deadline)
+                assert process.close_owner(owner, deadline=rescue_deadline)
         assert not parent.has_pending(deadline=time.monotonic() + 1)
         # This parent is a synthetic ledger: it never launches its own group.
         parent.proven_empty = True
         parent.close(deadline=time.monotonic() + 1)
         assert not parent.capability.directory.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Native closure in ledger rescue")
+def test_parent_ledger_fixture_rescue_closes_retired_native_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from h2h_dev_tools._process_posix import PinnedProcess
+
+    close = process.close_owner
+    attempted: list[tuple[process.OwnedProcess, float, bool]] = []
+
+    def fail_first_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        result = (
+            False
+            if not attempted
+            else close(owner, deadline=deadline, diagnostic=diagnostic)
+        )
+        attempted.append((owner, deadline, result))
+        return result
+
+    monkeypatch.setattr(process, "close_owner", fail_first_close)
+    try:
+        with pytest.raises(process.ProcessOwnershipError):
+            test_normal_exit_closes_parent_obligation_with_remaining_cleanup_budget(
+                tmp_path, monkeypatch, 0, False
+            )
+        assert len(attempted) == 2
+        owner = attempted[0][0]
+        assert attempted[0][2] is False
+        assert attempted[1][0] is owner and attempted[1][2] is True
+        assert isinstance(owner.process, PinnedProcess)
+        assert owner.process._identity_retired and owner.process._pidfd is None
+        scope = owner.posix_scope
+        assert scope is not None and scope.proven_empty
+        assert not scope.capability.directory.exists()
+    finally:
+        with process.controlled_termination_signals() as controller:
+            with controller.defer():
+                if attempted:
+                    owner, deadline, _ = attempted[-1]
+                    assert isinstance(owner.process, PinnedProcess)
+                    if owner.process._pidfd is not None:
+                        # The old fixture closes only ledger metadata. Native
+                        # retirement was already proven; close this exact handle.
+                        owner.process.close_identity()
+                    scope = owner.posix_scope
+                    if scope is not None and scope.capability.directory.exists():
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert close(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX parent ledger contention")
@@ -1016,13 +1247,17 @@ def test_owner_close_deadline_retains_responsibility_until_lock_release(
                 monkeypatch.setenv(
                     scope_module.ENVIRONMENT_KEY, parent.capability.encode()
                 )
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "bounded close", (sys.executable, "-c", "pass"), tmp_path
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "bounded close", (sys.executable, "-c", "pass"), tmp_path
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             scope = owner.posix_scope
             assert scope is not None
             assert owner.process.wait(timeout=3) == 0
@@ -1107,23 +1342,27 @@ def test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
         owner: process.OwnedProcess | None = None
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "native signal exit barrier",
-                        (
-                            sys.executable,
-                            "-I",
-                            "-S",
-                            "-c",
-                            child,
-                            str(ready),
-                            str(release),
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "native signal exit barrier",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-S",
+                                "-c",
+                                child,
+                                str(ready),
+                                str(release),
+                            ),
+                            tmp_path,
                         ),
-                        tmp_path,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             scope = owner.posix_scope
             assert scope is not None
             if edge == "term":
@@ -1186,20 +1425,39 @@ def test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
 
 @pytest.mark.skipif(os.name != "posix", reason="Real signal at owner handoff")
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
-@pytest.mark.parametrize("boundary", ["launch", "cleanup"])
 @pytest.mark.parametrize(
-    "fixture",
+    ("fixture", "boundary"),
     [
-        "silent",
-        "close",
         pytest.param(
-            "native-term",
-            marks=pytest.mark.skipif(sys.platform != "darwin", reason="XNU EPERM"),
-        ),
+            fixture,
+            boundary,
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="XNU EPERM")
+            if fixture.startswith("native-")
+            else (),
+        )
+        for fixture in ("silent", "close", "native-term", "native-kill")
+        for boundary in ("launch", "cleanup", "retained-error")
+    ]
+    + [
+        (fixture, boundary)
+        for fixture in (
+            "retained",
+            "blocking-running",
+            "blocking-stopped",
+            "signal-wait",
+            "foreign-reap",
+            "diagnostic",
+        )
+        for boundary in ("launch", "retained-error")
+    ]
+    + [("foreign-reap", "reap")]
+    + [
         pytest.param(
-            "native-kill",
-            marks=pytest.mark.skipif(sys.platform != "darwin", reason="XNU EPERM"),
-        ),
+            "fork-transfer",
+            boundary,
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd"),
+        )
+        for boundary in ("launch", "retained-error")
     ],
 )
 def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
@@ -1222,6 +1480,8 @@ def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
     pending: list[int | None] = []
     controllers: list[process.SignalController | None] = []
     parents_closed: list[tuple[scope_module.PosixScope, float]] = []
+    retained_errors: list[process.ProcessOwnershipError] = []
+    waitpid = os.waitpid
 
     def send_signal(controller: process.SignalController | None) -> None:
         os.kill(os.getpid(), signum)
@@ -1242,9 +1502,36 @@ def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
         owner = original(phase, deadline=deadline, signal_controller=signal_controller)
         owners.append((owner, deadline))
         controllers.append(signal_controller)
-        if boundary == "launch":
+        if fixture == "blocking-stopped":
+            # Put the real child in the exact leaked state from the finding,
+            # before interrupting the caller's owner assignment.
+            while True:
+                receipt = os.waitid(
+                    os.P_PID, owner.process.pid, os.WSTOPPED | os.WNOWAIT | os.WNOHANG
+                )
+                if receipt is not None and receipt.si_code == os.CLD_STOPPED:
+                    break
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+        if boundary in {"launch", "retained-error"}:
             send_signal(signal_controller)
+        if boundary == "retained-error":
+            from h2h_dev_tools._process_posix import AcquisitionError, PinnedProcess
+
+            assert isinstance(owner.process, PinnedProcess)
+            failure = process.ProcessOwnershipError("injected retained-owner handoff")
+            failure.owner = owner
+            retained_errors.append(failure)
+            # Keep the real identity available so this regression can prove that
+            # the receiving fixture actually cleans the exception's owner.
+            raise failure from AcquisitionError(owner.process)
         return owner
+
+    def reap_then_interrupt(pid: int, options: int) -> tuple[int, int]:
+        result = waitpid(pid, options)
+        if boundary == "reap" and options == 0:
+            send_signal(controllers[0])
+        return result
 
     def record_close(
         owner: process.OwnedProcess,
@@ -1269,6 +1556,8 @@ def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
 
     monkeypatch.setattr(process, "start_owned_process", interrupt)
     monkeypatch.setattr(process, "close_owner", record_close)
+    if boundary == "reap":
+        monkeypatch.setattr(os, "waitpid", reap_then_interrupt)
     if fixture == "close":
         monkeypatch.setattr(scope_module.PosixScope, "create", observe_scope)
         monkeypatch.setattr(scope_module.PosixScope, "close", record_parent_close)
@@ -1278,8 +1567,39 @@ def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
     try:
         # A regressed controller=None fixture must raise a typed interruption,
         # not deliver default SIGTERM to the pytest process before rescue.
-        with process.controlled_termination_signals(), pytest.raises(expected):
-            if fixture == "silent":
+        with (
+            process.controlled_termination_signals(),
+            pytest.raises(expected) as caught,
+        ):
+            if fixture == "retained":
+                test_wait_retains_group_identity_until_cleanup_and_retires_all_signals(
+                    tmp_path, monkeypatch, 0, None
+                )
+            elif fixture.startswith("blocking-"):
+                test_unbounded_wait_allows_concurrent_group_signals_and_canonical_retirement(
+                    tmp_path, monkeypatch, fixture == "blocking-stopped"
+                )
+            elif fixture == "signal-wait":
+                test_signal_interrupt_clears_blocking_observation_before_owned_cleanup(
+                    tmp_path, monkeypatch, signum
+                )
+            elif fixture == "foreign-reap":
+                test_foreign_reap_rejects_signals_and_retains_cleanup_responsibility(
+                    tmp_path, monkeypatch
+                )
+            elif fixture == "fork-transfer":
+                test_pidfd_cleanup_survives_leader_reap_fork_transfer_and_nondumpable_child(
+                    tmp_path, monkeypatch
+                )
+            elif fixture == "diagnostic":
+                with _diagnostic_launcher(
+                    process.ProcessCommand(
+                        "handoff", (sys.executable, "-c", "pass"), tmp_path
+                    ),
+                    deadline=time.monotonic() + 10,
+                ):
+                    pytest.fail("interrupted launch reached the fixture body")
+            elif fixture == "silent":
                 test_low_level_launch_does_not_pollute_callers_output(tmp_path, capsys)
             elif fixture == "close":
                 test_owner_close_deadline_retains_responsibility_until_lock_release(
@@ -1310,6 +1630,11 @@ def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
             assert parents_closed == [(parent, scopes[0][1])]
             assert not parent.capability.directory.exists()
         assert pending == [signum]
+        if boundary == "retained-error":
+            assert len(retained_errors) == 1
+            assert retained_errors[0].owner is owner
+            assert not retained_errors[0].cleanup_proven
+            assert caught.value.__context__ is retained_errors[0]
     finally:
         # Failure-only rescue cannot satisfy the assertions above. Retain the
         # original deadlines, including this fixture's exact synthetic parent.
@@ -1367,17 +1692,22 @@ def test_pidfd_cleanup_survives_leader_reap_fork_transfer_and_nondumpable_child(
     )
     deadline = time.monotonic() + 10
     with process.controlled_termination_signals() as controller:
-        with controller.defer():
-            owner = process.start_owned_process(
-                process.ProcessCommand(
-                    "fork transfer",
-                    (sys.executable, "-I", "-S", "-c", leader, str(ready)),
-                    tmp_path,
-                ),
-                deadline=deadline,
-                signal_controller=controller,
-            )
+        owner: process.OwnedProcess | None = None
         try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "fork transfer",
+                            (sys.executable, "-I", "-S", "-c", leader, str(ready)),
+                            tmp_path,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             assert owner.process.wait(timeout=3) == 0
             while not ready.exists():
                 assert time.monotonic() < deadline - 4
@@ -1403,9 +1733,9 @@ def test_pidfd_cleanup_survives_leader_reap_fork_transfer_and_nondumpable_child(
             )
         finally:
             with controller.defer():
-                if (
-                    owner.posix_scope
-                    and owner.posix_scope.capability.directory.exists()
+                if owner is not None and (
+                    owner.posix_scope is None
+                    or owner.posix_scope.capability.directory.exists()
                 ):
                     assert process.terminate_owned_tree(owner, deadline=deadline)
                     assert process.close_owner(owner, deadline=deadline)
@@ -1414,9 +1744,15 @@ def test_pidfd_cleanup_survives_leader_reap_fork_transfer_and_nondumpable_child(
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Linux post-spawn pidfd acquisition failure"
 )
-@pytest.mark.parametrize("nested_completes", [False, True])
+@pytest.mark.parametrize(
+    ("nested_completes", "inner_signal"),
+    [(False, 0), (True, 0), (True, signal.SIGINT), (True, signal.SIGTERM)],
+)
 def test_pidfd_acquisition_failure_preserves_live_nested_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested_completes: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    nested_completes: bool,
+    inner_signal: int,
 ) -> None:
     import json
 
@@ -1442,21 +1778,36 @@ ready,release,completed=map(Path,sys.argv[2:5])
 cooperative=sys.argv[5]=='True'
 deadline=float(sys.argv[6])
 leaf=sys.argv[7]
+inner_signal=int(sys.argv[8])
 with p.controlled_termination_signals() as controller:
-    with controller.defer():
-        inner=p.start_owned_process(
-            p.ProcessCommand('nested leaf',(sys.executable,'-I','-S','-c',leaf,str(release)),ready.parent),
-            deadline=deadline,signal_controller=controller)
-        scope=inner.posix_scope
-        assert scope is not None and scope.parent is not None
-        if not cooperative:
-            signal.signal(signal.SIGTERM,signal.SIG_IGN)
-        data={'pid':inner.process.pid,'scope':scope.capability.encode(),
-              'parent':scope.parent.encode(),'outer':os.environ[scopes.ENVIRONMENT_KEY]}
-        staging=ready.with_suffix('.pending')
-        staging.write_text(json.dumps(data))
-        staging.replace(ready)
+    inner=None
     try:
+        with controller.defer():
+            try:
+                inner=p.start_owned_process(
+                    p.ProcessCommand('nested leaf',(sys.executable,'-I','-S','-c',leaf,str(release)),ready.parent),
+                    deadline=deadline,signal_controller=controller)
+            except p.ProcessOwnershipError as error:
+                inner=error.owner
+                raise
+            scope=inner.posix_scope
+            assert scope is not None and scope.parent is not None
+            if not cooperative:
+                signal.signal(signal.SIGTERM,signal.SIG_IGN)
+            data={'pid':inner.process.pid,'scope':scope.capability.encode(),
+                  'parent':scope.parent.encode(),'outer':os.environ[scopes.ENVIRONMENT_KEY]}
+            staging=ready.with_suffix('.pending')
+            staging.write_text(json.dumps(data))
+            staging.replace(ready)
+            if inner_signal:
+                # The host must own the original nested pidfd before this
+                # fixture can clean/reap that identity during the handoff.
+                while not ready.with_suffix('.handle-ready').exists():
+                    assert time.monotonic()<deadline
+                    time.sleep(.001)
+                os.kill(os.getpid(),inner_signal)
+                assert controller.pending_signal==inner_signal
+                ready.with_suffix('.signal-injected').touch()
         while not release.exists():
             time.sleep(.01)
     except (KeyboardInterrupt,p.RunnerSignalInterrupt):
@@ -1466,9 +1817,10 @@ with p.controlled_termination_signals() as controller:
             # Only the explicit fixture marker admits an independent rescue
             # budget; production TERM cleanup retains the original deadline.
             cleanup_deadline=time.monotonic()+5 if release.exists() else deadline
-            assert p.terminate_owned_tree(inner,deadline=cleanup_deadline)
-            assert p.close_owner(inner,deadline=cleanup_deadline)
-            completed.touch()
+            if inner is not None:
+                assert p.terminate_owned_tree(inner,deadline=cleanup_deadline)
+                assert p.close_owner(inner,deadline=cleanup_deadline)
+                completed.touch()
 """
     deadline = time.monotonic() + 5
     original_open = native._pidfd_open
@@ -1491,6 +1843,13 @@ with p.controlled_termination_signals() as controller:
             # Independent fixture authority is acquired before the failure.
             # This handle is used only for rescue if a regression kills the owner.
             nested_handle = original_open(nested_identity["pid"])
+            if inner_signal:
+                ready.with_suffix(".handle-ready").touch()
+                while (
+                    not ready.with_suffix(".signal-injected").exists()
+                    and time.monotonic() < deadline - 2
+                ):
+                    time.sleep(0.001)
         raise acquisition_error
 
     def observe_signal(group: int, number: int) -> None:
@@ -1513,34 +1872,40 @@ with p.controlled_termination_signals() as controller:
                     controller.defer(),
                     pytest.raises(process.ProcessOwnershipError) as caught,
                 ):
-                    process.start_owned_process(
-                        process.ProcessCommand(
-                            "post-spawn identity failure",
-                            (
-                                sys.executable,
-                                "-I",
-                                "-S",
-                                "-B",
-                                "-c",
-                                target,
-                                str(Path(process.__file__).parent),
-                                str(ready),
-                                str(release),
-                                str(completed),
-                                str(nested_completes),
-                                str(deadline),
-                                leaf,
+                    try:
+                        process.start_owned_process(
+                            process.ProcessCommand(
+                                "post-spawn identity failure",
+                                (
+                                    sys.executable,
+                                    "-I",
+                                    "-S",
+                                    "-B",
+                                    "-c",
+                                    target,
+                                    str(Path(process.__file__).parent),
+                                    str(ready),
+                                    str(release),
+                                    str(completed),
+                                    str(nested_completes),
+                                    str(deadline),
+                                    leaf,
+                                    str(inner_signal),
+                                ),
+                                tmp_path,
                             ),
-                            tmp_path,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as error:
+                        owner = error.owner
+                        raise
             failure = caught.value
-            owner = failure.owner
-            assert owner is not None
+            assert owner is not None and failure.owner is owner
             assert isinstance(failure.__cause__, native.AcquisitionError)
             assert failure.__cause__.__cause__ is acquisition_error
+            if inner_signal:
+                assert ready.with_suffix(".signal-injected").exists()
             assert not failure.cleanup_proven
             assert isinstance(owner.process, native.PinnedProcess)
             assert owner.process._pidfd is None
@@ -1608,3 +1973,82 @@ with p.controlled_termination_signals() as controller:
                 finally:
                     if nested_handle is not None:
                         os.close(nested_handle)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Real retained pidfd failure")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_acquisition_fixture_retains_error_owner_before_pending_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int
+) -> None:
+    from h2h_dev_tools import _process_posix as native
+
+    original_start = process.start_owned_process
+    original_close = process.close_owner
+    retained: list[process.OwnedProcess] = []
+    closed: list[process.OwnedProcess] = []
+
+    def interrupt_retained_error(
+        phase: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        try:
+            return original_start(
+                phase, deadline=deadline, signal_controller=signal_controller
+            )
+        except process.ProcessOwnershipError as error:
+            assert error.owner is not None
+            retained.append(error.owner)
+            assert signal_controller is not None and signal_controller.defer_depth > 0
+            os.kill(os.getpid(), signum)
+            raise
+
+    def record_close(
+        owner: process.OwnedProcess,
+        *,
+        deadline: float,
+        diagnostic: Callable[[str], None] | None = None,
+    ) -> bool:
+        result = original_close(owner, deadline=deadline, diagnostic=diagnostic)
+        if result:
+            closed.append(owner)
+        return result
+
+    monkeypatch.setattr(process, "start_owned_process", interrupt_retained_error)
+    monkeypatch.setattr(process, "close_owner", record_close)
+    expected = (
+        KeyboardInterrupt if signum == signal.SIGINT else process.RunnerSignalInterrupt
+    )
+    try:
+        with process.controlled_termination_signals(), pytest.raises(expected):
+            test_pidfd_acquisition_failure_preserves_live_nested_cleanup(
+                tmp_path, monkeypatch, False, 0
+            )
+        # These assertions precede independent rescue and require the actual
+        # acquisition fixture to recover its retained handle and canonical scope.
+        assert len(retained) == 1 and closed == retained
+        owner = retained[0]
+        assert isinstance(owner.process, native.PinnedProcess)
+        assert owner.process._identity_retired
+        scope = owner.posix_scope
+        assert scope is not None and scope.proven_empty
+        assert not scope.capability.directory.exists()
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
+    finally:
+        with process.controlled_termination_signals() as controller:
+            with controller.defer():
+                for owner in retained:
+                    if owner not in closed:
+                        # The nested fixture explicitly admits this independent
+                        # rescue only after releasing its fixed leaf by marker.
+                        (tmp_path / "fixture-release").touch()
+                        deadline = time.monotonic() + 8
+                        child = owner.process
+                        assert isinstance(child, native.PinnedProcess)
+                        if child._pidfd is None:
+                            child._pidfd = native._pidfd_open(child.pid)
+                            child._pidfd_acquisition_failed = False
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert original_close(owner, deadline=deadline)

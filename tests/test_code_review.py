@@ -108,14 +108,16 @@ state = Path(sys.argv[1])
 lock = (state / 'child-lock').open('a', encoding='utf-8')
 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
 (state / 'child-pid').write_text(str(os.getpid()), encoding='utf-8')
-while True:
+while not (state / 'fixture-release').exists():
     time.sleep(0.1)
 """
     subprocess.Popen([sys.executable, "-c", child_code, str(state)])
     while not (state / "child-pid").exists():
         time.sleep(0.01)
     if mode == "timeout":
-        time.sleep(120)
+        until = time.monotonic() + 120
+        while not (state / 'fixture-release').exists() and time.monotonic() < until:
+            time.sleep(0.01)
         raise SystemExit(0)
 if mode == "change-tree":
     Path("feature.py").write_text("value = 2\n", encoding="utf-8")
@@ -1112,18 +1114,22 @@ time.sleep(60)
     with process.controlled_termination_signals() as controller:
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "Review cleanup negative control",
-                        (sys.executable, "-c", source, str(tmp_path), residue),
-                        tmp_path,
-                        environment=environment,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "Review cleanup negative control",
+                            (sys.executable, "-c", source, str(tmp_path), residue),
+                            tmp_path,
+                            environment=environment,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
             assert owner.process.wait(timeout=2) == 0
             assert _child_released_lock(tmp_path)
             if residue == "scope":
@@ -1174,14 +1180,9 @@ def test_review_timeout_terminates_the_codex_descendant(
         assert _child_released_lock(repo.state), "The Codex descendant survived timeout"
         _assert_blocked(repo.review("verify", "--index"))
     finally:
-        record_path = repo.state / "review-owner.json"
-        if record_path.exists():
-            # Rescue cannot supply a passing oracle or erase an unclosed ledger.
-            pgid = json.loads(record_path.read_text())["pgid"]
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        # Fixed fixture actors cooperate without signalling a historical PGID.
+        # This cannot supply the assertions above or erase an unclosed ledger.
+        (repo.state / "fixture-release").touch()
 
 
 def test_standalone_surviving_descendant_blocks_publication_even_after_cleanup(
@@ -1195,13 +1196,152 @@ def test_standalone_surviving_descendant_blocks_publication_even_after_cleanup(
         assert _child_released_lock(repo.state)
         _assert_blocked(repo.review("verify", "--index"))
     finally:
-        record_path = repo.state / "review-owner.json"
-        if record_path.exists():
-            pgid = json.loads(record_path.read_text())["pgid"]
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        (repo.state / "fixture-release").touch()
+
+
+@pytest.mark.parametrize("fixture", ["timeout", "passing-child"])
+def test_review_fixture_rescue_never_signals_historical_group(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: str,
+) -> None:
+    repo = review_repository
+    failure = RuntimeError("review failed after its recorded group disappeared")
+    (repo.state / "review-owner.json").write_text(json.dumps({"pgid": 31337}))
+
+    def fail_review(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise failure
+
+    def refuse_historical_signal(group: int, number: int) -> None:
+        pytest.fail(f"Fixture signalled historical group {group} with {number}")
+
+    monkeypatch.setattr(ReviewRepository, "review", fail_review)
+    monkeypatch.setattr(os, "killpg", refuse_historical_signal)
+    with pytest.raises(RuntimeError) as caught:
+        if fixture == "timeout":
+            test_review_timeout_terminates_the_codex_descendant(repo)
+        else:
+            test_standalone_surviving_descendant_blocks_publication_even_after_cleanup(
+                repo
+            )
+    assert caught.value is failure
+    assert (repo.state / "fixture-release").exists()
+
+
+def test_fake_review_actors_exit_cooperatively_without_rescue_signals(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    schema = repo.state / "fixture-schema.json"
+    schema.write_text(
+        json.dumps({"properties": {"shard_id": {"enum": ["shard-0000"]}}})
+    )
+    source = "import io,sys\nsys.stdin=io.StringIO('')\nexec(" + repr(FAKE_CODEX) + ")"
+    deadline = time.monotonic() + 8
+    owner: process.OwnedProcess | None = None
+    with process.controlled_termination_signals() as controller:
+        try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "cooperative fake review rescue",
+                            (
+                                sys.executable,
+                                "-c",
+                                source,
+                                "--output-schema",
+                                str(schema),
+                            ),
+                            repo.path,
+                            environment=repo.environment
+                            | {"FAKE_CODEX_MODE": "timeout"},
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
+            while not (repo.state / "child-pid").exists():
+                assert owner.process.poll() is None
+                assert time.monotonic() < deadline - 3
+                time.sleep(0.01)
+            assert not _child_released_lock(repo.state)
+            (repo.state / "fixture-release").touch()
+            assert owner.process.wait(timeout=2) == 0
+            # Retire the real native group without sending it any rescue signal.
+            assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+            assert process.close_owner(owner, deadline=deadline)
+            _assert_review_tree_cleaned(repo.state)
+            assert _child_released_lock(repo.state)
+        finally:
+            with controller.defer():
+                (repo.state / "fixture-release").touch()
+                if owner is not None and (
+                    owner.posix_scope is None
+                    or owner.posix_scope.capability.directory.exists()
+                ):
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Retained owner signal handoff")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_review_oracle_fixture_retains_error_owner_before_pending_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signum: int
+) -> None:
+    original = process.start_owned_process
+    close = process.close_owner
+    owners: list[tuple[process.OwnedProcess, float]] = []
+    closed: list[process.OwnedProcess] = []
+
+    def interrupt(
+        phase: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        owner = original(phase, deadline=deadline, signal_controller=signal_controller)
+        owners.append((owner, deadline))
+        assert signal_controller is not None and signal_controller.defer_depth > 0
+        os.kill(os.getpid(), signum)
+        failure = process.ProcessOwnershipError("retained cleanup-oracle owner")
+        failure.owner = owner
+        raise failure
+
+    def record_close(owner: process.OwnedProcess, **kwargs: Any) -> bool:
+        result = close(owner, **kwargs)
+        if result:
+            closed.append(owner)
+        return result
+
+    monkeypatch.setattr(process, "start_owned_process", interrupt)
+    monkeypatch.setattr(process, "close_owner", record_close)
+    expected = (
+        KeyboardInterrupt if signum == signal.SIGINT else process.RunnerSignalInterrupt
+    )
+    try:
+        with pytest.raises(expected):
+            test_review_cleanup_oracle_rejects_residue_before_rescue(
+                tmp_path, "descendant"
+            )
+        assert len(owners) == 1
+        owner, _ = owners[0]
+        assert closed == [owner]
+        assert owner.posix_scope is not None and owner.posix_scope.proven_empty
+        assert not owner.posix_scope.capability.directory.exists()
+        assert isinstance(owner.process, _process_posix.PinnedProcess)
+        assert owner.process._identity_retired and owner.process._pidfd is None
+    finally:
+        with process.controlled_termination_signals() as controller:
+            with controller.defer():
+                for owner, deadline in owners:
+                    if owner not in closed:
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert close(owner, deadline=deadline)
 
 
 def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(

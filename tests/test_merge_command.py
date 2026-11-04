@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from test_merge_workflow import owned_fixture_process
 
 from h2h_dev_tools import (
     bundle,
@@ -89,26 +90,34 @@ def test_recovery_never_waits_for_an_open_undrained_diagnostic_pipe(
             "sys.stderr.write('x' * (192 * 1024)); sys.stderr.flush()\n"
             f"Path({str(marker)!r}).touch()\nraise SystemExit(7)\n"
         )
-        owner = subprocess.Popen(
-            (
-                sys.executable,
-                "-I",
-                "-B",
-                merge_command.__file__,
-                "--cleanup-receipt",
-                str(receipt),
-                "--recovery",
-                str(tmp_path),
-                "--",
-                sys.executable,
-                "-c",
-                child,
+        with owned_fixture_process(
+            process.ProcessCommand(
+                "undrained recovery diagnostic fixture",
+                (
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    merge_command.__file__,
+                    "--cleanup-receipt",
+                    str(receipt),
+                    "--recovery",
+                    str(tmp_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    child,
+                ),
+                tmp_path,
+                stdout=write_descriptor
+                if stream_name == "stdout"
+                else subprocess.DEVNULL,
+                stderr=write_descriptor
+                if stream_name == "stderr"
+                else subprocess.DEVNULL,
             ),
-            stdout=write_descriptor if stream_name == "stdout" else subprocess.DEVNULL,
-            stderr=write_descriptor if stream_name == "stderr" else subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        try:
+            deadline=time.monotonic() + 10,  # Original five-second wait plus rescue.
+        ) as owned:
+            owner = owned.process
             # The reader deliberately stays open without consuming any bytes.
             # A full diagnostic pipe must not participate in the recovery wait.
             assert owner.wait(timeout=5) == 7
@@ -116,10 +125,6 @@ def test_recovery_never_waits_for_an_open_undrained_diagnostic_pipe(
             assert receipt.read_text() == "owned_tree_empty\n"
             # dup/inheritance shares the open-file description with our writer.
             assert os.get_blocking(write_descriptor) == original_blocking
-        finally:
-            if owner.poll() is None:
-                os.killpg(owner.pid, signal.SIGKILL)
-                owner.wait(timeout=5)
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
@@ -459,27 +464,31 @@ def test_killed_post_proof_launcher_leaves_no_proof_for_live_writer(
         with process.controlled_termination_signals() as controller:
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            "post-proof diagnostic launcher",
-                            (
-                                sys.executable,
-                                "-I",
-                                "-B",
-                                "-c",
-                                _POST_PROOF_DIAGNOSTIC_ACTOR,
-                                str(Path(process.__file__).resolve().parent),
-                                str(tmp_path),
-                                str(deadline),
-                                scenario,
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                "post-proof diagnostic launcher",
+                                (
+                                    sys.executable,
+                                    "-I",
+                                    "-B",
+                                    "-c",
+                                    _POST_PROOF_DIAGNOSTIC_ACTOR,
+                                    str(Path(process.__file__).resolve().parent),
+                                    str(tmp_path),
+                                    str(deadline),
+                                    scenario,
+                                ),
+                                tmp_path,
+                                stdout=subprocess.DEVNULL,
+                                stderr=write_descriptor,
                             ),
-                            tmp_path,
-                            stdout=subprocess.DEVNULL,
-                            stderr=write_descriptor,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as launch_error:
+                        owner = launch_error.owner
+                        raise
                 marker = tmp_path / "writer.json"
                 while not marker.exists():
                     assert owner.process.poll() is None
@@ -627,27 +636,31 @@ def test_outer_io_failure_exits_without_writing_to_full_stderr(
         with process.controlled_termination_signals() as controller:
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            "outer I/O failure launcher",
-                            (
-                                sys.executable,
-                                "-I",
-                                "-B",
-                                "-c",
-                                _OUTER_IO_ACTOR,
-                                str(Path(process.__file__).resolve().parent),
-                                str(tmp_path),
-                                mode,
-                                fault,
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                "outer I/O failure launcher",
+                                (
+                                    sys.executable,
+                                    "-I",
+                                    "-B",
+                                    "-c",
+                                    _OUTER_IO_ACTOR,
+                                    str(Path(process.__file__).resolve().parent),
+                                    str(tmp_path),
+                                    mode,
+                                    fault,
+                                ),
+                                tmp_path,
+                                stdout=subprocess.DEVNULL,
+                                stderr=write_descriptor,
                             ),
-                            tmp_path,
-                            stdout=subprocess.DEVNULL,
-                            stderr=write_descriptor,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as launch_error:
+                        owner = launch_error.owner
+                        raise
                 try:
                     status = owner.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:

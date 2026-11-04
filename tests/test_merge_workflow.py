@@ -9,7 +9,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -138,6 +139,123 @@ def owned_fixture_command(
             stdout.read().decode("utf-8", errors="replace"),
             stderr.read().decode("utf-8", errors="replace"),
         )
+
+
+@contextmanager
+def owned_fixture_process(
+    command: process.ProcessCommand, *, deadline: float
+) -> Iterator[process.OwnedProcess]:
+    """Retain a fixture's group through launch, observation and retirement."""
+    with process.controlled_termination_signals() as controller:
+        owner: process.OwnedProcess | None = None
+        clean = False
+        try:
+            with controller.defer():
+                try:
+                    owner = process.start_owned_process(
+                        command, deadline=deadline, signal_controller=controller
+                    )
+                except process.ProcessOwnershipError as error:
+                    owner = error.owner
+                    raise
+            yield owner
+            # A successful fixture must prove absence before any rescue. wait()
+            # only observes the pinned leader; this call retires its identity.
+            assert process.wait_for_owned_tree_exit(
+                owner, deadline=deadline, poll_deadline=time.monotonic()
+            )
+            clean = True
+        finally:
+            failure = sys.exception()
+            with controller.defer():
+                try:
+                    if owner is not None:
+                        if not clean:
+                            assert process.terminate_owned_tree(
+                                owner, deadline=deadline
+                            )
+                        assert process.close_owner(owner, deadline=deadline)
+                except BaseException as rescue_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(
+                        f"Pipe fixture cleanup also failed: {rescue_error}"
+                    )
+                finally:
+                    if owner is not None:
+                        for stream in (owner.process.stdout, owner.process.stderr):
+                            if stream is not None:
+                                stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Real POSIX pipe owner handoff")
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("retained_error", [False, True])
+def test_pipe_fixture_cleans_a_signal_interrupted_owner_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signum: int,
+    retained_error: bool,
+) -> None:
+    start = process.start_owned_process
+    owners: list[process.OwnedProcess] = []
+    deadline = time.monotonic() + 10
+
+    def interrupt(
+        command: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        owner = start(command, deadline=deadline, signal_controller=signal_controller)
+        owners.append(owner)
+        os.kill(os.getpid(), signum)
+        if retained_error:
+            error = process.ProcessOwnershipError("injected retained pipe owner")
+            error.owner = owner
+            raise error
+        return owner
+
+    monkeypatch.setattr(process, "start_owned_process", interrupt)
+    expected = (
+        KeyboardInterrupt if signum == signal.SIGINT else process.RunnerSignalInterrupt
+    )
+    proven = False
+    with process.controlled_termination_signals() as controller:
+        try:
+            with pytest.raises(expected):
+                with owned_fixture_process(
+                    process.ProcessCommand(
+                        "interrupted pipe fixture",
+                        (
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            "-c",
+                            "import time; time.sleep(60)",
+                        ),
+                        tmp_path,
+                    ),
+                    deadline=deadline,
+                ):
+                    pytest.fail("Interrupted launch reached the fixture body")
+            assert len(owners) == 1
+            owner = owners[0]
+            assert owner.process.poll() is not None
+            with pytest.raises(ChildProcessError):
+                os.waitpid(owner.process.pid, os.WNOHANG)
+            assert owner.posix_scope is not None and owner.posix_scope.proven_empty
+            assert not owner.posix_scope.capability.directory.exists()
+            with pytest.raises(ProcessLookupError):
+                os.killpg(owner.process.pid, 0)
+            proven = True
+        finally:
+            # A regressed handoff must fail the assertions before this rescue.
+            with controller.defer():
+                if not proven:
+                    for owner in owners:
+                        assert process.terminate_owned_tree(owner, deadline=deadline)
+                        assert process.close_owner(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX nested owner cleanup contract")
@@ -1556,31 +1674,35 @@ def test_all_mutating_workflow_hooks_are_owned(
         clean = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "workflow hook interruption fixture",
-                        (
-                            "bash",
-                            "src/h2h_dev_tools/git-flow-merge.sh",
-                            str(root),
-                            "scripts/review-merge-candidate.sh",
-                            *(["--cleanup-only"] if stage == "noop" else []),
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "workflow hook interruption fixture",
+                            (
+                                "bash",
+                                "src/h2h_dev_tools/git-flow-merge.sh",
+                                str(root),
+                                "scripts/review-merge-candidate.sh",
+                                *(["--cleanup-only"] if stage == "noop" else []),
+                            ),
+                            root,
+                            environment=os.environ
+                            | {
+                                "WORKFLOW_HOOK_STATE": str(state),
+                                "WORKFLOW_HOOK_STAGE": "checkout"
+                                if stage == "noop"
+                                else stage,
+                                "WORKFLOW_HOOK_MODE": mode,
+                            },
+                            stdout=output,
+                            stderr=subprocess.STDOUT,
                         ),
-                        root,
-                        environment=os.environ
-                        | {
-                            "WORKFLOW_HOOK_STATE": str(state),
-                            "WORKFLOW_HOOK_STAGE": "checkout"
-                            if stage == "noop"
-                            else stage,
-                            "WORKFLOW_HOOK_MODE": mode,
-                        },
-                        stdout=output,
-                        stderr=subprocess.STDOUT,
-                    ),
-                    deadline=cleanup_deadline,
-                    signal_controller=controller,
-                )
+                        deadline=cleanup_deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             wrapper = owner.process
             deadline = time.monotonic() + 20
             while not (state / "ready").exists():
@@ -1755,6 +1877,7 @@ def test_linked_cleanup_requires_surviving_primary_environment(
 )
 def test_passing_managed_review_requires_an_empty_stage_before_commit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     surviving_child: bool,
     diverged_primary: bool,
     separate_filesystem: bool,
@@ -1806,6 +1929,14 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
     task = git(root, "rev-parse", "HEAD")
     binary = tmp_path / "bin"
     binary.mkdir()
+    groups = tmp_path / "review-groups"
+    groups.mkdir()
+    release = tmp_path / "release-review-leaves"
+    leaf = (
+        "import sys,time\nfrom pathlib import Path\n"
+        "deadline=float(sys.argv[2])\n"
+        "while not Path(sys.argv[1]).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+    )
     write_python_executable(
         binary / "codex",
         "import json, os, subprocess, sys, time\n"
@@ -1818,10 +1949,23 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
         "output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
         + _PASS_REVIEW
         + f"if {surviving_child!r}:\n"
-        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
-        "    Path(os.environ['REVIEW_GROUP_FILE']).write_text(str(os.getpgrp()))\n",
+        "    (Path(os.environ['REVIEW_GROUPS']) / str(os.getpgrp())).touch()\n"
+        f"    subprocess.Popen([sys.executable, '-c', {leaf!r}, "
+        "os.environ['REVIEW_LEAF_RELEASE'], os.environ['REVIEW_LEAF_DEADLINE']])\n",
     )
-    group_file = tmp_path / "review-group"
+    original_killpg = os.killpg
+
+    def observe_group_only(group: int, number: int) -> None:
+        # These nested groups are owned by the workflow, not this fixture. A
+        # recorded number never grants the test authority to signal it later.
+        assert number == 0 or not (groups / str(group)).exists(), (
+            "Fixture attempted to signal a historical reviewer PGID"
+        )
+        original_killpg(group, number)
+
+    monkeypatch.setattr(os, "killpg", observe_group_only)
+    cleanup_proven = False
+    fixture_deadline = time.monotonic() + 20
     try:
         result = subprocess.run(
             ("scripts/git-flow-merge.sh",),
@@ -1829,7 +1973,9 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
             env=os.environ
             | {
                 "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
-                "REVIEW_GROUP_FILE": str(group_file),
+                "REVIEW_GROUPS": str(groups),
+                "REVIEW_LEAF_RELEASE": str(release),
+                "REVIEW_LEAF_DEADLINE": str(fixture_deadline),
             },
             capture_output=True,
             text=True,
@@ -1840,9 +1986,13 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
             result.stdout + result.stderr
         )
         assert not (root / ".git/MERGE_HEAD").exists()
-        if surviving_child:
+        observed_groups = list(groups.iterdir())
+        assert bool(observed_groups) is surviving_child
+        for group_file in observed_groups:
             with pytest.raises(ProcessLookupError):
-                os.killpg(int(group_file.read_text()), 0)
+                os.killpg(int(group_file.name), 0)
+        cleanup_proven = True
+        if surviving_child:
             assert git(root, "rev-parse", "master") == base
             assert git(root, "rev-parse", "task") == task
             assert not (root / ".git/fixture-gate").exists()
@@ -1866,11 +2016,27 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
             ]
             assert (root / ".git/fixture-gate").read_text() == "checked\n"
     finally:
-        if group_file.exists():
-            try:
-                os.killpg(int(group_file.read_text()), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        if not cleanup_proven:
+            # Only a failed oracle releases the fixed synthetic leaves. Do not
+            # signal historical IDs, even during rescue: they may be reused.
+            release.touch()
+            while True:
+                present = False
+                for group_file in groups.iterdir():
+                    try:
+                        os.killpg(int(group_file.name), 0)
+                    except ProcessLookupError:
+                        continue
+                    except PermissionError:
+                        # XNU may retain an exited group until its parent reaps.
+                        pass
+                    present = True
+                if not present:
+                    break
+                assert time.monotonic() < fixture_deadline, (
+                    "Cooperative reviewer fixture cleanup remained unproven"
+                )
+                time.sleep(0.01)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Online review requires POSIX ownership")
@@ -1926,15 +2092,23 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
         "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
         "REVIEW_OWNER_STATE": str(state),
     }
-    with (state / "output").open("w+") as output:
-        wrapper = subprocess.Popen(
-            ("scripts/git-flow-merge.sh",),
-            cwd=root,
-            env=environment,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    with (
+        (state / "output").open("w+b") as output,
+        owned_fixture_process(
+            process.ProcessCommand(
+                "managed review publication fixture",
+                ("scripts/git-flow-merge.sh",),
+                root,
+                environment=environment,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+            ),
+            # Existing ready (15), two lock probes (10 each), wait (20) and
+            # final cleanup (10) budgets share one fixture lifetime.
+            deadline=time.monotonic() + 65,
+        ) as publication_owner,
+    ):
+        wrapper = publication_owner.process
         try:
             deadline = time.monotonic() + 15
             while not (state / "ready").exists():
@@ -1989,9 +2163,6 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
             )
         finally:
             (state / "release").touch()
-            if wrapper.poll() is None:
-                wrapper.send_signal(signal.SIGTERM)
-            wrapper.wait(timeout=10)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
@@ -2021,31 +2192,31 @@ def test_recovery_owner_startup_failure_does_not_wait_for_diagnostic_reader(
             pass
         os.set_blocking(write_descriptor, True)
         launcher = _ROOT / "src/h2h_dev_tools/merge_command.py"
-        wrapper = subprocess.Popen(
-            (
-                "bash",
-                str(script),
-                str(tmp_path / "missing-python")
-                if missing == "python"
-                else sys.executable,
-                str(tmp_path / "missing-launcher")
-                if missing == "launcher"
-                else str(launcher),
-                str(tmp_path),
+        with owned_fixture_process(
+            process.ProcessCommand(
+                "missing recovery owner fixture",
+                (
+                    "bash",
+                    str(script),
+                    str(tmp_path / "missing-python")
+                    if missing == "python"
+                    else sys.executable,
+                    str(tmp_path / "missing-launcher")
+                    if missing == "launcher"
+                    else str(launcher),
+                    str(tmp_path),
+                ),
+                tmp_path,
+                stdout=subprocess.DEVNULL,
+                stderr=write_descriptor,
             ),
-            stdout=subprocess.DEVNULL,
-            stderr=write_descriptor,
-            start_new_session=True,
-        )
-        try:
+            deadline=time.monotonic() + 10,  # Original five-second wait plus rescue.
+        ) as owner:
+            wrapper = owner.process
             assert wrapper.wait(timeout=5) == 125
             assert (tmp_path / "failed").read_text() == "1"
             assert not (tmp_path / "cleanup-1").exists()
             assert os.get_blocking(write_descriptor)
-        finally:
-            if wrapper.poll() is None:
-                os.killpg(wrapper.pid, signal.SIGKILL)
-                wrapper.wait(timeout=5)
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
@@ -2068,7 +2239,10 @@ def test_recovery_owner_startup_failure_does_not_wait_for_diagnostic_reader(
     ],
 )
 def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
-    tmp_path: Path, stage: str, interruption: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    interruption: str,
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True)
@@ -2084,6 +2258,38 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
         "print('full')\n"
     )
     (root / "scripts/blocking-review.py").write_text(_BLOCKING_GATE)
+    if interruption in {"crash", "closed-pipe-crash"}:
+        original_kill = os.kill
+
+        def refuse_historical_reviewer_signal(pid: int, number: int) -> None:
+            identity = state / "reviewer-pid"
+            assert (
+                number == 0 or not identity.exists() or identity.read_text() != str(pid)
+            ), "Fixture attempted to signal a historical reviewer PID"
+            original_kill(pid, number)
+
+        monkeypatch.setattr(os, "kill", refuse_historical_reviewer_signal)
+        worker = root / "src/h2h_dev_tools/review_worker.py"
+        anchor = 'if __name__ == "__main__":\n'
+        source = worker.read_text()
+        assert source.count(anchor) == 1
+        worker.write_text(
+            source.replace(
+                anchor,
+                anchor
+                + "    import os, signal, threading, time\n"
+                + "    state = Path(os.environ['MERGE_INTERRUPTION_STATE'])\n"
+                + "    def crash_on_request():\n"
+                + "        request = state / 'crash-target'\n"
+                + "        deadline = float(os.environ['MERGE_FIXTURE_CLEANUP_DEADLINE'])\n"
+                + "        while time.monotonic() < deadline:\n"
+                + "            if request.exists() and request.read_text() == str(os.getpid()):\n"
+                + "                (state / 'crash-observed').write_text(str(os.getpid()))\n"
+                + "                os.kill(os.getpid(), signal.SIGKILL)\n"
+                + "            time.sleep(.01)\n"
+                + "    threading.Thread(target=crash_on_request, daemon=True).start()\n",
+            )
+        )
     piped_output = interruption.startswith(("closed-pipe", "backpressure"))
     if piped_output:
         write_python_executable(
@@ -2126,28 +2332,33 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
         clean = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "review interruption fixture",
-                        ("scripts/git-flow-merge.sh",),
-                        root,
-                        environment=os.environ
-                        | {
-                            "PATH": str(binary)
-                            + os.pathsep
-                            + os.environ.get("PATH", ""),
-                            "MERGE_INTERRUPTION_STATE": str(state),
-                            "MERGE_REVIEW_STAGE": stage,
-                            "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "40"
-                            if interruption == "timeout"
-                            else "900",
-                        },
-                        stdout=subprocess.PIPE if piped_output else output,
-                        stderr=subprocess.STDOUT,
-                    ),
-                    deadline=cleanup_deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "review interruption fixture",
+                            ("scripts/git-flow-merge.sh",),
+                            root,
+                            environment=os.environ
+                            | {
+                                "PATH": str(binary)
+                                + os.pathsep
+                                + os.environ.get("PATH", ""),
+                                "MERGE_INTERRUPTION_STATE": str(state),
+                                "MERGE_REVIEW_STAGE": stage,
+                                "MERGE_FIXTURE_CLEANUP_DEADLINE": str(cleanup_deadline),
+                                "H2H_CODE_REVIEW_TIMEOUT_SECONDS": "40"
+                                if interruption == "timeout"
+                                else "900",
+                            },
+                            stdout=subprocess.PIPE if piped_output else output,
+                            stderr=subprocess.STDOUT,
+                        ),
+                        deadline=cleanup_deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             wrapper = owner.process
             deadline = time.monotonic() + 15
             while not (state / "ready").exists():
@@ -2160,7 +2371,11 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 assert wrapper.stdout is not None
                 wrapper.stdout.close()
             if interruption in {"crash", "closed-pipe-crash"}:
-                os.kill(int((state / "reviewer-pid").read_text()), signal.SIGKILL)
+                # The fixed worker kills itself while its identity is live.
+                # A historical PID read by the host is never signal authority.
+                (state / "crash-target").write_text(
+                    (state / "reviewer-pid").read_text()
+                )
             elif interruption in {"cancel", "closed-pipe"} or interruption.startswith(
                 "backpressure"
             ):
@@ -2168,6 +2383,10 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
             # Two shards reserve 20% for integration, including six cleanup seconds.
             wrapper.wait(timeout=45 if interruption == "timeout" else 15)
             assert wrapper.returncode != 0, (state / "output").read_text()
+            if interruption in {"crash", "closed-pipe-crash"}:
+                assert (state / "crash-observed").read_text() == (
+                    state / "crash-target"
+                ).read_text()
             if interruption in {"cancel", "closed-pipe"} or interruption.startswith(
                 "backpressure"
             ):
@@ -2296,24 +2515,28 @@ def test_merge_interruption_cleans_gate_descendants_before_restoring_git_state(
         clean = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "merge interruption fixture",
-                        (
-                            "bash",
-                            str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
-                            str(root),
-                            "scripts/review-merge-candidate.sh",
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "merge interruption fixture",
+                            (
+                                "bash",
+                                str(root / "src/h2h_dev_tools/git-flow-merge.sh"),
+                                str(root),
+                                "scripts/review-merge-candidate.sh",
+                            ),
+                            root,
+                            environment=os.environ
+                            | {"MERGE_INTERRUPTION_STATE": str(state)},
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
                         ),
-                        root,
-                        environment=os.environ
-                        | {"MERGE_INTERRUPTION_STATE": str(state)},
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             wrapper = owner.process
             while not (state / "ready").exists():
                 assert wrapper.poll() is None, wrapper.communicate()[0]
@@ -2444,18 +2667,22 @@ def test_success_output_cannot_hold_workflow_admission(
         clean = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "terminal completion output fixture",
-                        ("scripts/git-flow-merge.sh",),
-                        root,
-                        environment=os.environ | {"TMPDIR": str(exports)},
-                        stdout=subprocess.PIPE,
-                        stderr=errors,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "terminal completion output fixture",
+                            ("scripts/git-flow-merge.sh",),
+                            root,
+                            environment=os.environ | {"TMPDIR": str(exports)},
+                            stdout=subprocess.PIPE,
+                            stderr=errors,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             wrapper = owner.process
             assert wrapper.stdout is not None
             while not ready.exists():
@@ -2566,14 +2793,18 @@ def test_failed_gate_recovers_without_waiting_for_diagnostic_reader(
     git(root, "add", ".")
     git(root, "commit", "-m", "test: fail the gate with an undrained diagnostic pipe")
     task = git(root, "rev-parse", "HEAD")
-    wrapper = subprocess.Popen(
-        ("scripts/git-flow-merge.sh",),
-        cwd=root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
+    with owned_fixture_process(
+        process.ProcessCommand(
+            "failed gate diagnostic fixture",
+            ("scripts/git-flow-merge.sh",),
+            root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        ),
+        deadline=time.monotonic()
+        + 20,  # Original 15-second wait plus five-second rescue.
+    ) as owner:
+        wrapper = owner.process
         # Keep the pipe open without reading it. No external signal is needed:
         # the failed gate must automatically reach recovery and exit.
         assert wrapper.wait(timeout=15) == 1
@@ -2586,10 +2817,6 @@ def test_failed_gate_recovers_without_waiting_for_diagnostic_reader(
         else:
             assert git(root, "branch", "--show-current") == "task"
             assert git(root, "status", "--porcelain") == ""
-    finally:
-        if wrapper.poll() is None:
-            os.killpg(wrapper.pid, signal.SIGKILL)
-        wrapper.communicate(timeout=5)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real isolated shell diagnostic entry")
@@ -2814,18 +3041,22 @@ def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
         clean = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "interrupted diagnostic launcher",
-                        ("scripts/git-flow-merge.sh",),
-                        root,
-                        environment=os.environ | {"TMPDIR": str(exports)},
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "interrupted diagnostic launcher",
+                            ("scripts/git-flow-merge.sh",),
+                            root,
+                            environment=os.environ | {"TMPDIR": str(exports)},
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             wrapper = owner.process
             while not ready.exists():
                 assert wrapper.poll() is None, wrapper.communicate()[0]
@@ -2890,24 +3121,28 @@ def test_interruption_oracle_tracks_non_locking_descendants_after_wrapper_exit(
         clean = False
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "non-locking descendant oracle control",
-                        (
-                            sys.executable,
-                            "-I",
-                            "-c",
-                            wrapper_source,
-                            str(lock),
-                            str(child_pid),
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "non-locking descendant oracle control",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-c",
+                                wrapper_source,
+                                str(lock),
+                                str(child_pid),
+                            ),
+                            tmp_path,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
                         ),
-                        tmp_path,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             assert owner.process.wait(timeout=3) == 143
             _assert_gate_lock_released(lock)
             assert owner.posix_scope is not None
@@ -2951,16 +3186,27 @@ def test_interruption_oracle_tracks_non_locking_descendants_after_wrapper_exit(
         "nested-obligation",
         "publication-stage",
         "publication-terminal",
+        "publication-lock",
+        "success-output",
+        "preview",
+        "post-proof-diagnostic",
+        "outer-io",
     ],
 )
 @pytest.mark.parametrize("signal_number", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("retained_error", [False, True])
 def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture: str, signal_number: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: str,
+    signal_number: int,
+    retained_error: bool,
 ) -> None:
     start = process.start_owned_process
     close = process.close_owner
     owners: list[tuple[process.OwnedProcess, float]] = []
     closed: list[tuple[process.OwnedProcess, float, bool]] = []
+    retained_errors: list[process.ProcessOwnershipError] = []
 
     def start_and_interrupt(
         command: process.ProcessCommand,
@@ -2973,6 +3219,11 @@ def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
         owner = start(command, deadline=deadline, signal_controller=signal_controller)
         owners.append((owner, deadline))
         signal_controller.receive(signal_number)
+        if retained_error:
+            error = process.ProcessOwnershipError("injected retained fixture owner")
+            error.owner = owner
+            retained_errors.append(error)
+            raise error
         return owner
 
     def record_close(
@@ -2997,7 +3248,7 @@ def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
                 )
             elif fixture == "review":
                 test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
-                    tmp_path, "execute", "cancel"
+                    tmp_path, monkeypatch, "execute", "cancel"
                 )
             elif fixture == "non-locking":
                 test_interruption_oracle_tracks_non_locking_descendants_after_wrapper_exit(
@@ -3023,6 +3274,32 @@ def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
                 test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
                     tmp_path
                 )
+            elif fixture == "publication-lock":
+                test_managed_review_lock_covers_cleanup_and_evidence_publication(
+                    tmp_path, "publish"
+                )
+            elif fixture == "success-output":
+                test_success_output_cannot_hold_workflow_admission(
+                    tmp_path, "merge", "normal"
+                )
+            elif fixture == "preview":
+                test_merge_preview_owns_driver_inherited_stderr(tmp_path, False)
+            elif fixture == "post-proof-diagnostic":
+                from test_merge_command import (
+                    test_killed_post_proof_launcher_leaves_no_proof_for_live_writer,
+                )
+
+                test_killed_post_proof_launcher_leaves_no_proof_for_live_writer(
+                    tmp_path, "signal"
+                )
+            elif fixture == "outer-io":
+                from test_merge_command import (
+                    test_outer_io_failure_exits_without_writing_to_full_stderr,
+                )
+
+                test_outer_io_failure_exits_without_writing_to_full_stderr(
+                    tmp_path, "ordinary", "write"
+                )
             else:
                 test_cancel_merge_during_receipt_publication_restores_task(
                     tmp_path, fixture.removeprefix("publication-")
@@ -3035,6 +3312,10 @@ def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
         assert len(owners) == 1
         owner, deadline = owners[0]
         assert closed == [(owner, deadline, True)]
+        if retained_error:
+            assert len(retained_errors) == 1
+            assert retained_errors[0].owner is owner
+            assert caught.value.__context__ is retained_errors[0]
         with pytest.raises(ProcessLookupError):
             os.killpg(owner.process.pid, 0)
     finally:
@@ -3109,25 +3390,29 @@ def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
         owner: process.OwnedProcess | None = None
         try:
             with controller.defer():
-                owner = process.start_owned_process(
-                    process.ProcessCommand(
-                        "missing nested cleanup negative control",
-                        (
-                            sys.executable,
-                            "-I",
-                            "-B",
-                            "-c",
-                            child,
-                            str(package),
-                            str(marker),
+                try:
+                    owner = process.start_owned_process(
+                        process.ProcessCommand(
+                            "missing nested cleanup negative control",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                child,
+                                str(package),
+                                str(marker),
+                            ),
+                            tmp_path,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
                         ),
-                        tmp_path,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    ),
-                    deadline=deadline,
-                    signal_controller=controller,
-                )
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+                except process.ProcessOwnershipError as launch_error:
+                    owner = launch_error.owner
+                    raise
             assert owner.process.wait(timeout=3) == 143
             # Observation retains the leader's waitable identity until nested
             # obligations are discharged. Exited does not mean safe to reap.
@@ -4123,24 +4408,28 @@ def test_cancel_merge_during_receipt_publication_restores_task(
             clean = False
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            f"cancel receipt {phase} publication",
-                            ("scripts/git-flow-merge.sh",),
-                            root,
-                            environment=os.environ
-                            | {
-                                "PUBLICATION_HOLD": str(marker),
-                                "PUBLICATION_RECEIPTS": str(
-                                    root / ".git/h2h-review/receipts"
-                                ),
-                            },
-                            stdout=output,
-                            stderr=subprocess.STDOUT,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                f"cancel receipt {phase} publication",
+                                ("scripts/git-flow-merge.sh",),
+                                root,
+                                environment=os.environ
+                                | {
+                                    "PUBLICATION_HOLD": str(marker),
+                                    "PUBLICATION_RECEIPTS": str(
+                                        root / ".git/h2h-review/receipts"
+                                    ),
+                                },
+                                stdout=output,
+                                stderr=subprocess.STDOUT,
+                            ),
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as launch_error:
+                        owner = launch_error.owner
+                        raise
                 wrapper = owner.process
                 while not marker.exists():
                     assert wrapper.poll() is None, output_path.read_text()
@@ -4386,23 +4675,27 @@ def test_cleanliness_stage_owns_git_callbacks_before_task_cleanup(
             clean = False
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            "owned cleanliness before task cleanup",
-                            ("scripts/git-flow-merge.sh",)
-                            + (
-                                ("--cleanup-only",)
-                                if operation == "cleanup-only"
-                                else ()
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                "owned cleanliness before task cleanup",
+                                ("scripts/git-flow-merge.sh",)
+                                + (
+                                    ("--cleanup-only",)
+                                    if operation == "cleanup-only"
+                                    else ()
+                                ),
+                                root,
+                                environment=os.environ | {"TMPDIR": str(scopes)},
+                                stdout=output,
+                                stderr=subprocess.STDOUT,
                             ),
-                            root,
-                            environment=os.environ | {"TMPDIR": str(scopes)},
-                            stdout=output,
-                            stderr=subprocess.STDOUT,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as launch_error:
+                        owner = launch_error.owner
+                        raise
                 status = owner.process.wait(timeout=12)
                 recorded = output_path.read_text()
                 assert process.wait_for_owned_tree_exit(
@@ -4594,22 +4887,26 @@ def test_candidate_export_uses_owned_capture_before_review(
             clean = False
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            "owned candidate capture before review",
-                            ("scripts/git-flow-merge.sh",),
-                            root,
-                            environment=os.environ
-                            | {
-                                "TMPDIR": str(scopes),
-                                "GIT_TRACE2_EVENT": str(state / "git-trace"),
-                            },
-                            stdout=output,
-                            stderr=subprocess.STDOUT,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                "owned candidate capture before review",
+                                ("scripts/git-flow-merge.sh",),
+                                root,
+                                environment=os.environ
+                                | {
+                                    "TMPDIR": str(scopes),
+                                    "GIT_TRACE2_EVENT": str(state / "git-trace"),
+                                },
+                                stdout=output,
+                                stderr=subprocess.STDOUT,
+                            ),
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as launch_error:
+                        owner = launch_error.owner
+                        raise
                 (state / "outer-group").write_text(str(owner.process.pid))
                 status = owner.process.wait(timeout=60)
                 recorded = output_path.read_text()
@@ -4756,18 +5053,22 @@ def test_merge_preview_owns_driver_inherited_stderr(
             clean = False
             try:
                 with controller.defer():
-                    owner = process.start_owned_process(
-                        process.ProcessCommand(
-                            "owned merge preview callback",
-                            ("scripts/git-flow-merge.sh",),
-                            root,
-                            environment=os.environ | {"TMPDIR": str(scopes)},
-                            stdout=output,
-                            stderr=subprocess.STDOUT,
-                        ),
-                        deadline=deadline,
-                        signal_controller=controller,
-                    )
+                    try:
+                        owner = process.start_owned_process(
+                            process.ProcessCommand(
+                                "owned merge preview callback",
+                                ("scripts/git-flow-merge.sh",),
+                                root,
+                                environment=os.environ | {"TMPDIR": str(scopes)},
+                                stdout=output,
+                                stderr=subprocess.STDOUT,
+                            ),
+                            deadline=deadline,
+                            signal_controller=controller,
+                        )
+                    except process.ProcessOwnershipError as launch_error:
+                        owner = launch_error.owner
+                        raise
                 status = owner.process.wait(timeout=12)
                 recorded = output_path.read_text()
                 assert process.wait_for_owned_tree_exit(
