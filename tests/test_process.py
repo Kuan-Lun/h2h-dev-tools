@@ -19,6 +19,7 @@ from unittest.mock import ANY, Mock, call
 import pytest
 
 from h2h_dev_tools import _process_diagnostic as diagnostic
+from h2h_dev_tools import _process_posix as posix
 from h2h_dev_tools import process as implementation
 
 runner: ModuleType = implementation
@@ -91,7 +92,8 @@ def test_short_group_observation_never_replaces_or_extends_cleanup_deadline(
         nonlocal clock
         clock += seconds
 
-    child = Mock(pid=4312)
+    child = Mock(spec=posix.PinnedProcess, pid=4312)
+    child.poll.return_value = None
     scope = Mock()
     owner = runner.OwnedProcess(child, posix_scope=scope)
     monkeypatch.setattr(runner.os, "killpg", Mock(), raising=False)
@@ -114,10 +116,13 @@ def require_explicit_process_launch_double(
     popen = Mock(
         side_effect=AssertionError("Unit test attempted a real process launch")
     )
+    pinned = Mock(side_effect=AssertionError("Unit test attempted a pinned launch"))
     monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(posix.PinnedProcess, "__init__", pinned)
     yield
     # Also catch callers that convert the guard's exception into an expected error.
     popen.assert_not_called()
+    pinned.assert_not_called()
 
 
 @pytest.fixture
@@ -140,7 +145,7 @@ def test_start_phase_inherits_live_output_and_starts_posix_process_group(
 ) -> None:
     process = Mock()
     popen = Mock(return_value=process)
-    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(posix, "PinnedProcess", popen)
 
     assert runner._start_posix_process(COMMAND) is process
 
@@ -342,7 +347,8 @@ def test_phase_wait_subtracts_ownership_overhead_from_absolute_deadline(
 def test_posix_termination_kills_surviving_group_after_leader_exits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = Mock(pid=4312)
+    process = Mock(spec=posix.PinnedProcess, pid=4312)
+    process.signal_group.side_effect = lambda number, *, send: send(4312, number)
     process.poll.return_value = 0
     kill_process_group = Mock()
     wait_for_group = Mock(side_effect=(False, True))
@@ -362,29 +368,31 @@ def test_posix_termination_kills_surviving_group_after_leader_exits(
 def test_posix_group_probe_does_not_trust_an_exited_leader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = Mock(pid=4312)
+    process = Mock(spec=posix.PinnedProcess, pid=4312)
     process.poll.return_value = 0
-    process.wait.return_value = 0
-    kill_process_group = Mock(side_effect=(None, ProcessLookupError()))
-    monotonic = Mock(side_effect=(1.0, 2.0))
+    process.retire_clean_group.side_effect = (False, True)
+    monotonic = Mock(return_value=1.0)
     sleep = Mock()
     monkeypatch.setattr(runner.time, "monotonic", monotonic)
     monkeypatch.setattr(runner.time, "sleep", sleep)
 
     assert runner._wait_for_posix_process_group_exit(
         process,
-        kill_process_group=kill_process_group,
         deadline=10.0,
     )
-    assert kill_process_group.call_args_list == [call(4312, 0), call(4312, 0)]
     sleep.assert_called_once_with(runner.TERMINATION_POLL_SECONDS)
-    process.wait.assert_called_once_with(timeout=8.0)
+    assert process.retire_clean_group.call_args_list == [
+        call(deadline=10.0),
+        call(deadline=10.0),
+    ]
+    process.wait.assert_not_called()
 
 
 def test_posix_termination_reports_a_group_that_survives_sigkill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = Mock(pid=4312)
+    process = Mock(spec=posix.PinnedProcess, pid=4312)
+    process.signal_group.side_effect = lambda number, *, send: send(4312, number)
     kill_process_group = Mock()
     wait_for_group = Mock(side_effect=(False, False))
     monkeypatch.setattr(runner, "os", SimpleNamespace(killpg=kill_process_group))
@@ -401,7 +409,8 @@ def test_posix_termination_reports_a_group_that_survives_sigkill(
 def test_posix_signal_eperm_requires_bounded_complete_cleanup_proof(
     monkeypatch: pytest.MonkeyPatch, edge: int, outcome: str
 ) -> None:
-    process = Mock(pid=4312)
+    process = Mock(spec=posix.PinnedProcess, pid=4312)
+    process.signal_group.side_effect = lambda number, *, send: send(4312, number)
     process.poll.return_value = 0
     process.wait.return_value = 0
     scope = Mock()
@@ -420,7 +429,7 @@ def test_posix_signal_eperm_requires_bounded_complete_cleanup_proof(
         return signaled and outcome == "pending"
 
     def kill_process_group(group: int, number: int) -> None:
-        nonlocal signaled, probes
+        nonlocal signaled
         assert group == process.pid
         calls.append(number)
         if number == edge:
@@ -428,12 +437,16 @@ def test_posix_signal_eperm_requires_bounded_complete_cleanup_proof(
             if outcome == "other-error":
                 raise OSError(errno.EIO, "Unknown signaling failure")
             raise PermissionError(errno.EPERM, "No absence evidence")
-        if number == 0 and signaled:
-            probes += 1
-            if outcome == "permission" or (outcome == "resolved" and probes == 1):
-                raise PermissionError(errno.EPERM, "Still no absence evidence")
-            raise ProcessLookupError(errno.ESRCH, "Group absent")
 
+    def group_proof(*, deadline: float) -> bool:
+        nonlocal probes
+        assert deadline <= 106.0
+        if not signaled:
+            return False
+        probes += 1
+        return outcome == "resolved" and probes > 1
+
+    process.retire_clean_group.side_effect = group_proof
     scope.has_pending.side_effect = pending
     monkeypatch.setattr(runner, "os", SimpleNamespace(killpg=kill_process_group))
     monkeypatch.setattr(runner, "signal", SimpleNamespace(SIGTERM=15, SIGKILL=9))
@@ -449,13 +462,15 @@ def test_posix_signal_eperm_requires_bounded_complete_cleanup_proof(
     if outcome == "resolved":
         assert probes == 2
         assert clock < deadline
-        process.wait.assert_called_once()
+        process.wait.assert_not_called()
     else:
         process.wait.assert_not_called()
         if outcome == "other-error":
             assert probes == 0 and clock < deadline
-        else:
+        elif outcome == "permission":
             assert probes >= 2 and clock == deadline
+        else:
+            assert probes == 0 and clock == deadline
 
 
 def test_windows_taskkill_success_is_checked(

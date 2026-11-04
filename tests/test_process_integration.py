@@ -7,14 +7,244 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from h2h_dev_tools import process
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained waitable identity")
+@pytest.mark.parametrize("exit_code", [0, 7])
+@pytest.mark.parametrize("wait_timeout", [None, 3])
+def test_wait_retains_group_identity_until_cleanup_and_retires_all_signals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    wait_timeout: float | None,
+) -> None:
+    deadline = time.monotonic() + 10
+    command = process.ProcessCommand(
+        "retained group identity",
+        (sys.executable, "-I", "-S", "-c", f"raise SystemExit({exit_code})"),
+        tmp_path,
+    )
+    with process.controlled_termination_signals() as controller:
+        owner = process.start_owned_process(
+            command, deadline=deadline, signal_controller=controller
+        )
+        try:
+            assert owner.process.wait(timeout=wait_timeout) == exit_code
+            receipt = os.waitid(
+                os.P_PID, owner.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+            assert receipt is not None and receipt.si_pid == owner.process.pid
+            assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+            with pytest.raises(ChildProcessError):
+                os.waitid(
+                    os.P_PID, owner.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+                )
+            with monkeypatch.context() as boundary:
+
+                def forbid_reused_group(group: int, number: int) -> None:
+                    pytest.fail(f"Retired PGID was used again: {group}, {number}")
+
+                boundary.setattr(os, "killpg", forbid_reused_group)
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+                assert owner.process.poll() == exit_code
+            assert process.close_owner(owner, deadline=deadline)
+        finally:
+            scope = owner.posix_scope
+            if scope is not None and scope.capability.directory.exists():
+                with controller.defer():
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX blocking wait identity")
+@pytest.mark.parametrize("stopped", [False, True])
+def test_unbounded_wait_allows_concurrent_group_signals_and_canonical_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stopped: bool
+) -> None:
+    from h2h_dev_tools._process_posix import PinnedProcess
+
+    deadline = time.monotonic() + 10
+    script = "import os,signal,time; "
+    if stopped:
+        script += "os.kill(os.getpid(), signal.SIGSTOP); "
+    script += "time.sleep(30)"
+    command = process.ProcessCommand(
+        "blocking waiter", (sys.executable, "-I", "-S", "-c", script), tmp_path
+    )
+    entered = threading.Event()
+    original_waitid = os.waitid
+    errors: list[BaseException] = []
+    results: list[int] = []
+
+    with process.controlled_termination_signals() as controller:
+        owner = process.start_owned_process(
+            command, deadline=deadline, signal_controller=controller
+        )
+        assert isinstance(owner.process, PinnedProcess)
+
+        def observe(kind: int, pid: int, options: int) -> Any:
+            if pid == owner.process.pid and not options & os.WNOHANG:
+                entered.set()
+            return original_waitid(kind, pid, options)
+
+        def wait() -> None:
+            try:
+                results.append(owner.process.wait())
+            except BaseException as error:
+                errors.append(error)
+
+        monkeypatch.setattr(os, "waitid", observe)
+        waiter = threading.Thread(target=wait, daemon=True)
+        waiter.start()
+        try:
+            assert entered.wait(2)
+            if stopped:
+                while time.monotonic() < deadline:
+                    receipt = original_waitid(
+                        os.P_PID,
+                        owner.process.pid,
+                        os.WSTOPPED | os.WNOWAIT | os.WNOHANG,
+                    )
+                    if receipt is not None and receipt.si_code == os.CLD_STOPPED:
+                        break
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("child never reached its stopped state")
+                assert waiter.is_alive()
+                assert owner.process.poll() is None
+                owner.process.signal_group(signal.SIGCONT, send=os.killpg)
+            assert process.terminate_owned_tree(owner, deadline=deadline)
+            waiter.join(2)
+            assert not waiter.is_alive()
+            assert not errors
+            assert results == [-signal.SIGTERM]
+            assert not owner.process._blocking_observers
+            assert owner.process._identity_retired
+            with pytest.raises(ChildProcessError):
+                original_waitid(
+                    os.P_PID, owner.process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
+                )
+        finally:
+            with controller.defer():
+                # Continue a stopped leaf even if an earlier assertion failed,
+                # so its ordinary TERM cleanup can make progress.
+                owner.process.signal_group(signal.SIGCONT, send=os.killpg)
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+                waiter.join(2)
+                assert not waiter.is_alive()
+                assert process.close_owner(owner, deadline=deadline)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX interruptible blocking wait")
+@pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM])
+def test_signal_interrupt_clears_blocking_observation_before_owned_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, number: int
+) -> None:
+    from h2h_dev_tools._process_posix import PinnedProcess
+
+    deadline = time.monotonic() + 10
+    command = process.ProcessCommand(
+        "interrupted blocking waiter",
+        (sys.executable, "-I", "-S", "-c", "import time; time.sleep(3)"),
+        tmp_path,
+    )
+    entered = threading.Event()
+    sent = threading.Event()
+    original_waitid = os.waitid
+    with process.controlled_termination_signals() as controller:
+        owner = process.start_owned_process(
+            command, deadline=deadline, signal_controller=controller
+        )
+        assert isinstance(owner.process, PinnedProcess)
+
+        def observe(kind: int, pid: int, options: int) -> Any:
+            if pid == owner.process.pid and not options & os.WNOHANG:
+                entered.set()
+            return original_waitid(kind, pid, options)
+
+        def interrupt() -> None:
+            if entered.wait(2):
+                time.sleep(0.02)
+                sent.set()
+                os.kill(os.getpid(), number)
+
+        monkeypatch.setattr(os, "waitid", observe)
+        sender = threading.Thread(target=interrupt)
+        sender.start()
+        try:
+            expected = (
+                KeyboardInterrupt
+                if number == signal.SIGINT
+                else process.RunnerSignalInterrupt
+            )
+            with pytest.raises(expected):
+                owner.process.wait()
+            assert sent.is_set()
+            assert not owner.process._blocking_observers
+            assert owner.process.poll() is None
+        finally:
+            sender.join(3)
+            assert not sender.is_alive()
+            with controller.defer():
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+                assert process.close_owner(owner, deadline=deadline)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX retained waitable identity")
+def test_foreign_reap_rejects_signals_and_retains_cleanup_responsibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deadline = time.monotonic() + 10
+    command = process.ProcessCommand(
+        "foreign reap", (sys.executable, "-I", "-S", "-c", "pass"), tmp_path
+    )
+    with process.controlled_termination_signals() as controller:
+        owner = process.start_owned_process(
+            command, deadline=deadline, signal_controller=controller
+        )
+        scope = owner.posix_scope
+        assert scope is not None
+        manually_reaped = False
+        try:
+            assert owner.process.wait(timeout=3) == 0
+            assert os.waitpid(owner.process.pid, 0)[0] == owner.process.pid
+            manually_reaped = True
+            with monkeypatch.context() as boundary:
+
+                def forbid_unowned_signal(group: int, number: int) -> None:
+                    pytest.fail(f"Unproven PGID was signalled: {group}, {number}")
+
+                boundary.setattr(os, "killpg", forbid_unowned_signal)
+                with pytest.raises(process.ProcessOwnershipError) as caught:
+                    process.terminate_owned_tree(owner, deadline=deadline)
+                assert caught.value.cleanup_proven is False
+                assert not scope.proven_empty
+                assert scope.capability.directory.is_dir()
+        finally:
+            # This fixture deliberately violates the owner API. Its fixed leaf
+            # has no descendants; only that independent fact permits rescue.
+            if manually_reaped:
+                assert not scope.has_pending(deadline=deadline)
+                scope.proven_empty = True
+                # Independent fixture-only proof: this deliberately reaped leaf
+                # cannot have descendants; release its retained native handle.
+                from h2h_dev_tools._process_posix import PinnedProcess
+
+                assert isinstance(owner.process, PinnedProcess)
+                owner.process._identity_retired = True
+            else:
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+            assert process.close_owner(owner, deadline=deadline)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX scope ledger locks")
@@ -207,22 +437,19 @@ def _diagnostic_launcher(
 
 def _assert_diagnostic_cleanup(owner: process.OwnedProcess, *, deadline: float) -> None:
     if os.name == "posix":
-        try:
-            os.killpg(owner.process.pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise AssertionError("Diagnostic launcher/writer group survived")
         scope = owner.posix_scope
         assert scope is not None
         assert not scope.has_pending(deadline=deadline), (
             "Diagnostic nested cleanup obligations remain"
         )
-    # This only observes absence and seals admission; it does not terminate a
-    # surviving writer. Windows retains the corresponding whole-Job proof.
+    # This observation retires only the pinned zombie, never a surviving writer.
+    # The independent OS absence assertion follows retirement, before any rescue.
     assert process.wait_for_owned_tree_exit(
         owner, deadline=deadline, poll_deadline=time.monotonic()
-    )
+    ), "Diagnostic launcher/writer group survived"
+    if os.name == "posix":
+        with pytest.raises(ProcessLookupError):
+            os.killpg(owner.process.pid, 0)
 
 
 @pytest.mark.parametrize("standard_output", [False, True])
@@ -803,7 +1030,7 @@ def test_owner_close_deadline_retains_responsibility_until_lock_release(
             assert not process.close_owner(
                 owner, deadline=time.monotonic() + 1, diagnostic=messages.append
             )
-            assert "Unproven process scope retained" in messages.pop()
+            assert "Cannot close an unproven group identity" in messages.pop()
             assert parent.has_pending(deadline=time.monotonic() + 1)
             assert process.wait_for_owned_tree_exit(
                 owner, deadline=time.monotonic() + 1
@@ -928,7 +1155,9 @@ def test_native_signal_eperm_waits_for_reap_and_complete_cleanup(
                 assert process.terminate_owned_tree(owner, deadline=deadline)
             expected_signal = signal.SIGTERM if edge == "term" else signal.SIGKILL
             assert (expected_signal, errno.EPERM) in observations
-            assert observations[-1] == (0, errno.ESRCH)
+            assert all(number != 0 for number, _ in observations)
+            with pytest.raises(ProcessLookupError):
+                real_killpg(owner.process.pid, 0)
             assert owner.process.returncode == 0
             assert scope.proven_empty
             assert not scope.has_pending(deadline=deadline)
@@ -1110,3 +1339,272 @@ def test_owner_fixtures_clean_up_when_launch_handoff_is_interrupted(
             failure.add_note(
                 f"Owner boundary control rescue also failed: {rescue_error}"
             )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux retained pidfd group identity"
+)
+def test_pidfd_cleanup_survives_leader_reap_fork_transfer_and_nondumpable_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from h2h_dev_tools._process_posix import PinnedProcess
+
+    ready = tmp_path / "descendant-ready"
+    grandchild = (
+        "import ctypes,os,signal,sys,time\nfrom pathlib import Path\n"
+        "assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    child = (
+        "import subprocess,sys\n"
+        f"subprocess.Popen([sys.executable,'-I','-S','-c',{grandchild!r},sys.argv[1]])\n"
+    )
+    leader = (
+        "import subprocess,sys\n"
+        f"subprocess.Popen([sys.executable,'-I','-S','-c',{child!r},sys.argv[1]])\n"
+    )
+    deadline = time.monotonic() + 10
+    with process.controlled_termination_signals() as controller:
+        with controller.defer():
+            owner = process.start_owned_process(
+                process.ProcessCommand(
+                    "fork transfer",
+                    (sys.executable, "-I", "-S", "-c", leader, str(ready)),
+                    tmp_path,
+                ),
+                deadline=deadline,
+                signal_controller=controller,
+            )
+        try:
+            assert owner.process.wait(timeout=3) == 0
+            while not ready.exists():
+                assert time.monotonic() < deadline - 4
+                time.sleep(0.01)
+            assert isinstance(owner.process, PinnedProcess)
+            assert not process.wait_for_owned_tree_exit(
+                owner, deadline=deadline, poll_deadline=time.monotonic() + 0.05
+            )
+            assert owner.process._leader_reaped
+            with pytest.raises(ChildProcessError):
+                os.waitpid(owner.process.pid, os.WNOHANG)
+            with monkeypatch.context() as boundary:
+
+                def forbid_numeric_group(group: int, number: int) -> None:
+                    pytest.fail("Linux cleanup used a reusable numeric PGID")
+
+                boundary.setattr(os, "killpg", forbid_numeric_group)
+                assert process.terminate_owned_tree(owner, deadline=deadline)
+            assert process.close_owner(owner, deadline=deadline)
+            assert (
+                not owner.posix_scope
+                or not owner.posix_scope.capability.directory.exists()
+            )
+        finally:
+            with controller.defer():
+                if (
+                    owner.posix_scope
+                    and owner.posix_scope.capability.directory.exists()
+                ):
+                    assert process.terminate_owned_tree(owner, deadline=deadline)
+                    assert process.close_owner(owner, deadline=deadline)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux post-spawn pidfd acquisition failure"
+)
+@pytest.mark.parametrize("nested_completes", [False, True])
+def test_pidfd_acquisition_failure_preserves_live_nested_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nested_completes: bool
+) -> None:
+    import json
+
+    from h2h_dev_tools import _process_posix as native
+    from h2h_dev_tools import _process_scope as scopes
+
+    ready = tmp_path / "nested-ready.json"
+    release = tmp_path / "fixture-release"
+    completed = tmp_path / "nested-clean"
+    # The fixed nested leaf also accepts the fixture's release marker, so even
+    # a regression that kills its owner cannot leave it running indefinitely.
+    leaf = (
+        "import sys,time\nfrom pathlib import Path\n"
+        "while not Path(sys.argv[1]).exists(): time.sleep(.01)\n"
+    )
+    target = """import json,os,runpy,signal,sys,time
+from pathlib import Path
+package=Path(sys.argv[1])
+runpy.run_path(str(package/'source_loader.py'))['load_package'](package,'h2h_dev_tools')
+from h2h_dev_tools import process as p
+from h2h_dev_tools import _process_scope as scopes
+ready,release,completed=map(Path,sys.argv[2:5])
+cooperative=sys.argv[5]=='True'
+deadline=float(sys.argv[6])
+leaf=sys.argv[7]
+with p.controlled_termination_signals() as controller:
+    with controller.defer():
+        inner=p.start_owned_process(
+            p.ProcessCommand('nested leaf',(sys.executable,'-I','-S','-c',leaf,str(release)),ready.parent),
+            deadline=deadline,signal_controller=controller)
+        scope=inner.posix_scope
+        assert scope is not None and scope.parent is not None
+        if not cooperative:
+            signal.signal(signal.SIGTERM,signal.SIG_IGN)
+        data={'pid':inner.process.pid,'scope':scope.capability.encode(),
+              'parent':scope.parent.encode(),'outer':os.environ[scopes.ENVIRONMENT_KEY]}
+        staging=ready.with_suffix('.pending')
+        staging.write_text(json.dumps(data))
+        staging.replace(ready)
+    try:
+        while not release.exists():
+            time.sleep(.01)
+    except (KeyboardInterrupt,p.RunnerSignalInterrupt):
+        pass
+    finally:
+        with controller.defer():
+            # Only the explicit fixture marker admits an independent rescue
+            # budget; production TERM cleanup retains the original deadline.
+            cleanup_deadline=time.monotonic()+5 if release.exists() else deadline
+            assert p.terminate_owned_tree(inner,deadline=cleanup_deadline)
+            assert p.close_owner(inner,deadline=cleanup_deadline)
+            completed.touch()
+"""
+    deadline = time.monotonic() + 5
+    original_open = native._pidfd_open
+    original_signal = os.killpg
+    nested_handle: int | None = None
+    nested_identity: dict[str, Any] | None = None
+    signals: list[int] = []
+    owner: process.OwnedProcess | None = None
+    acquisition_error = OSError(errno.EMFILE, "injected post-spawn fd exhaustion")
+
+    def fail_target_acquisition(pid: int) -> int:
+        nonlocal nested_handle, nested_identity
+        if pid == os.getpid():
+            return original_open(pid)  # Keep the actual Linux capability probe.
+        while not ready.exists() and time.monotonic() < deadline - 2:
+            time.sleep(0.01)
+        if ready.exists():
+            nested_identity = json.loads(ready.read_text())
+            assert nested_identity is not None
+            # Independent fixture authority is acquired before the failure.
+            # This handle is used only for rescue if a regression kills the owner.
+            nested_handle = original_open(nested_identity["pid"])
+        raise acquisition_error
+
+    def observe_signal(group: int, number: int) -> None:
+        assert nested_identity is not None, "Nested target did not reach readiness"
+        outer = scopes._Capability.decode(nested_identity["outer"])
+        assert (outer.directory / "closed").exists()
+        if number == signal.SIGKILL:
+            assert not tuple((outer.directory / "pending").iterdir()), (
+                "Acquisition failure killed an owner with nested obligations"
+            )
+        signals.append(number)
+        original_signal(group, number)
+
+    with process.controlled_termination_signals() as controller:
+        try:
+            with monkeypatch.context() as boundary:
+                boundary.setattr(native, "_pidfd_open", fail_target_acquisition)
+                boundary.setattr(os, "killpg", observe_signal)
+                with (
+                    controller.defer(),
+                    pytest.raises(process.ProcessOwnershipError) as caught,
+                ):
+                    process.start_owned_process(
+                        process.ProcessCommand(
+                            "post-spawn identity failure",
+                            (
+                                sys.executable,
+                                "-I",
+                                "-S",
+                                "-B",
+                                "-c",
+                                target,
+                                str(Path(process.__file__).parent),
+                                str(ready),
+                                str(release),
+                                str(completed),
+                                str(nested_completes),
+                                str(deadline),
+                                leaf,
+                            ),
+                            tmp_path,
+                        ),
+                        deadline=deadline,
+                        signal_controller=controller,
+                    )
+            failure = caught.value
+            owner = failure.owner
+            assert owner is not None
+            assert isinstance(failure.__cause__, native.AcquisitionError)
+            assert failure.__cause__.__cause__ is acquisition_error
+            assert not failure.cleanup_proven
+            assert isinstance(owner.process, native.PinnedProcess)
+            assert owner.process._pidfd is None
+            assert owner.process._pidfd_acquisition_failed
+            assert not owner.process._leader_reaped
+            assert not owner.process._identity_retired
+            scope = owner.posix_scope
+            assert scope is not None and scope.capability.directory.is_dir()
+            assert not scope.proven_empty
+            # A reaped leader would raise ECHILD. This receipt never reaps it.
+            receipt = os.waitid(
+                os.P_PID, owner.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+            if nested_completes:
+                assert completed.exists()
+                assert receipt is not None
+                assert signals == [signal.SIGTERM, signal.SIGKILL]
+                assert not tuple((scope.capability.directory / "pending").iterdir())
+            else:
+                assert not completed.exists()
+                assert receipt is None
+                assert signals == [signal.SIGTERM]
+                assert tuple((scope.capability.directory / "pending").iterdir())
+        finally:
+            with controller.defer():
+                release.touch()
+                rescue_deadline = time.monotonic() + 8
+                try:
+                    if owner is not None:
+                        child = owner.process
+                        assert isinstance(child, native.PinnedProcess)
+                        # The failure retained this waitable leader, so opening
+                        # its original pidfd after lifting fault injection is safe.
+                        child._pidfd = original_open(child.pid)
+                        child._pidfd_acquisition_failed = False
+                        scope = owner.posix_scope
+                        assert scope is not None
+                        if child.poll() is not None and scope.has_pending(
+                            deadline=rescue_deadline
+                        ):
+                            # A failing regression may have killed the nested
+                            # owner. Independently prove its fixed leaf group
+                            # empty before releasing only that exact obligation.
+                            assert (
+                                nested_handle is not None
+                                and nested_identity is not None
+                            )
+                            while True:
+                                try:
+                                    native._pidfd_signal(nested_handle, 0)
+                                except ProcessLookupError:
+                                    break
+                                assert time.monotonic() < rescue_deadline
+                                time.sleep(0.01)
+                            nested_scope = scopes.PosixScope(
+                                scopes._Capability.decode(nested_identity["scope"]),
+                                scopes._Capability.decode(nested_identity["parent"]),
+                                proven_empty=True,
+                            )
+                            nested_scope.close(deadline=rescue_deadline)
+                        assert process.terminate_owned_tree(
+                            owner, deadline=rescue_deadline
+                        )
+                        assert process.close_owner(owner, deadline=rescue_deadline)
+                finally:
+                    if nested_handle is not None:
+                        os.close(nested_handle)

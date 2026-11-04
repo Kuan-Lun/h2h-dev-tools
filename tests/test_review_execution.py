@@ -427,9 +427,16 @@ def test_orphan_group_exit_waits_for_actual_reap_after_native_eperm(
                     real_killpg(group, number)
                 except PermissionError:
                     observations.append("permission-denied")
-                    # Real OS reaping causes the next probe to observe ESRCH.
-                    # Re-raise the genuine first result to the fixture oracle.
+                    # wait() observes status while retaining the leader. Only
+                    # canonical native group proof may retire that identity.
                     assert owner.process.wait(timeout=deadline - time.monotonic()) == 0
+                    receipt = os.waitid(
+                        os.P_PID, group, os.WEXITED | os.WNOWAIT | os.WNOHANG
+                    )
+                    assert receipt is not None and receipt.si_pid == group
+                    assert process.wait_for_owned_tree_exit(owner, deadline=deadline)
+                    # Re-raise the genuine first result; the fixture's next
+                    # independent probe must observe the actual OS retirement.
                     raise
                 except ProcessLookupError:
                     observations.append("absent")
@@ -1002,8 +1009,16 @@ def test_completed_review_owner_uses_phase_budget_for_scope_lock(
                 assert scope.capability.directory.exists()
                 assert not scope.proven_empty
                 assert owners[0].process.poll() == 0
-                with pytest.raises(ProcessLookupError):
-                    os.killpg(owners[0].process.pid, 0)
+                # An invalid ledger forbids retirement even after exit. The
+                # actual leader must remain waitable until fixture repair.
+                receipt = os.waitid(
+                    os.P_PID,
+                    owners[0].process.pid,
+                    os.WEXITED | os.WNOWAIT | os.WNOHANG,
+                )
+                assert receipt is not None
+                assert receipt.si_pid == owners[0].process.pid
+                assert receipt.si_code == os.CLD_EXITED and receipt.si_status == 0
             else:
                 # Before fixture rescue: both real process absence and the
                 # canonical scope/parent-obligation closure must already hold.

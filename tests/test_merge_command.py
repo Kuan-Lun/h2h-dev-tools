@@ -495,7 +495,9 @@ def test_killed_post_proof_launcher_leaves_no_proof_for_live_writer(
                 )
                 os.kill(writer["pid"], 0)
                 tree_empty = process.wait_for_owned_tree_exit(
-                    owner, deadline=min(deadline, time.monotonic() + 0.1)
+                    owner,
+                    deadline=deadline,
+                    poll_deadline=time.monotonic() + 0.1,
                 )
                 receipt_exists = (tmp_path / "cleanup").exists()
                 (tmp_path / "before-rescue.json").write_text(

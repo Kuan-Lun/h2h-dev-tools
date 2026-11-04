@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from h2h_dev_tools import (
+    _process_posix,
     bundle,
     bundle_verify,
     code_review,
@@ -1209,8 +1210,8 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     repo = review_repository
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
-    original_popen = subprocess.Popen
-    original_killpg = os.killpg
+    original_start = process.start_owned_process
+    original_retire = _process_posix.PinnedProcess.retire_clean_group
     review_processes: list[subprocess.Popen[bytes]] = []
     owners: list[process.OwnedProcess] = []
     original_stop = process.terminate_owned_tree
@@ -1222,23 +1223,23 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
             owners.append(owner)
         return original_stop(owner, deadline=deadline, **kwargs)
 
-    def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        child = original_popen(*args, **kwargs)
-        if "review_worker.py" in str(args[0]) and "exec" in args[0]:
-            review_processes.append(child)
-        return child
+    def launch(phase: process.ProcessCommand, **kwargs: Any) -> process.OwnedProcess:
+        owner = original_start(phase, **kwargs)
+        if "review_worker.py" in str(phase.argv) and "exec" in phase.argv:
+            review_processes.append(owner.process)
+        return owner
 
-    def group_signal(group: int, signum: int) -> None:
-        if review_processes and group == review_processes[0].pid:
+    def retire(child: _process_posix.PinnedProcess, *, deadline: float) -> bool:
+        if child in review_processes:
             # Model an exited leader whose descendant stays in uninterruptible
-            # I/O: signals succeed, but the OS still reports a nonempty group.
-            return
-        original_killpg(group, signum)
+            # I/O: native identity remains retained without group-absence proof.
+            return False
+        return original_retire(child, deadline=deadline)
 
     monkeypatch.setenv("PATH", repo.environment["PATH"])
     monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
-    monkeypatch.setattr(subprocess, "Popen", launch)
-    monkeypatch.setattr(os, "killpg", group_signal)
+    monkeypatch.setattr(process, "start_owned_process", launch)
+    monkeypatch.setattr(_process_posix.PinnedProcess, "retire_clean_group", retire)
     monkeypatch.setattr(process, "terminate_owned_tree", remember_owner)
     try:
         started = time.monotonic()
@@ -1260,7 +1261,9 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     finally:
         # Remove the simulated obstruction, then obtain actual group proof.
         # Never release a parent obligation using the mocked cleanup result.
-        monkeypatch.setattr(os, "killpg", original_killpg)
+        monkeypatch.setattr(
+            _process_posix.PinnedProcess, "retire_clean_group", original_retire
+        )
         for owner in owners:
             cleanup_deadline = time.monotonic() + 5
             assert original_stop(owner, deadline=cleanup_deadline)
@@ -1537,37 +1540,54 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
     target = reviewer._target(index=True)
     signal_number = int(getattr(signal, signal_name))
     previous_handler = signal.getsignal(signal_number)
-    original_popen = subprocess.Popen
+    original_start = process.start_owned_process
     original_stop = process.terminate_owned_tree
-    owned: list[subprocess.Popen[bytes]] = []
+    owned: list[process.OwnedProcess] = []
+    cleanup_deadlines: dict[int, float] = {}
     cleanup_started: list[int] = []
 
     def unprotected_signal(_signal: int, _frame: object) -> None:
         raise AssertionError("Reviewer did not install its signal controller")
 
-    def launch_then_signal(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
-        command = args[0]
+    def launch_then_signal(
+        phase: process.ProcessCommand,
+        *,
+        deadline: float,
+        signal_controller: process.SignalController | None,
+    ) -> process.OwnedProcess:
+        command = phase.argv
         if "review_worker.py" not in str(command) or "exec" not in command:
-            return original_popen(*args, **kwargs)
-        child = original_popen(
-            (sys.executable, "-c", REVIEW_PROCESS_TREE, str(repo.state)), **kwargs
+            return original_start(
+                phase, deadline=deadline, signal_controller=signal_controller
+            )
+        owner = original_start(
+            replace(
+                phase,
+                argv=(sys.executable, "-c", REVIEW_PROCESS_TREE, str(repo.state)),
+            ),
+            deadline=deadline,
+            signal_controller=signal_controller,
         )
-        owned.append(child)
-        deadline = time.monotonic() + 5
+        owned.append(owner)
+        child = owner.process
+        cleanup_deadlines[child.pid] = deadline
+        ready_deadline = min(deadline, time.monotonic() + 5)
         while not (repo.state / "tree-ready").exists():
             assert child.poll() is None, "The process-tree fixture exited too early"
-            assert time.monotonic() < deadline, "The descendant never became ready"
+            assert time.monotonic() < ready_deadline, (
+                "The descendant never became ready"
+            )
             time.sleep(0.01)
         if interrupt_handoff:
-            # The child exists but Reviewer has not received its Popen handle yet.
+            # The child exists but Reviewer has not received its owned handle yet.
             os.kill(os.getpid(), signal_number)
-        return child
+        return owner
 
     def stop_with_repeated_signals(
         owner: process.OwnedProcess, *, deadline: float, **kwargs: Any
     ) -> bool:
         child = owner.process
-        if child not in owned:
+        if owner not in owned:
             return original_stop(owner, deadline=deadline, **kwargs)
         cleanup_started.append(child.pid)
         os.kill(os.getpid(), signal_number)
@@ -1579,7 +1599,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
     monkeypatch.setenv(
         "FAKE_CODEX_SCOPE_PARENT", repo.environment["FAKE_CODEX_SCOPE_PARENT"]
     )
-    monkeypatch.setattr(subprocess, "Popen", launch_then_signal)
+    monkeypatch.setattr(process, "start_owned_process", launch_then_signal)
     monkeypatch.setattr(process, "terminate_owned_tree", stop_with_repeated_signals)
     signal.signal(signal_number, unprotected_signal)
     try:
@@ -1593,7 +1613,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
                 destination=repo.state / "prepared.json",
             )
         assert len(owned) == 1
-        child = owned[0]
+        child = owned[0].process
         assert cleanup_started == [child.pid]
         assert child.poll() is not None, "The reviewer process survived interruption"
         _assert_review_tree_cleaned(repo.state)
@@ -1602,14 +1622,22 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
         assert signal.getsignal(signal_number) is unprotected_signal
     finally:
         signal.signal(signal_number, previous_handler)
-        for child in owned:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait(timeout=5)
-            if child.stdin is not None:
-                child.stdin.close()
+        failure = sys.exception()
+        for owner in owned:
+            scope = owner.posix_scope
+            if scope is not None and scope.capability.directory.exists():
+                try:
+                    with process.controlled_termination_signals() as controller:
+                        with controller.defer():
+                            cleanup_deadline = cleanup_deadlines[owner.process.pid]
+                            assert original_stop(owner, deadline=cleanup_deadline)
+                            assert process.close_owner(owner, deadline=cleanup_deadline)
+                except BaseException as rescue_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(
+                        f"Review signal fixture rescue failed: {rescue_error}"
+                    )
 
 
 def _candidate_receipt(repo: ReviewRepository) -> tuple[Path, dict[str, Any]]:

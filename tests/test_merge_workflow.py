@@ -2203,11 +2203,17 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
 
 
 def _assert_interrupted_workflow_cleanup(
-    owner: process.OwnedProcess, output: str, *, deadline: float
+    owner: process.OwnedProcess,
+    output: str,
+    *,
+    deadline: float,
+    poll_deadline: float | None = None,
 ) -> None:
     assert "process cleanup unproven" not in output, output
     assert "cleanup could not be proven" not in output, output
-    assert process.wait_for_owned_tree_exit(owner, deadline=deadline), output
+    assert process.wait_for_owned_tree_exit(
+        owner, deadline=deadline, poll_deadline=poll_deadline
+    ), output
     assert process.close_owner(owner, deadline=deadline), output
 
 
@@ -2766,7 +2772,12 @@ def test_interrupted_diagnostic_is_reaped_before_preserving_candidate(
     tmp_path: Path, *, handoff_signal: bool
 ) -> None:
     root = tmp_path / "repository"
-    base = fixture_repository(root, succeeds=False)
+    # Reach the real failed-gate diagnostic without charging its readiness
+    # budget for the separately tested full-review protocol.
+    base = fixture_repository(root, succeeds=False, profile="documentation")
+    (root / "scripts/check-docs.py").write_text(
+        "from pathlib import Path\nraise SystemExit(Path('.git/MERGE_HEAD').exists())\n"
+    )
     ready = tmp_path / "diagnostic-ready"
     receipts = tmp_path / "receipts.tsv"
     record_workflow_receipts(root, receipts)
@@ -2905,7 +2916,10 @@ def test_interruption_oracle_tracks_non_locking_descendants_after_wrapper_exit(
                 os.kill(int(child_pid.read_text()), 0)
                 with pytest.raises(AssertionError):
                     _assert_interrupted_workflow_cleanup(
-                        owner, "normal signal exit", deadline=time.monotonic() + 0.1
+                        owner,
+                        "normal signal exit",
+                        deadline=deadline,
+                        poll_deadline=time.monotonic() + 0.1,
                     )
             else:
                 with pytest.raises(ProcessLookupError):
@@ -3115,13 +3129,25 @@ def test_interruption_oracle_rejects_exited_group_with_unclosed_obligation(
                     signal_controller=controller,
                 )
             assert owner.process.wait(timeout=3) == 143
-            with pytest.raises(ProcessLookupError):
-                os.killpg(owner.process.pid, 0)
+            # Observation retains the leader's waitable identity until nested
+            # obligations are discharged. Exited does not mean safe to reap.
+            receipt = os.waitid(
+                os.P_PID, owner.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+            assert receipt is not None
+            assert (receipt.si_pid, receipt.si_code, receipt.si_status) == (
+                owner.process.pid,
+                os.CLD_EXITED,
+                143,
+            )
             assert owner.posix_scope is not None
             assert owner.posix_scope.has_pending(deadline=deadline)
             with pytest.raises(AssertionError):
                 _assert_interrupted_workflow_cleanup(
-                    owner, "normal signal exit", deadline=time.monotonic() + 0.1
+                    owner,
+                    "normal signal exit",
+                    deadline=deadline,
+                    poll_deadline=time.monotonic() + 0.1,
                 )
         finally:
             if owner is not None:
@@ -4380,7 +4406,9 @@ def test_cleanliness_stage_owns_git_callbacks_before_task_cleanup(
                 status = owner.process.wait(timeout=12)
                 recorded = output_path.read_text()
                 assert process.wait_for_owned_tree_exit(
-                    owner, deadline=min(deadline - 6, time.monotonic() + 0.25)
+                    owner,
+                    deadline=deadline,
+                    poll_deadline=min(deadline - 6, time.monotonic() + 0.25),
                 ), recorded
                 _assert_interrupted_workflow_cleanup(owner, recorded, deadline=deadline)
                 clean = True
@@ -4586,7 +4614,9 @@ def test_candidate_export_uses_owned_capture_before_review(
                 status = owner.process.wait(timeout=60)
                 recorded = output_path.read_text()
                 assert process.wait_for_owned_tree_exit(
-                    owner, deadline=min(deadline - 30, time.monotonic() + 0.25)
+                    owner,
+                    deadline=deadline,
+                    poll_deadline=min(deadline - 30, time.monotonic() + 0.25),
                 ), recorded
                 _assert_interrupted_workflow_cleanup(owner, recorded, deadline=deadline)
                 clean = True
@@ -4670,7 +4700,9 @@ def test_merge_preview_owns_driver_inherited_stderr(
     tmp_path: Path, stray: bool
 ) -> None:
     root = tmp_path / "repository"
-    fixture_repository(root, succeeds=True, primary_hooks=True)
+    # Both profiles use the same owned Git preview. Keep the fixed driver and
+    # cleanup budget independent of full-review planning and publication.
+    fixture_repository(root, succeeds=True, primary_hooks=True, profile="documentation")
     (root / "README.md").write_text("task version\n")
     git(root, "add", "README.md")
     git(root, "commit", "-m", "test: task content merge")
@@ -4739,7 +4771,9 @@ def test_merge_preview_owns_driver_inherited_stderr(
                 status = owner.process.wait(timeout=12)
                 recorded = output_path.read_text()
                 assert process.wait_for_owned_tree_exit(
-                    owner, deadline=min(deadline - 6, time.monotonic() + 0.25)
+                    owner,
+                    deadline=deadline,
+                    poll_deadline=min(deadline - 6, time.monotonic() + 0.25),
                 ), recorded
                 _assert_interrupted_workflow_cleanup(owner, recorded, deadline=deadline)
                 clean = True
