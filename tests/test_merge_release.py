@@ -111,8 +111,9 @@ def test_terminal_release_retains_admission_for_surviving_site_child(
 
 
 @pytest.mark.parametrize("unlink_stage", ["owner", "directory"])
+@pytest.mark.parametrize("cleanup_only", [False, True])
 def test_failed_terminal_unlink_does_not_start_another_writer(
-    tmp_path: Path, unlink_stage: str
+    tmp_path: Path, unlink_stage: str, cleanup_only: bool
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True, profile="documentation")
@@ -152,6 +153,8 @@ def test_failed_terminal_unlink_does_not_start_another_writer(
     git(root, "add", "src/h2h_dev_tools")
     git(root, "commit", "-m", "test: inject terminal filesystem failure")
     task = git(root, "rev-parse", "HEAD")
+    if cleanup_only:
+        git(root, "update-ref", "refs/heads/master", task)
     result = owned_fixture_command(root, ("scripts/git-flow-merge.sh",))
     (tmp_path / "workflow.log").write_text(result.stdout + result.stderr)
     assert entered.exists()
@@ -163,12 +166,61 @@ def test_failed_terminal_unlink_does_not_start_another_writer(
     assert receipt.read_text() == "owned_tree_empty\n"
     assert (receipt.parent / "workflow.json").is_file()
     assert (root / ".git/h2h-merge-workflow.lock").is_dir()
-    assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
+    if cleanup_only:
+        assert git(root, "rev-parse", "master") == task
+    else:
+        assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
     assert not (root / ".git/MERGE_HEAD").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Real workflow owner interruption")
+@pytest.mark.parametrize("cleanup_only", [False, True])
+def test_normal_terminal_interruption_cleans_owner_without_reentering_recovery(
+    tmp_path: Path, cleanup_only: bool
+) -> None:
+    root = tmp_path / "repository"
+    base = fixture_repository(root, succeeds=True, profile="documentation")
+    receipts = tmp_path / "receipts.tsv"
+    record_workflow_receipts(root, receipts)
+    entered = tmp_path / "validation-entered"
+    admission = root / "src/h2h_dev_tools/merge_admission.py"
+    admission.write_text(
+        admission.read_text()
+        + "\n_fixture_validate_release = validate_release\n"
+        + "def validate_release(state_path):\n"
+        + "    state = _fixture_validate_release(state_path)\n"
+        + "    import signal, sys, time\n"
+        + "    if sys.argv[1:3] == ['--workflow-state', 'validate-release']:\n"
+        + f"        Path({str(entered)!r}).touch()\n"
+        + "        os.kill(state.owner_pid, signal.SIGTERM)\n"
+        + "        time.sleep(20)\n"
+        + "    return state\n"
+    )
+    git(root, "add", "src/h2h_dev_tools")
+    git(root, "commit", "-m", "test: interrupt the normal terminal validation")
+    task = git(root, "rev-parse", "task")
+    if cleanup_only:
+        git(root, "update-ref", "refs/heads/master", task)
+    result = owned_fixture_command(root, ("scripts/git-flow-merge.sh",))
+    assert entered.exists(), result.stdout + result.stderr
+    assert result.returncode == 143, result.stdout + result.stderr
+    records = [line.split("\t", 1) for line in receipts.read_text().splitlines()]
+    assert records[-1][0] == "release", "No recovery or diagnostic may start afterward"
+    assert all(Path(path).read_text() == "owned_tree_empty\n" for _, path in records)
+    assert (Path(records[-1][1]).parent / "workflow.json").is_file()
+    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
+    assert git(root, "branch", "--show-current") == "master"
+    assert git(root, "branch", "--list", "task") == ""
+    if cleanup_only:
+        assert git(root, "rev-parse", "master") == task
+    else:
+        assert git(root, "show", "-s", "--format=%P", "master").split() == [base, task]
+    assert not (root / ".git/MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize("recovery", [False, True])
 def test_unknown_terminal_cleanup_does_not_release_or_publish_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: bool
 ) -> None:
     from h2h_dev_tools import merge_admission, merge_command, process
 
@@ -186,7 +238,7 @@ def test_unknown_terminal_cleanup_does_not_release_or_publish_receipt(
         root,
         (sys.executable, "-c", "pass"),
         review=False,
-        recovery=True,
+        recovery=recovery,
         receipt=receipt,
         release_workflow=state,
     )
@@ -196,8 +248,9 @@ def test_unknown_terminal_cleanup_does_not_release_or_publish_receipt(
     assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
 
 
-def test_terminal_release_uses_the_existing_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("recovery", [False, True])
+def test_terminal_release_uses_only_its_own_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: bool
 ) -> None:
     from h2h_dev_tools import merge_admission, merge_command
 
@@ -210,30 +263,28 @@ def test_terminal_release_uses_the_existing_deadline(
 
     def complete_at_deadline(*args: object, **kwargs: object) -> int:
         nonlocal now
-        assert kwargs["deadline"] == 110.0
+        assert kwargs["deadline"] == (110.0 if recovery else None)
         now = 110.0
         return 0
 
     monkeypatch.setattr(time, "monotonic", lambda: now)
     monkeypatch.setattr(merge_command, "_run_git", complete_at_deadline)
-    assert (
-        merge_command._execute(
-            root,
-            (sys.executable, "-c", "pass"),
-            review=False,
-            recovery=True,
-            receipt=receipt,
-            release_workflow=state,
-        )
-        == 1
-    )
+    assert merge_command._execute(
+        root,
+        (sys.executable, "-c", "pass"),
+        review=False,
+        recovery=recovery,
+        receipt=receipt,
+        release_workflow=state,
+    ) == (1 if recovery else 0)
     assert receipt.read_text() == "owned_tree_empty\n"
-    assert state.is_file()
-    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
+    assert state.is_file() is recovery
+    assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file() is recovery
 
 
+@pytest.mark.parametrize("recovery", [False, True])
 def test_terminal_owner_releases_after_successful_owned_validation(
-    tmp_path: Path,
+    tmp_path: Path, recovery: bool
 ) -> None:
     from h2h_dev_tools import merge_admission
 
@@ -256,7 +307,7 @@ def test_terminal_owner_releases_after_successful_owned_validation(
             str(receipt),
             "--release-workflow",
             str(state),
-            "--recovery",
+            *(("--recovery",) if recovery else ()),
             str(root),
             "--",
             python,
@@ -273,3 +324,30 @@ def test_terminal_owner_releases_after_successful_owned_validation(
     assert receipt.read_text() == "owned_tree_empty\n"
     assert not state.exists()
     assert not (root / ".git/h2h-merge-workflow.lock").exists()
+
+
+def test_terminal_release_cannot_run_as_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from h2h_dev_tools import merge_command
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "merge-command",
+            "--cleanup-receipt",
+            str(tmp_path / "cleanup"),
+            "--review",
+            "--release-workflow",
+            str(tmp_path / "state"),
+            str(tmp_path),
+            "--",
+            "git",
+            "status",
+        ],
+    )
+    with pytest.raises(SystemExit) as rejected:
+        merge_command.main()
+    assert rejected.value.code == 2
+    assert not (tmp_path / "cleanup").exists()
