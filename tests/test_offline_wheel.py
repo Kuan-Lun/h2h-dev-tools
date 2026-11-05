@@ -1,14 +1,91 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import sysconfig
+import venv
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from h2h_dev_tools import offline_wheel
+
+
+def test_site_query_preserves_whitespace_and_escaped_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = tmp_path / " tab\tquoted'\"\\path\r\n "
+    run = subprocess.run
+
+    def query(command: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        # Exercise the actual child protocol with a path whose trailing bytes
+        # cannot be removed as output framing.
+        source = (
+            f"import sysconfig; sysconfig.get_path = lambda _key: {str(expected)!r}; "
+            + command[-1]
+        )
+        return run([*command[:-1], source], **options)
+
+    monkeypatch.setattr(subprocess, "run", query)
+    assert offline_wheel._site(Path(sys.executable), cwd=tmp_path) == expected
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX control-character filenames")
+@pytest.mark.parametrize(
+    "component",
+    ["development\rsite", "development\r\nsite", "development\nsite", " space site "],
+    ids=["cr", "crlf", "lf", "spaces"],
+)
+def test_offline_smoke_imports_dependency_from_literal_site_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    repository = tmp_path / component
+    repository.mkdir()
+    development = repository / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(development)
+    development_site = Path(
+        sysconfig.get_path(
+            "purelib", vars={"base": str(development), "platbase": str(development)}
+        )
+    )
+    (development_site / "literal_site_dependency.py").write_text("VALUE = 731\n")
+    callback = repository / "smoke.py"
+    evidence = tmp_path / "callback.json"
+    callback.write_text(
+        "import json, pathlib, sys\n"
+        "import literal_site_dependency as dependency\n"
+        "assert sys.flags.isolated and dependency.VALUE == 731\n"
+        "site = pathlib.Path(dependency.__file__).parent\n"
+        "assert site == pathlib.Path(sys.argv[2])\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps(str(site)))\n"
+    )
+    run = subprocess.run
+    artifact_roots: list[Path] = []
+
+    def prepare(command: list[str], **options: Any) -> subprocess.CompletedProcess[str]:
+        # Existing integration tests exercise real build/install. Here only
+        # those stages are replaced; both site queries, .pth publication and
+        # the isolated dependency import execute their actual implementations.
+        if command[1:3] == ["-m", "build"]:
+            dist = Path(command[command.index("--outdir") + 1])
+            artifact_roots.append(dist.parent)
+            dist.mkdir()
+            (dist / "candidate.whl").write_bytes(b"unused wheel fixture")
+        elif command[:2] == ["uv", "venv"]:
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(command[-1])
+        elif command[:3] != ["uv", "pip", "install"]:
+            return run(command, **options)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", prepare)
+    offline_wheel.run_offline_smoke(
+        repository, callback, [str(evidence), str(development_site)]
+    )
+    assert json.loads(evidence.read_text()) == str(development_site)
+    assert artifact_roots and all(not path.exists() for path in artifact_roots)
 
 
 def _repository(root: Path) -> tuple[Path, Path]:

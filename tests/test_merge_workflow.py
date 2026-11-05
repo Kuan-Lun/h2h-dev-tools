@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shlex
@@ -13,6 +14,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -4775,6 +4777,90 @@ def test_cleanliness_stage_owns_git_callbacks_before_task_cleanup(
                         )
 
 
+def _assert_capture_restore_timeout(
+    evidence: dict[str, Any],
+    *,
+    root: Path,
+    owner_pid: int,
+    base: str,
+    task: str,
+    task_tree: str,
+) -> None:
+    """Recognize only a cleaned, post-checkout recovery work-budget expiry."""
+    events = evidence["events"]
+    assert len(events) % 2 == 0
+    finished = []
+    for started, ended in zip(events[::2], events[1::2], strict=True):
+        assert started == {"event": "start", "action": ended["action"]}
+        assert ended["event"] == "finish"
+        finished.append(ended)
+    assert [(item["action"], item["status"]) for item in finished[-3:]] == [
+        ("capture", 1),
+        ("recover-abort", 0),
+        ("recover-restore", process.TIMEOUT_EXIT_CODE),
+    ]
+    assert all(item["status"] == 0 for item in finished[:-3])
+    assert not any(item["action"] == "release" for item in finished)
+
+    scope = Path(evidence["scope"])
+    assert scope.parent == root.parent / "scopes"
+    assert scope.name.startswith("h2h-merge-owner.")
+    receipts = evidence["receipts"]
+    assert receipts
+    for number, receipt in enumerate(receipts, 1):
+        assert receipt["path"] == str(scope / f"cleanup-{number}")
+        assert receipt["regular"] and not receipt["symlink"]
+        assert receipt["contents"] == "owned_tree_empty\n"
+    assert evidence["receipt_inventory"] == sorted(
+        receipt["path"] for receipt in receipts
+    )
+    for item in finished:
+        assert 1 <= item["command"] <= len(receipts)
+        assert receipts[item["command"] - 1]["owner"] == "process"
+    restore_command = finished[-1]["command"]
+    # The shell reports failed recovery through one final owned diagnostic.
+    # It may not release admission or start another Git/state command.
+    assert len(receipts) == restore_command + 1
+    assert receipts[-1]["owner"] == "diagnostic"
+
+    workflow = evidence["workflow"]
+    for key, value in {
+        "phase": "aborted",
+        "owner_pid": owner_pid,
+        "repository": str(root),
+        "worktree": str(root),
+        "entry_ref": "refs/heads/task",
+        "task_ref": "refs/heads/task",
+        "task_oid": task,
+        "primary_ref": "refs/heads/master",
+        "primary_oid": base,
+        "lock_directory": str(root / ".git/h2h-merge-workflow.lock"),
+    }.items():
+        assert workflow[key] == value, key
+    assert len(workflow["token"]) == 64
+    assert set(workflow["token"]) <= set("0123456789abcdef")
+    assert evidence["lock_owner"] == {
+        "token": workflow["token"],
+        "owner_pid": owner_pid,
+        "repository": str(root),
+    }
+    assert evidence["lock_identity"] == (
+        workflow["lock_device"],
+        workflow["lock_inode"],
+    )
+    assert evidence["switch"] == {
+        "arguments": ["switch", "--no-overwrite-ignore", "task"],
+        "phase": "aborted",
+        "status": 0,
+    }
+    assert evidence["branch"] == "task"
+    assert evidence["head"] == evidence["task_ref"] == task
+    assert evidence["primary_ref"] == base
+    assert evidence["index_tree"] == task_tree
+    assert evidence["status"] == ""
+    assert evidence["operation_metadata"] == []
+
+
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX Git fsmonitor ownership")
 @pytest.mark.parametrize(
     "mode",
@@ -4786,6 +4872,7 @@ def test_cleanliness_stage_owns_git_callbacks_before_task_cleanup(
         "export-failure",
         "missing-export",
         "empty-export",
+        "restore-timeout",
     ],
 )
 def test_candidate_export_uses_owned_capture_before_review(
@@ -4797,7 +4884,52 @@ def test_candidate_export_uses_owned_capture_before_review(
     state.mkdir()
     scopes = tmp_path / "scopes"
     scopes.mkdir()
+    capture_mode = "inherited-stderr" if mode == "restore-timeout" else mode
+    record_workflow_receipts(root, state / "registered-receipts")
     shell = root / "src/h2h_dev_tools/git-flow-merge.sh"
+    stage_function = "run_workflow_state() {\n"
+    assert shell.read_text().count(stage_function) == 1
+    shell.write_text(
+        shell.read_text().replace(
+            stage_function,
+            "run_workflow_state() {\n"
+            "    local fixture_action=$1 fixture_status=0\n"
+            '    printf \'{"event":"start","action":"%s"}\\n\' '
+            '"$fixture_action" >> ' + shlex.quote(str(state / "stage-events")) + "\n"
+            '    case "$fixture_action" in\n'
+            "        recover-abort|recover-restore) : > "
+            + shlex.quote(str(state / "recovery-observed"))
+            + " ;;\n    esac\n"
+            '    fixture_run_workflow_state "$@" || fixture_status=$?\n'
+            '    printf \'{"event":"finish","action":"%s",'
+            '"status":%d,"command":%d}\\n\' "$fixture_action" '
+            '"$fixture_status" "$command_number" >> '
+            + shlex.quote(str(state / "stage-events"))
+            + "\n"
+            '    return "$fixture_status"\n'
+            "}\n\nfixture_run_workflow_state() {\n",
+        )
+    )
+    admission = root / "src/h2h_dev_tools/merge_admission.py"
+    admission.write_text(
+        admission.read_text()
+        + "\n_fixture_git = _git\n"
+        + "def _git(repository, *arguments, **kwargs):\n"
+        + "    result = _fixture_git(repository, *arguments, **kwargs)\n"
+        + "    if arguments == ('switch', '--no-overwrite-ignore', 'task'):\n"
+        + f"        workflow = next(Path({str(scopes)!r}).glob('h2h-merge-owner.*/workflow.json'))\n"
+        + "        phase = json.loads(workflow.read_text())['phase']\n"
+        + f"        Path({str(state / 'restored-checkout')!r}).write_text(json.dumps(\n"
+        + "            {'arguments': list(arguments), 'phase': phase, 'status': 0}))\n"
+        + (
+            "        assert phase == 'aborted'\n"
+            "        import threading\n"
+            "        threading.Event().wait()\n"
+            if mode == "restore-timeout"
+            else ""
+        )
+        + "    return result\n"
+    )
     marker = 'archive_paths=("$source_relative")\n'
     assert shell.read_text().count(marker) == 1
     shell.write_text(
@@ -4835,6 +4967,7 @@ def test_candidate_export_uses_owned_capture_before_review(
     git(root, "add", ".")
     git(root, "commit", "-m", "test: observe captured candidate export")
     task = git(root, "rev-parse", "task")
+    task_tree = git(root, "rev-parse", "task^{tree}")
     child = (
         "import json, os, signal, sys, time\nfrom pathlib import Path\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -4848,7 +4981,7 @@ def test_candidate_export_uses_owned_capture_before_review(
         "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
         f"state = Path({str(state)!r})\n"
         f"scopes = Path({str(scopes)!r})\n"
-        f"mode = {mode!r}\n"
+        f"mode = {capture_mode!r}\n"
         "suffix = f'-P{os.getppid():08x}'\n"
         "trace = [json.loads(line) for line in "
         "(state / 'git-trace').read_text().splitlines()]\n"
@@ -4875,7 +5008,26 @@ def test_candidate_export_uses_owned_capture_before_review(
         "        time.sleep(0.005)\n"
         "if write_tree and phase == 'retained' and mode == 'export-failure':\n"
         "    workflow.with_suffix('.tree').mkdir()\n"
+        "if write_tree and phase == 'retained':\n"
+        "    (state / 'capture-observed').touch()\n"
         "os.write(1, b'candidate-token\\0/\\0')\n",
+    )
+    # Keep observing every normal-path callback: an unowned write-tree after
+    # successful capture must still trigger the outer-group negative control.
+    # Only bounded recovery may skip parsing the growing trace after capture.
+    hook_source = hook.read_text()
+    assert hook_source.startswith("#!/bin/sh\n")
+    hook.write_text(
+        hook_source.replace(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ -f "
+            + shlex.quote(str(state / "capture-observed"))
+            + " ] && [ -f "
+            + shlex.quote(str(state / "recovery-observed"))
+            + " ]; then\n    printf 'candidate-token\\000/\\000'\n"
+            + "    exit 0\nfi\n",
+            1,
+        )
     )
     git(root, "config", "core.fsmonitor", str(hook))
     git(root, "config", "core.fsmonitorHookVersion", "2")
@@ -4926,8 +5078,14 @@ def test_candidate_export_uses_owned_capture_before_review(
                 assert all(
                     row["group"] != owner.process.pid for row in write_tree_queries
                 )
+                events = [
+                    json.loads(line)
+                    for line in (state / "stage-events").read_text().splitlines()
+                ]
+                admission_retained = False
                 if mode == "normal":
                     assert status == 0, recorded
+                    assert not (state / "recovery-observed").exists()
                     assert (state / "exported-tree").read_text().strip() == git(
                         root, "rev-parse", "HEAD^{tree}"
                     )
@@ -4944,6 +5102,7 @@ def test_candidate_export_uses_owned_capture_before_review(
                     assert not (root / ".git/fixture-gate").exists()
                     assert not (root / ".git/fixture-review-events").exists()
                 if mode == "unknown-cleanup":
+                    admission_retained = True
                     assert (state / "unknown-cleanup").exists()
                     assert (root / ".git/MERGE_HEAD").exists()
                     assert git(root, "branch", "--show-current") == "master"
@@ -4953,11 +5112,166 @@ def test_candidate_export_uses_owned_capture_before_review(
                     assert (root / ".git/h2h-merge-workflow.lock/owner.json").is_file()
                 else:
                     assert not (root / ".git/MERGE_HEAD").exists()
-                    assert not (root / ".git/h2h-merge-workflow.lock").exists()
-                    assert not list(scopes.glob("h2h-merge-owner.*"))
+                    lock = root / ".git/h2h-merge-workflow.lock"
+                    admission_retained = lock.exists()
+                    if mode == "restore-timeout":
+                        assert admission_retained
+                    if admission_retained:
+                        assert mode in {
+                            "fsmonitor-stray",
+                            "inherited-stderr",
+                            "export-failure",
+                            "restore-timeout",
+                        }
+                        retained = list(scopes.glob("h2h-merge-owner.*"))
+                        assert len(retained) == 1
+                        scope = retained[0]
+                        registered = [
+                            line.split("\t")
+                            for line in (state / "registered-receipts")
+                            .read_text()
+                            .splitlines()
+                        ]
+                        lock_identity = lock.lstat()
+                        evidence: dict[str, Any] = {
+                            "events": events,
+                            "scope": str(scope),
+                            "receipts": [
+                                {
+                                    "owner": kind,
+                                    "path": path,
+                                    "contents": Path(path).read_text(),
+                                    "regular": Path(path).is_file(),
+                                    "symlink": Path(path).is_symlink(),
+                                }
+                                for kind, path in registered
+                            ],
+                            "receipt_inventory": sorted(
+                                str(path) for path in scope.glob("cleanup-*")
+                            ),
+                            "workflow": json.loads(
+                                (scope / "workflow.json").read_text()
+                            ),
+                            "lock_owner": json.loads((lock / "owner.json").read_text()),
+                            "lock_identity": (
+                                lock_identity.st_dev,
+                                lock_identity.st_ino,
+                            ),
+                            "switch": json.loads(
+                                (state / "restored-checkout").read_text()
+                            ),
+                            "branch": git(root, "branch", "--show-current"),
+                            "head": git(root, "rev-parse", "HEAD"),
+                            "task_ref": git(root, "rev-parse", "task"),
+                            "primary_ref": git(root, "rev-parse", "master"),
+                            "index_tree": git(root, "write-tree"),
+                            "status": git(root, "status", "--porcelain"),
+                            "operation_metadata": [
+                                name
+                                for name in (
+                                    "MERGE_HEAD",
+                                    "MERGE_MODE",
+                                    "MERGE_MSG",
+                                    "AUTO_MERGE",
+                                    "MERGE_AUTOSTASH",
+                                    "CHERRY_PICK_HEAD",
+                                    "REVERT_HEAD",
+                                    "REBASE_HEAD",
+                                    "BISECT_START",
+                                    "rebase-apply",
+                                    "rebase-merge",
+                                    "sequencer",
+                                    "index.lock",
+                                )
+                                if (root / ".git" / name).exists()
+                            ],
+                        }
+                        owner_pid = owner.process.pid
+
+                        def require_retention(values: dict[str, Any]) -> None:
+                            _assert_capture_restore_timeout(
+                                values,
+                                root=root,
+                                owner_pid=owner_pid,
+                                base=base,
+                                task=task,
+                                task_tree=task_tree,
+                            )
+
+                        require_retention(evidence)
+                        assert "command budget expired" in recorded
+                        assert "recovery ownership or cleanup unproven" in recorded
+                        if mode == "restore-timeout":
+                            # Damage copies of the real, naturally cleaned run's
+                            # evidence; no fixture rescue can satisfy this oracle.
+                            for damage in (
+                                "capture-timeout",
+                                "abort-failure",
+                                "restore-not-timeout",
+                                "release-after-timeout",
+                                "phase",
+                                "token",
+                                "lock-identity",
+                                "wrong-switch",
+                                "ref",
+                                "tree",
+                                "dirty",
+                                "operation-metadata",
+                                "restore-receipt",
+                                "missing-receipt",
+                                "wrong-scope",
+                                "diagnostic-as-restore",
+                                "later-writer",
+                            ):
+                                damaged = copy.deepcopy(evidence)
+                                if damage == "capture-timeout":
+                                    damaged["events"][-5]["status"] = 124
+                                elif damage == "abort-failure":
+                                    damaged["events"][-3]["status"] = 1
+                                elif damage == "restore-not-timeout":
+                                    damaged["events"][-1]["status"] = 1
+                                elif damage == "release-after-timeout":
+                                    damaged["events"].append(
+                                        {"event": "start", "action": "release"}
+                                    )
+                                elif damage == "phase":
+                                    damaged["workflow"]["phase"] = "candidate"
+                                elif damage == "token":
+                                    damaged["lock_owner"]["token"] = "wrong-token"
+                                elif damage == "lock-identity":
+                                    damaged["lock_identity"] = (0, 0)
+                                elif damage == "wrong-switch":
+                                    damaged["switch"]["phase"] = "prepared"
+                                elif damage == "ref":
+                                    damaged["task_ref"] = base
+                                elif damage == "tree":
+                                    damaged["index_tree"] = "wrong-tree"
+                                elif damage == "dirty":
+                                    damaged["status"] = "?? private-material"
+                                elif damage == "operation-metadata":
+                                    damaged["operation_metadata"] = ["MERGE_HEAD"]
+                                elif damage == "restore-receipt":
+                                    number = damaged["events"][-1]["command"]
+                                    damaged["receipts"][number - 1]["contents"] = ""
+                                elif damage == "missing-receipt":
+                                    damaged["receipts"][-1]["contents"] = ""
+                                elif damage == "wrong-scope":
+                                    damaged["receipts"][0]["path"] = "other-scope"
+                                elif damage == "diagnostic-as-restore":
+                                    damaged["events"][-1]["command"] += 1
+                                else:
+                                    damaged["receipts"][-1]["owner"] = "process"
+                                with pytest.raises(AssertionError):
+                                    require_retention(damaged)
+                    else:
+                        assert not list(scopes.glob("h2h-merge-owner.*"))
+                        assert not any(
+                            item.get("status") == process.TIMEOUT_EXIT_CODE
+                            for item in events
+                        )
                     if mode != "normal":
                         assert git(root, "branch", "--show-current") == "task"
-                if mode in {"fsmonitor-stray", "inherited-stderr"}:
+                if capture_mode in {"fsmonitor-stray", "inherited-stderr"}:
                     identity = json.loads((state / "child.json").read_text())
                     with pytest.raises(ProcessLookupError):
                         os.kill(identity["pid"], 0)
@@ -4979,7 +5293,7 @@ def test_candidate_export_uses_owned_capture_before_review(
                             "status": status,
                             "natural_exit_before_rescue": True,
                             "owned_tree_empty": True,
-                            "admission_retained": mode == "unknown-cleanup",
+                            "admission_retained": admission_retained,
                         }
                     )
                 )
