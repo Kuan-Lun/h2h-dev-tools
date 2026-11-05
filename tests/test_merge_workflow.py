@@ -391,6 +391,72 @@ def fixture_repository(
     return base
 
 
+@pytest.mark.parametrize("stage", ["capture", "finish", "release", "noop-release"])
+def test_normal_workflow_state_keeps_outer_lifetime(tmp_path: Path, stage: str) -> None:
+    root = tmp_path / "repository"
+    fixture_repository(root, succeeds=True, primary_hooks=True, profile="documentation")
+    state = tmp_path / "state"
+    state.mkdir()
+    scopes = tmp_path / "scopes"
+    scopes.mkdir()
+    admission = root / "src/h2h_dev_tools/merge_admission.py"
+    target = "validate-release" if stage.endswith("release") else stage
+    operation = "validate_release" if stage.endswith("release") else "_snapshot"
+    admission.write_text(
+        admission.read_text()
+        + f"\n_fixture_operation = {operation}\n"
+        + f"def {operation}(*args, **kwargs):\n"
+        + "    result = _fixture_operation(*args, **kwargs)\n"
+        + "    import sys, time\n"
+        + f"    if sys.argv[1:3] == ['--workflow-state', {target!r}]:\n"
+        + f"        marker = Path({str(state / 'healthy-operation')!r})\n"
+        + "        started = time.monotonic()\n"
+        + "        marker.write_text(json.dumps({'started': started}))\n"
+        # This is healthy work after real Git/state validation, not a changed
+        # timeout constant or a mocked owner. The old recovery work budget is 4s.
+        + "        time.sleep(5)\n"
+        + "        marker.write_text(json.dumps({'started': started,\n"
+        + "                                      'elapsed': time.monotonic() - started}))\n"
+        + "    return result\n"
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-m", "test: allow healthy workflow state work to finish")
+    task = git(root, "rev-parse", "task")
+    primary = git(root, "rev-parse", "master")
+    if stage == "noop-release":
+        git(root, "switch", "master")
+        git(
+            root,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "task",
+        )
+        primary = git(root, "rev-parse", "master")
+        git(root, "switch", "task")
+    result = owned_fixture_command(
+        root,
+        ("bash", "scripts/git-flow-merge.sh"),
+        environment=os.environ | {"TMPDIR": str(scopes)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads((state / "healthy-operation").read_text())
+    assert observed["elapsed"] >= 5
+    assert git(root, "branch", "--show-current") == "master"
+    if stage == "noop-release":
+        assert git(root, "rev-parse", "master") == primary
+    else:
+        assert git(root, "show", "-s", "--format=%P", "master").split() == [
+            primary,
+            task,
+        ]
+    assert git(root, "branch", "--list", "task") == ""
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert not list(scopes.glob("h2h-merge-owner.*"))
+
+
 @pytest.mark.parametrize("component", ["git-flow", "code-review"])
 def test_selected_merge_component_exports_the_complete_owner(
     tmp_path: Path, component: str

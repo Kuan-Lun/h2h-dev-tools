@@ -1236,13 +1236,105 @@ def test_windows_pipe_diagnostics_preserve_payload_without_mutating_shared_flags
 
     transport.assert_called_once()
     assert transport.call_args.args == (42, payload)
-    assert 100.0 < transport.call_args.kwargs["deadline"] <= 101.0
+    assert transport.call_args.kwargs["deadline"] == 101.0
+    assert transport.call_args.kwargs["work_deadline"] == 100.25
     assert transport.call_args.kwargs["signal_controller"] is controller
     native.get_blocking.assert_not_called()
     native.set_blocking.assert_not_called()
     native.write.assert_not_called()
     sink.write.assert_not_called()
     sink.flush.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("deadline", "work_deadline", "expected_cleanup", "expected_work"),
+    [
+        (None, None, 106.0, 100.25),
+        (101.0, None, 101.0, 100.25),
+        (100.1, None, 100.1, 100.1),
+        (101.0, 100.05, 101.0, 100.05),
+        (100.1, 101.0, 100.1, 100.1),
+    ],
+)
+def test_diagnostic_display_bound_never_replaces_caller_cleanup_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    deadline: float | None,
+    work_deadline: float | None,
+    expected_cleanup: float,
+    expected_work: float,
+) -> None:
+    sink = Mock(encoding="utf-8", errors="strict")
+    sink.fileno.return_value = 42
+    transport = Mock()
+    monkeypatch.setattr(runner.sys, "stderr", sink)
+    monkeypatch.setattr(runner, "_diagnostic_requires_writer", lambda _fd: True)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(diagnostic, "write_diagnostic", transport)
+    controller = runner.SignalController()
+    runner.report_diagnostic(
+        "bounded display",
+        deadline=deadline,
+        work_deadline=work_deadline,
+        signal_controller=controller,
+    )
+    transport.assert_called_once_with(
+        42,
+        b"bounded display\n",
+        deadline=expected_cleanup,
+        work_deadline=expected_work,
+        signal_controller=controller,
+    )
+
+
+@pytest.mark.parametrize(
+    ("hard_deadline", "after_header", "expected_status"),
+    [(110.0, 100.3, 0), (110.0, 105.0, 124), (None, 100.3, 0)],
+)
+def test_owned_header_retains_cleanup_time_without_extending_work_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    hard_deadline: float | None,
+    after_header: float,
+    expected_status: int,
+) -> None:
+    clock = 100.0
+    child = Mock(pid=4312, returncode=0)
+    child.wait.return_value = 0
+    owner = runner.OwnedProcess(child)
+    start = Mock(return_value=owner)
+    close = Mock(return_value=True)
+    events: list[dict[str, Any]] = []
+
+    def report(message: str, **kwargs: Any) -> None:
+        nonlocal clock
+        events.append(kwargs)
+        if message.startswith("\n==>"):
+            clock = after_header
+
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(runner, "report_diagnostic", report)
+    monkeypatch.setattr(runner, "start_owned_process", start)
+    monkeypatch.setattr(runner, "wait_for_owned_tree_exit", Mock(return_value=True))
+    monkeypatch.setattr(runner, "close_owner", close)
+    assert runner.run_command(COMMAND, hard_deadline=hard_deadline) == expected_status
+    assert events[0]["deadline"] == (
+        hard_deadline if hard_deadline is not None else 106.0
+    )
+    assert events[0]["work_deadline"] == (104.0 if hard_deadline is not None else None)
+    if expected_status:
+        start.assert_not_called()
+        close.assert_not_called()
+        assert len(events) == 1
+    else:
+        start.assert_called_once_with(
+            COMMAND,
+            deadline=hard_deadline if hard_deadline is not None else 106.0,
+            signal_controller=ANY,
+        )
+        cleanup_deadline = (
+            hard_deadline if hard_deadline is not None else after_header + 6
+        )
+        close.assert_called_once_with(owner, deadline=cleanup_deadline, diagnostic=ANY)
+        assert all(event["deadline"] == cleanup_deadline for event in events[1:])
 
 
 class _NativeDiagnosticCapture(io.TextIOWrapper):
@@ -1485,9 +1577,11 @@ def test_windows_fallback_diagnostics_wait_for_owner_cleanup(
         payload: bytes,
         *,
         deadline: float,
+        work_deadline: float,
         signal_controller: implementation.SignalController,
     ) -> None:
-        assert descriptor == 42 and deadline <= 110.0
+        assert descriptor == 42 and deadline == 110.0
+        assert work_deadline == 100.25
         diagnostic_events.append(
             (job.close.call_count, signal_controller is controller, payload)
         )

@@ -167,6 +167,7 @@ def test_windows_diagnostic_writer_is_job_owned_before_release_and_fully_reaped(
         42,
         "診斷 ✓\n".encode(),
         deadline=101.0,
+        work_deadline=101.0,
         signal_controller=process.SignalController(),
     )
     assert state.events.index("assign") < state.events.index("gate")
@@ -176,13 +177,45 @@ def test_windows_diagnostic_writer_is_job_owned_before_release_and_fully_reaped(
     assert all(timeout <= 1.0 for timeout in state.waits)
 
 
+@pytest.mark.parametrize("after_preparation", [100.13, 100.30])
+def test_windows_preparation_expiry_closes_empty_job_without_spawning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, after_preparation: float
+) -> None:
+    state = windows_writer(monkeypatch, tmp_path)
+    clock = 100.0
+
+    def delayed_job() -> Mock:
+        nonlocal clock
+        clock = after_preparation
+        return state.job
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock)
+    monkeypatch.setattr(process.WindowsJob, "create", delayed_job)
+    diagnostic.write_diagnostic(
+        42,
+        b"expired during preparation\n",
+        deadline=101.0,
+        work_deadline=100.25,
+        signal_controller=process.SignalController(),
+    )
+    assert clock == after_preparation < 101.0
+    state.popen.assert_not_called()
+    assert state.events == ["close-job"]
+    assert state.closed and not state.assigned
+    assert not state.gate_bytes
+
+
 @pytest.mark.parametrize("mode", ["spawn-failure", "assignment-failure"])
 def test_windows_diagnostic_admission_failure_never_releases_writer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
     state = windows_writer(monkeypatch, tmp_path, mode=mode)
     diagnostic.write_diagnostic(
-        42, b"message\n", deadline=101.0, signal_controller=process.SignalController()
+        42,
+        b"message\n",
+        deadline=101.0,
+        work_deadline=101.0,
+        signal_controller=process.SignalController(),
     )
     assert not state.gate_bytes and not state.assigned
     assert state.closed
@@ -200,7 +233,11 @@ def test_windows_diagnostic_spawn_signal_cannot_escape_job_cleanup(
     state = windows_writer(monkeypatch, tmp_path, controller=controller)
     with pytest.raises(KeyboardInterrupt):
         diagnostic.write_diagnostic(
-            42, b"message\n", deadline=101.0, signal_controller=controller
+            42,
+            b"message\n",
+            deadline=101.0,
+            work_deadline=101.0,
+            signal_controller=controller,
         )
     assert not state.gate_bytes
     assert state.assigned and state.terminated and state.reaped and state.closed
@@ -226,6 +263,7 @@ def test_windows_diagnostic_cannot_discard_unproven_cleanup(
             42,
             b"message\n",
             deadline=101.0,
+            work_deadline=101.0,
             signal_controller=process.SignalController(),
         )
     assert "close-job" in state.events
@@ -242,6 +280,7 @@ def test_windows_diagnostic_unexpected_wait_error_still_closes_job(
             42,
             b"message\n",
             deadline=101.0,
+            work_deadline=101.0,
             signal_controller=process.SignalController(),
         )
     assert state.terminated and state.reaped and state.closed
@@ -256,6 +295,7 @@ def test_windows_diagnostic_cannot_admit_work_without_cleanup_budget(
         42,
         b"message\n",
         deadline=100.0 + remaining,
+        work_deadline=100.0 + remaining,
         signal_controller=process.SignalController(),
     )
     state.popen.assert_not_called()
@@ -270,7 +310,11 @@ def test_actual_windows_leaf_program_preserves_short_write_unicode_bytes(
     state = windows_writer(monkeypatch, tmp_path)
     payload = "清理已完成 😀\n".encode(encoding)
     diagnostic.write_diagnostic(
-        42, payload, deadline=101.0, signal_controller=process.SignalController()
+        42,
+        payload,
+        deadline=101.0,
+        work_deadline=101.0,
+        signal_controller=process.SignalController(),
     )
     code_index = state.argv.index("-c")
     program = state.argv[code_index + 1]
@@ -301,7 +345,11 @@ def test_actual_windows_leaf_program_cannot_write_without_admission_token(
 ) -> None:
     state = windows_writer(monkeypatch, tmp_path)
     diagnostic.write_diagnostic(
-        42, b"message\n", deadline=101.0, signal_controller=process.SignalController()
+        42,
+        b"message\n",
+        deadline=101.0,
+        work_deadline=101.0,
+        signal_controller=process.SignalController(),
     )
     index = state.argv.index("-c")
     monkeypatch.setattr(sys, "argv", ["-c", *state.argv[index + 2 :]])
@@ -343,7 +391,11 @@ def test_windows_command_line_guard_counts_utf16_units_and_closes_unstarted_job(
         SimpleNamespace(executable="venv redirector.exe", _base_executable=executable),
     )
     diagnostic.write_diagnostic(
-        42, b"message\n", deadline=101.0, signal_controller=process.SignalController()
+        42,
+        b"message\n",
+        deadline=101.0,
+        work_deadline=101.0,
+        signal_controller=process.SignalController(),
     )
     state.popen.assert_not_called()
     assert state.events == ["close-job"]
