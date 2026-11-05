@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -452,7 +453,6 @@ def test_terminal_writer_obligation_prevents_force_kill_before_real_reap(
 def test_closed_parent_admits_no_terminal_diagnostic_leaf(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from h2h_dev_tools import _process_diagnostic as diagnostic
     from h2h_dev_tools._process_scope import ENVIRONMENT_KEY, PosixScope
 
     deadline = time.monotonic() + 3
@@ -470,11 +470,13 @@ def test_closed_parent_admits_no_terminal_diagnostic_leaf(
         with monkeypatch.context() as boundary:
             boundary.setenv(ENVIRONMENT_KEY, parent.capability.encode())
             boundary.setattr(subprocess, "Popen", observed_popen)
-            with (tmp_path / "output").open("wb") as output:
+            with (tmp_path / "output").open("w") as output:
+                boundary.setattr(
+                    process, "sys", SimpleNamespace(**(vars(sys) | {"stderr": output}))
+                )
                 with process.controlled_termination_signals() as controller:
-                    diagnostic.write_diagnostic(
-                        output.fileno(),
-                        b"late output",
+                    process.report_diagnostic(
+                        "late output",
                         deadline=deadline,
                         signal_controller=controller,
                     )
@@ -498,7 +500,6 @@ def test_diagnostic_scope_failures_remain_typed_and_retain_uncertain_obligations
     stage: str,
     error_type: type[Exception],
 ) -> None:
-    from h2h_dev_tools import _process_diagnostic as diagnostic
     from h2h_dev_tools._process_scope import ENVIRONMENT_KEY, PosixScope
 
     deadline = time.monotonic() + 3
@@ -543,12 +544,14 @@ def test_diagnostic_scope_failures_remain_typed_and_retain_uncertain_obligations
             boundary.setattr(PosixScope, "create", failing_create)
             boundary.setattr(PosixScope, "close", failing_close)
             boundary.setattr(subprocess, "Popen", observed_popen)
-            with (tmp_path / "output").open("wb") as output:
+            with (tmp_path / "output").open("w") as output:
+                boundary.setattr(
+                    process, "sys", SimpleNamespace(**(vars(sys) | {"stderr": output}))
+                )
                 with process.controlled_termination_signals() as controller:
                     with pytest.raises(process.ProcessOwnershipError) as raised:
-                        diagnostic.write_diagnostic(
-                            output.fileno(),
-                            b"output",
+                        process.report_diagnostic(
+                            "output",
                             deadline=deadline,
                             signal_controller=controller,
                         )
@@ -624,6 +627,7 @@ def test_registered_unlaunched_diagnostic_closes_with_original_deadline(
                             output.fileno(),
                             b"output",
                             deadline=deadline,
+                            work_deadline=deadline,
                             signal_controller=controller,
                         )
                     except process.RunnerSignalInterrupt as error:
@@ -645,6 +649,124 @@ def test_registered_unlaunched_diagnostic_closes_with_original_deadline(
                 real_close(scope, deadline=deadline)
         parent.proven_empty = True
         real_close(parent, deadline=deadline)
+
+
+@pytest.mark.parametrize("explicit_deadline", [True, False])
+def test_public_diagnostic_reaps_then_closes_beyond_display_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_deadline: bool
+) -> None:
+    from h2h_dev_tools._process_scope import ENVIRONMENT_KEY, PosixScope
+
+    deadline = time.monotonic() + 3
+    parent = PosixScope.create(deadline=deadline)
+    scopes: list[PosixScope] = []
+    children: list[subprocess.Popen[bytes]] = []
+    reaped: list[int] = []
+    real_create, real_close, real_popen = (
+        PosixScope.create,
+        PosixScope.close,
+        subprocess.Popen,
+    )
+
+    def observe_create(*, deadline: float) -> PosixScope:
+        scope = real_create(deadline=deadline)
+        scopes.append(scope)
+        return scope
+
+    def observe_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        child: subprocess.Popen[bytes] = real_popen(*args, **kwargs)
+        children.append(child)
+        real_wait = child.wait
+
+        def delayed_return(*args: Any, **kwargs: Any) -> int:
+            result = real_wait(*args, **kwargs)
+            if child.pid not in reaped:
+                with pytest.raises(ChildProcessError):
+                    os.waitpid(child.pid, os.WNOHANG)
+                reaped.append(child.pid)
+                # Model scheduling/filesystem delay after a real OS reap. This
+                # crosses the display bound while the caller still owns time.
+                time.sleep(0.30)
+            return result
+
+        monkeypatch.setattr(child, "wait", delayed_return)
+        return child
+
+    try:
+        with (
+            monkeypatch.context() as boundary,
+            (tmp_path / "output").open("w") as output,
+        ):
+            boundary.setenv(ENVIRONMENT_KEY, parent.capability.encode())
+            boundary.setattr(PosixScope, "create", observe_create)
+            boundary.setattr(subprocess, "Popen", observe_popen)
+            boundary.setattr(
+                process, "sys", SimpleNamespace(**(vars(sys) | {"stderr": output}))
+            )
+            with process.controlled_termination_signals() as controller:
+                process.report_diagnostic(
+                    "healthy diagnostic",
+                    deadline=deadline if explicit_deadline else None,
+                    signal_controller=controller,
+                )
+        assert len(children) == len(scopes) == len(reaped) == 1
+        assert children[0].returncode == 0
+        assert not scopes[0].capability.directory.exists()
+        assert not parent.has_pending(deadline=deadline)
+        assert (tmp_path / "output").read_text() == "healthy diagnostic\n"
+    finally:
+        # The exact fixture's real waits justify its rescue; this never turns a
+        # failed runtime assertion into passing cleanup evidence.
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            subprocess.Popen.wait(child, timeout=max(0.01, deadline - time.monotonic()))
+        for scope in scopes:
+            if scope.capability.directory.exists():
+                scope.proven_empty = True
+                real_close(scope, deadline=deadline)
+        parent.proven_empty = True
+        real_close(parent, deadline=deadline)
+
+
+@pytest.mark.parametrize("remaining", [-1.0, 0.0, 0.001])
+@pytest.mark.parametrize("cutoff", ["cleanup", "work"])
+def test_public_diagnostic_never_admits_after_insufficient_work_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remaining: float, cutoff: str
+) -> None:
+    from h2h_dev_tools._process_scope import ENVIRONMENT_KEY, PosixScope
+
+    deadline = time.monotonic() + 3
+    parent = PosixScope.create(deadline=deadline)
+
+    def forbidden_create(*, deadline: float) -> PosixScope:
+        raise AssertionError("Expired display budget admitted a scope")
+
+    def forbidden_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        raise AssertionError("Expired display budget admitted a writer")
+
+    try:
+        with (
+            monkeypatch.context() as boundary,
+            (tmp_path / "output").open("w") as output,
+        ):
+            boundary.setenv(ENVIRONMENT_KEY, parent.capability.encode())
+            boundary.setattr(PosixScope, "create", forbidden_create)
+            boundary.setattr(subprocess, "Popen", forbidden_spawn)
+            boundary.setattr(
+                process, "sys", SimpleNamespace(**(vars(sys) | {"stderr": output}))
+            )
+            expired = time.monotonic() + remaining
+            process.report_diagnostic(
+                "must not appear",
+                deadline=expired if cutoff == "cleanup" else deadline,
+                work_deadline=expired if cutoff == "work" else None,
+            )
+        assert not parent.has_pending(deadline=deadline)
+        assert (tmp_path / "output").read_text() == ""
+    finally:
+        parent.proven_empty = True
+        parent.close(deadline=deadline)
 
 
 @pytest.mark.parametrize("failure", ["launch", "body", "retained-error"])

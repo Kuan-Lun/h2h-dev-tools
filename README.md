@@ -740,12 +740,23 @@ lock failure or unproven cleanup instead remains an ownership error. This also
 protects output emitted after a main command has closed its own scope. Windows uses the
 base interpreter with isolated startup and a Job-assigned start gate. The fixed
 stdlib writer starts no descendants and has no dependency on a consumer runtime.
-Spawn, writing, termination and reaping share the caller's original absolute
-deadline; an expired or insufficient budget admits no writer. Diagnostic output
-uses at most 0.25 seconds within that bound, including cleanup. Only a standalone
-CLI without an outer deadline receives that explicit default budget. Failure to
-prove helper cleanup remains an ownership error, even after the main command is
-empty. No additional cleanup grace, process session or recursive command runner is created.
+Admission and display retain a work window of at most 0.25 seconds and its
+existing half-window execution cutoff. An expired or insufficient work budget
+admits no writer. Termination, reaping and complete scope removal instead use
+the caller's existing absolute cleanup deadline; the display cutoff never
+shortens that responsibility. A diagnostic call may therefore take longer than
+0.25 seconds to prove cleanup, but never receives extra time beyond that original
+deadline. Scope lock contention can consume its remaining cleanup budget.
+`report_diagnostic(..., deadline=..., work_deadline=...)` accepts an optional
+earlier work cutoff; owned command headers preserve their execution cutoff and
+use the already-established ownership deadline for cleanup. Footers, recovery
+replay and review diagnostics retain their existing absolute phase bounds.
+An entry without any caller deadline, including standalone CLI diagnostics and
+offline verification, has one explicit six-second total budget, fixed before
+admission. This default also applies to the shell's fixed diagnostic/completion
+launcher; it is not six additional seconds after display or a cleanup retry.
+Failure to prove helper cleanup remains an ownership error, even after the main
+command is empty. No new process session or recursive command runner is created.
 Automatic diagnostic signal handling requires the main thread; callers already
 controlling signals pass their existing controller. Parallel cleanup workers only
 collect text; the controlling thread emits it after every worker has joined.
