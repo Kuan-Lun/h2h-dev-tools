@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-11-04T22:19:06+00:00",
+  "checked_at": "2026-11-05T15:54:27+00:00",
   "manifest_sha256": "aa20257539103591105ade67f7411e0eaff74f1ae5ce1d94a1bd0763f654f9c7",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.11.1",
+  "project_version": "0.12.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -124,7 +124,7 @@
     }
   ],
   "review": {
-    "note": "2026-11-05 h2h-dev-tools 0.11.1 compatible patch dependency review. Only the private offline-wheel site-directory subprocess protocol changes to standard-library JSON; the existing escaped .pth serialization, public CLI, dependencies, Python >=3.14 requirement and all bounds remain unchanged. Reviewed current upstream release notes: hatchling 1.33.0 adds Python3.15 support (https://hatch.pypa.io/dev/history/hatchling/); distlib 0.4.4 includes launcher-error and archive-containment fixes (https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib); packaging 26.3 adds range APIs and marker/specifier corrections while requiring Python >=3.9 (https://packaging.pypa.io/en/stable/changelog.html); build 1.6.1 fixes the Windows symlink regression (https://build.pypa.io/en/stable/changelog.html). Mypy 2.4.1 fixes overload checking and mypyc frame-private functions (https://mypy.readthedocs.io/en/stable/changelog.html); pytest 9.2.0 changes plugin-error reporting and hash-based assertion caches (https://docs.pytest.org/en/stable/changelog.html), whose existing source-authority regression suite remains required; pytest-xdist 3.8.0 adds loadscope ordering controls (https://pytest-xdist.readthedocs.io/en/latest/changelog.html). Ruff 0.17.3 corrects f-string conversions (https://github.com/astral-sh/ruff/releases/tag/0.17.3); markdownlint-cli2 0.24.0 updates dependencies and retains the prior Node >=22 requirement (https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md). These stable versions match the preceding 0.11.0 audit and are admitted by the existing declarations; no out-of-bound stable version is identified. The generator independently records current registry versions and non-yanked Python3.14-compatible artifacts. The clean local environment was rebuilt through the normal resolver. The complete offline-wheel test file passed14 tests, including real CR/CRLF imports, LF/space controls and a literal-whitespace protocol test; the old implementation failed the three intended negative controls. No native Windows execution is claimed. Final exact-candidate review, full release gate and artifact validation remain required; this audit is not a publishing receipt.",
+    "note": "2026-11-05 h2h-dev-tools 0.12.0 dependency review. Direct dependencies, bounds and Python >=3.14 remain unchanged. Fresh official PyPI/npm metadata reports hatchling 1.33.0, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.1, pytest 9.2.0, pytest-xdist 3.8.0, ruff 0.17.3 and markdownlint-cli2 0.24.0; all stable releases satisfy existing lower-only bounds, with no out-of-bound stable candidate. Declared Python requirements admit 3.14; distlib has no Requires-Python field, which is not execution evidence. markdownlint-cli2 requires Node >=22. Reviewed upstream notes for Python 3.15 additions, launcher/archive hardening, packaging marker/specifier fixes, build's Windows symlink regression fix, mypy overload fixes, pytest plugin-error/cache changes, xdist loadscope controls and Ruff f-string/default changes. No concrete latest-release incompatibility requiring a new bound was identified. Existing explicit Ruff py314/rule settings and canonical source-authority/xdist regressions remain applicable. This metadata/release-note review does not claim new dependency installation, test execution or native Windows validation. Separately, the accepted normal/diagnostic lifetime author set passed 285 tests under Python 3.14.8 and existing local dependencies; final current-environment fast/full/artifact gates remain required. Sources: https://hatch.pypa.io/dev/history/hatchling/ ; https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib ; https://packaging.pypa.io/en/stable/changelog.html ; https://build.pypa.io/en/stable/changelog.html ; https://mypy.readthedocs.io/en/stable/changelog.html ; https://docs.pytest.org/en/stable/changelog.html#pytest-9-2-0-2026-10-27 ; https://pytest-xdist.readthedocs.io/en/latest/changelog.html ; https://raw.githubusercontent.com/astral-sh/ruff/0.17.3/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md ; per-project https://pypi.org/pypi/PROJECT/json ; https://registry.npmjs.org/markdownlint-cli2/latest",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
