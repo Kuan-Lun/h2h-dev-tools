@@ -169,6 +169,10 @@ def response_capacity(
         "verdict": "pass",
         "summary": "",
         "findings": [],
+        "work_completion": {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+        },
         "plan_digest": "0" * 64,
         "shard_id": shard_id,
         "unit_reviews": [

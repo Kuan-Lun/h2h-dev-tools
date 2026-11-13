@@ -15,10 +15,11 @@ import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
+from uuid import uuid4
 
 from . import (
     bundle_verify,
@@ -381,6 +382,14 @@ Continue the assigned review while bounded reads and analysis can make progress
 within the original deadline. A clipped tool response is a recoverable read gap,
 not by itself evidence that the model context is exhausted. Do not infer context
 exhaustion from cumulative token usage, assignment length or number of tool calls.
+Before returning final JSON, wait for EVERY helper you started (including its
+own delegated work) and EVERY command, read or tool session to reach a terminal
+state. A wait returning a running session or partial output is not completion.
+Leave no active background or detached work. Set work_completion.helpers_complete
+and work_completion.tool_sessions_complete true only after confirming both;
+otherwise report incomplete and mark unconfirmed completion false. These are
+reviewer attestations, not an OS proof that arbitrary independent process groups
+are absent. CLI exit zero or an empty directly managed group cannot replace them.
 Use incomplete whenever context, tools or time actually prevent completion;
 identify the unread sources/ranges or unresolved obligations, the concrete
 barrier and why bounded continuation cannot resolve it. Do not invent capacity
@@ -526,11 +535,17 @@ def _executed_source_hashes() -> dict[str, str]:
     return hashes
 
 
+@dataclass
+class _ReviewWork:
+    completion: Literal["not-started", "unproven", "attested"] = "not-started"
+
+
 @dataclass(frozen=True)
 class Reviewer:
     """Keep candidate, Git metadata and policy operations local to one repository."""
 
     repository: Path
+    _work: _ReviewWork = field(default_factory=_ReviewWork, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repository", self.repository.resolve())
@@ -738,6 +753,53 @@ class Reviewer:
     def _receipt_path(self, target: Target) -> Path:
         return self._directory() / "receipts" / f"{target.key}.json"
 
+    def _pending_review_path(self, target: Target) -> Path:
+        return self._directory() / "locks" / f"{target.key}.unproven.json"
+
+    def _mark_review_pending(self, target: Target) -> bytes:
+        """Keep an interrupted review blocked even after its flock owner dies."""
+        content = review_plan.canonical(
+            {
+                "schema": 1,
+                "kind": "review-completion-unproven",
+                "target": target.document(),
+                "nonce": uuid4().hex,
+            }
+        )
+        path = self._pending_review_path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("xb") as stream:
+                stream.write(content)
+        except OSError as error:
+            raise review_execution.ReviewCompletionUnproven(
+                f"Cannot establish review retention marker: {path}"
+            ) from error
+        return content
+
+    def _clear_review_pending(self, target: Target, expected: bytes) -> None:
+        """Release only this invocation's exact marker after known completion."""
+        path = self._pending_review_path(target)
+        try:
+            with path.open("rb") as stream:
+                actual = stream.read(len(expected) + 1)
+            if actual != expected:
+                raise ValueError("Review retention marker changed")
+            path.unlink()
+        except (OSError, ValueError) as error:
+            raise review_execution.ReviewCompletionUnproven(
+                f"Review retention marker could not be safely cleared: {path}"
+            ) from error
+
+    def _require_review_not_retained(self, target: Target) -> None:
+        retained = self._pending_review_path(target)
+        if retained.exists() or retained.is_symlink():
+            raise review_execution.ReviewCompletionUnproven(
+                f"Review work completion requires manual verification: {retained}; "
+                "retain candidate, task and admission; inspect the recorded run "
+                "and confirm cleanup before explicitly clearing this marker"
+            )
+
     @contextmanager
     def _review_lock(self, target: Target, *, exclusive: bool) -> Iterator[None]:
         if os.name != "posix":
@@ -746,6 +808,7 @@ class Reviewer:
                     "Running Codex review currently requires POSIX process groups; "
                     "offline verification remains available on other platforms"
                 )
+            self._require_review_not_retained(target)
             yield
             return
         import fcntl
@@ -763,6 +826,7 @@ class Reviewer:
                     "Code review already running for this candidate"
                 ) from error
             try:
+                self._require_review_not_retained(target)
                 yield
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
@@ -1173,6 +1237,10 @@ class Reviewer:
                     raise ReviewError(
                         f"No valid JSON review: {invocation.id}"
                     ) from error
+                if not review_coverage.work_completion_confirmed(result):
+                    raise review_execution.ReviewCompletionUnproven(
+                        f"Review helper or tool-session completion is unproven: {invocation.id}"
+                    )
                 _require_complete(result)
                 review_coverage.validate_attestation(result, plan, index)
                 # No subsequent wave may be admitted after candidate/source drift.
@@ -1183,19 +1251,29 @@ class Reviewer:
                     )
                 results[invocation.id] = result
 
+            def admitted(_invocation: review_execution.Invocation) -> None:
+                self._work.completion = "unproven"
+
             review_execution.run_invocations(
                 self.repository,
                 invocations,
                 deadline=phase_deadline,
                 validate=validate,
+                on_admission=admitted,
             )
+            if any(item.needs_completion for item in invocations):
+                self._work.completion = "attested"
 
         index_argument = index
         try:
             execute(
                 [
                     review_execution.Invocation(
-                        "version", ("codex", "--version"), "", run_directory / "version"
+                        "version",
+                        ("codex", "--version"),
+                        "",
+                        run_directory / "version",
+                        False,
                     )
                 ],
                 min(deadline, time.monotonic() + 16),
@@ -1243,7 +1321,7 @@ class Reviewer:
                         "admission"
                     )
                 return review_execution.Invocation(
-                    identifier, tuple(command), prompt, directory
+                    identifier, tuple(command), prompt, directory, True
                 )
 
             shards = []
@@ -1388,9 +1466,7 @@ def main(repository: Path) -> None:
         try:
             process_control.report_diagnostic(message, deadline=deadline)
         except process_control.ProcessOwnershipError as ownership_error:
-            raise SystemExit(
-                process_control.TERMINATION_FAILED_EXIT_CODE
-            ) from ownership_error
+            fail_ownership(ownership_error)
 
     started = time.monotonic()
     deadline: float | None = None
@@ -1412,6 +1488,40 @@ def main(repository: Path) -> None:
             started = deadline - args.timeout_seconds
             publication_reserve = min(30.0, args.timeout_seconds * 0.05)
             deadline -= publication_reserve
+    managed = False
+    target: Target | None = None
+    standalone_marker: bytes | None = None
+    failure_receipt: Path | None = None
+
+    def fail_ownership(error: process_control.ProcessOwnershipError) -> NoReturn:
+        # The path was cached before admission. Unknown cleanup must not start
+        # another Git query or diagnostic writer merely to explain this failure.
+        if failure_receipt is not None:
+            merge_command._record_ownership_failure(
+                failure_receipt, error, boundary="code-review-main"
+            )
+        raise SystemExit(process_control.TERMINATION_FAILED_EXIT_CODE) from error
+
+    def finish(status: int) -> None:
+        if args.command != "run" or target is None:
+            return
+        completion = reviewer._work.completion
+        if completion == "unproven":
+            raise review_execution.ReviewCompletionUnproven(
+                "Review work completion is unproven; candidate retention remains active"
+            )
+        if managed:
+            try:
+                merge_command.write_review_completion(
+                    target_key=target.key, status=status, completion=completion
+                )
+            except (KeyError, OSError, ValueError) as error:
+                raise review_execution.ReviewCompletionUnproven(
+                    "Cannot publish the managed review completion handshake"
+                ) from error
+        elif standalone_marker is not None:
+            reviewer._clear_review_pending(target, standalone_marker)
+
     try:
         if publication_reserve is not None:
             process_control.report_diagnostic(
@@ -1434,6 +1544,8 @@ def main(repository: Path) -> None:
                 or not os.environ.get("H2H_REVIEW_PENDING_RECEIPT")
             ):
                 raise ReviewError("Review owner does not hold this candidate's lock")
+            if managed and os.environ.get("H2H_REVIEW_COMPLETION_RECEIPT"):
+                failure_receipt = Path(os.environ["H2H_REVIEW_COMPLETION_RECEIPT"])
             destination = (
                 Path(os.environ["H2H_REVIEW_PENDING_RECEIPT"])
                 if managed
@@ -1471,6 +1583,9 @@ def main(repository: Path) -> None:
                         admission.enter_context(
                             reviewer._review_lock(target, exclusive=True)
                         )
+                    if not managed:
+                        failure_receipt = reviewer._pending_review_path(target)
+                        standalone_marker = reviewer._mark_review_pending(target)
                     publication = admission.enter_context(_publication(destination))
                     if deadline is None:
                         raise ReviewError(
@@ -1497,9 +1612,15 @@ def main(repository: Path) -> None:
                         started=started,
                         minimum_shard_seconds=args.min_shard_seconds,
                     )
+                if not managed and standalone_marker is not None:
+                    # All model work and diagnostics completed normally. Clear
+                    # its retention barrier under the still-held candidate
+                    # flock BEFORE the final atomic publication operation.
+                    reviewer._clear_review_pending(target, standalone_marker)
+                    standalone_marker = None
                 publication.complete(deadline)
     except process_control.ProcessOwnershipError as error:
-        raise SystemExit(process_control.TERMINATION_FAILED_EXIT_CODE) from error
+        fail_ownership(error)
     except KeyboardInterrupt as error:
         report("h2h code review: interrupted by signal 2")
         raise SystemExit(process_control.INTERRUPTED_EXIT_CODE) from error
@@ -1515,4 +1636,13 @@ def main(repository: Path) -> None:
         subprocess.SubprocessError,
     ) as error:
         report(f"h2h code review: {error}")
+        try:
+            finish(1)
+        except process_control.ProcessOwnershipError as ownership_error:
+            fail_ownership(ownership_error)
         raise SystemExit(1) from error
+
+    try:
+        finish(0)
+    except process_control.ProcessOwnershipError as error:
+        fail_ownership(error)

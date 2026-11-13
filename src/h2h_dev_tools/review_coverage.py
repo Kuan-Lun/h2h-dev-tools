@@ -18,6 +18,15 @@ from .review_plan import (
 )
 
 ATTESTATION_PROPERTIES = {
+    "work_completion": {
+        "type": "object",
+        "properties": {
+            "helpers_complete": {"type": "boolean"},
+            "tool_sessions_complete": {"type": "boolean"},
+        },
+        "required": ["helpers_complete", "tool_sessions_complete"],
+        "additionalProperties": False,
+    },
     "plan_digest": {"type": "string"},
     "shard_id": {"type": "string"},
     "unit_reviews": {
@@ -76,7 +85,26 @@ def _text(value: object, maximum: int) -> bool:
     )
 
 
+def work_completion_confirmed(document: object) -> bool:
+    """Check the reviewer's assertion, not OS proof of arbitrary descendants.
+
+    Completion of managed process groups is checked separately by the owner.
+    Unknown, missing or malformed assertions cannot authorize normal recovery.
+    """
+    if not isinstance(document, dict):
+        return False
+    completion = document.get("work_completion")
+    return (
+        isinstance(completion, dict)
+        and set(completion) == {"helpers_complete", "tool_sessions_complete"}
+        and completion["helpers_complete"] is True
+        and completion["tool_sessions_complete"] is True
+    )
+
+
 def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) -> None:
+    if not work_completion_confirmed(result):
+        raise PlanError("Review helper or tool-session completion is unproven")
     limits = plan.response_limits(index)
     if len(wire(result)) > limits["wire_bytes"]:
         raise PlanError("Review result exceeds its response wire budget")

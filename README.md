@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.13.0 is available on your selected
+Use Python 3.14 or newer. When version 0.14.0 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.13.0
+python -m pip install h2h-dev-tools==0.14.0
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.13.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.14.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -546,7 +546,7 @@ Each review invocation sets `notify=[]`: asynchronous completion notifications
 can otherwise outlive the CLI and violate its process ownership contract.
 This override applies only to that invocation. Model preferences, authentication,
 plugins, MCP servers and security hooks retain their existing configuration;
-their descendants remain subject to the same cleanup requirements.
+this does not provide process containment for those tools.
 Reviews use normal persistent CLI sessions rather than forcing `--ephemeral`,
 so subagents can resolve their parent thread. Normal CLI session rollouts are
 retained and are not automatically deleted by the reviewer. The raw review
@@ -566,11 +566,36 @@ The managed reviewer validates its direct
 parent, group leader and complete owner source closure before sharing ownership.
 Every separate Codex session has a registered canonical owner. Unexpected owner
 death cannot turn an empty outer group into proof of nested cleanup. The launcher
-proves all groups and obligations empty before Git aborts; missing cleanup evidence
-retains the candidate and scope for inspection. Standalone
-review instead owns its CLI-version and Codex command groups directly. Even a
-successful leader exit requires bounded proof that its group is empty before
-standalone review evidence can be published.
+proves its managed groups and registered obligations empty. Codex tools can start
+independent groups, even for ordinary read commands; those groups are outside the
+automatic forced-cleanup guarantee. CLI exit zero and an empty managed group do
+not, by themselves, prove that every helper or tool session has finished.
+
+Before returning each shard or integration result, the reviewer must wait for every
+helper and every command, read or tool session it started to reach its terminal
+state. The result requires `work_completion.helpers_complete=true` and
+`work_completion.tool_sessions_complete=true`. These are reviewer attestations,
+not an operating-system census or proof that arbitrary processes no longer exist.
+Complete findings still block the merge but allow normal recovery once the managed
+cleanup and completion checks succeed. Interrupted, timed-out, abnormal, invalid or
+incomplete review work cannot provide that completion evidence: retain the pending
+candidate, task, review barrier and merge admission for inspection. Do not
+automatically abort, restore the checkout, release admission or publish passing
+evidence because the directly managed groups are empty.
+
+The managed reviewer reports its terminal completion to the parent separately from
+the passing receipt. The parent verifies that report before permitting recovery;
+a missing report or unexpected child exit retains the same barriers. Standalone
+review owns its CLI-version and Codex command groups directly and follows the same
+completion rules. A persistent review barrier blocks rerun and verification when
+completion is unknown, including after the operating system releases a dead
+process's file lock. Inspect the original diagnostics, outstanding work and Git
+state, then establish cleanup before manually recovering; elapsed time is not proof.
+Unknown completion preserves the exception chain in a bounded, non-authoritative
+failure sidecar beside the managed completion file or standalone retention marker.
+This uses the existing same-process diagnostic writer, starts no new process and
+does not extend the deadline. The sidecar explains the failure; it cannot prove
+cleanup or authorize recovery.
 
 For long-running review automation, redirect output to a log file and cancel with
 TERM sent to the outer merge wrapper. A terminal executor that forcibly kills the
@@ -617,6 +642,13 @@ attestations through a field conversion; there is no compatibility fallback.
 Artifact TOML declarations and the snapshot schema are unchanged. No consumer
 runtime or data migration is required; generate updated snapshots with the standard
 CLI and establish a new full-repository review baseline.
+
+Version 0.14 adds the required work-completion attestations and narrows the automatic
+cleanup promise to directly managed groups and registered obligations. Old results
+cannot be converted into these new semantic attestations. Keep historical evidence,
+sync the new snapshot from an explicit candidate wheel or released version, and
+establish a new full-repository review baseline. Consumer runtime data and the
+snapshot schema are unchanged; there is no product-data migration.
 
 Before starting Codex, review records its unit count, assigned bytes, shard count,
 concurrency, queued waves and remaining execution capacity in `time-budget.json`
@@ -706,7 +738,8 @@ admission; all active owners are cleaned under the same remaining deadline.
 
 Review evidence becomes canonical at one terminal commit: the final atomic rename.
 Complete the review, exact candidate/coverage revalidation, cleanup of every review
-owned process group and nested obligation, and evidence preparation first. Then
+owned process group and nested obligation, all work-completion attestations, and
+evidence preparation first. Then
 check the original absolute deadline and pending signals immediately before
 attempting the rename; this does not extend any budget. A failure before commit
 must not create a canonical receipt. A successful rename retains the valid committed

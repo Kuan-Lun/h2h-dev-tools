@@ -22,7 +22,7 @@ pytestmark = pytest.mark.skipif(
 
 def _invocation(root: Path, name: str, code: str = "pass") -> execution.Invocation:
     return execution.Invocation(
-        name, (sys.executable, "-I", "-c", code), "immutable prompt", root / name
+        name, (sys.executable, "-I", "-c", code), "immutable prompt", root / name, False
     )
 
 
@@ -612,7 +612,7 @@ def test_unexpected_registered_nested_owner_death_cannot_prove_cleanup(
         'runpy.run_path(str(package/"source_loader.py"))["load_package"](package,"h2h_dev_tools")\n'
         "from h2h_dev_tools import process,review_execution as execution\n"
         "try:\n"
-        ' execution.run_invocations(Path.cwd(), [execution.Invocation("orphan", (sys.executable,"nested.py"), "", Path("invocation"))], deadline=time.monotonic()+9, validate=lambda _: Path("validated").touch())\n'
+        ' execution.run_invocations(Path.cwd(), [execution.Invocation("orphan", (sys.executable,"nested.py"), "", Path("invocation"), False)], deadline=time.monotonic()+9, validate=lambda _: Path("validated").touch())\n'
         "except process.ProcessOwnershipError as error:\n"
         ' Path("outcome.json").write_text(json.dumps({"unproven": not error.cleanup_proven}))\n'
         "else:\n"
@@ -830,7 +830,7 @@ def test_one_busy_admission_cannot_starve_other_review_cleanup(
             """
             import textwrap
             child = textwrap.dedent(child)
-            invocations = [execution.Invocation(str(i), (sys.executable, "-I", "-c", child, str(i), str(peer_ignores_term)), "prompt", root / str(i)) for i in range(5)]
+            invocations = [execution.Invocation(str(i), (sys.executable, "-I", "-c", child, str(i), str(peer_ignores_term)), "prompt", root / str(i), False) for i in range(5)]
             before = {thread.ident for thread in threading.enumerate()}
             report = {}
             started = time.monotonic()
@@ -1216,3 +1216,145 @@ def test_scope_contention_fixture_rescues_interrupted_launch(
                     if failure is None:
                         raise
                     failure.add_note(f"Launch control rescue failed: {rescue_error}")
+
+
+@pytest.mark.parametrize("fault", ["nonzero", "validation", "timeout", "signal"])
+def test_model_work_is_unproven_despite_registered_group_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    owners = _track(monkeypatch)
+    code = "raise SystemExit(7)" if fault == "nonzero" else "pass"
+    if fault in {"timeout", "signal"}:
+        code = "import time; time.sleep(60)"
+    invocation = execution.Invocation(
+        "model", (sys.executable, "-I", "-c", code), "prompt", tmp_path / "model", True
+    )
+    admissions: list[str] = []
+    if fault == "signal":
+        start = process.start_owned_process
+
+        def signal_after_start(*args: Any, **kwargs: Any) -> process.OwnedProcess:
+            owner = start(*args, **kwargs)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return owner
+
+        monkeypatch.setattr(process, "start_owned_process", signal_after_start)
+
+    def validate(_item: execution.Invocation) -> None:
+        if fault == "validation":
+            raise ValueError("synthetic incomplete or invalid completion result")
+
+    with pytest.raises(execution.ReviewCompletionUnproven) as caught:
+        execution.run_invocations(
+            tmp_path,
+            [invocation],
+            deadline=time.monotonic() + 6.6,
+            validate=validate,
+            on_admission=lambda item: admissions.append(item.id),
+        )
+    assert admissions == ["model"]
+    assert not caught.value.cleanup_proven
+    assert not (tmp_path / "model" / "result.json").exists()
+    _empty(owners)  # Proven registered cleanup does not upgrade tool completion.
+
+
+def test_model_admission_failure_preserves_unproven_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_start(*args: Any, **kwargs: Any) -> process.OwnedProcess:
+        raise OSError("synthetic failed spawn handoff")
+
+    monkeypatch.setattr(process, "start_owned_process", failed_start)
+    admitted: list[str] = []
+    with pytest.raises(execution.ReviewCompletionUnproven) as caught:
+        execution.run_invocations(
+            tmp_path,
+            [
+                execution.Invocation(
+                    "model", ("unstarted",), "", tmp_path / "model", True
+                )
+            ],
+            deadline=time.monotonic() + 10,
+            validate=lambda _: pytest.fail("An unstarted invocation cannot validate"),
+            on_admission=lambda item: admitted.append(item.id),
+        )
+    assert admitted == ["model"]
+    assert isinstance(caught.value.__context__, OSError)
+    assert not caught.value.cleanup_proven
+
+
+def test_detached_tool_can_outlive_failed_review_without_cleanup_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owners = _track(monkeypatch)
+    ready = tmp_path / "detached.pid"
+    release = tmp_path / "release-detached"
+    tool = (
+        "import os,time\nfrom pathlib import Path\n"
+        f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+        "deadline=time.monotonic()+12\n"
+        f"while not Path({str(release)!r}).exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+    )
+    model = (
+        "import subprocess,sys,time\nfrom pathlib import Path\n"
+        f"subprocess.Popen([sys.executable,'-I','-c',{tool!r}],start_new_session=True)\n"
+        f"while not Path({str(ready)!r}).exists(): time.sleep(0.01)\n"
+        "raise SystemExit(7)\n"
+    )
+    try:
+        with pytest.raises(execution.ReviewCompletionUnproven) as caught:
+            execution.run_invocations(
+                tmp_path,
+                [
+                    execution.Invocation(
+                        "model",
+                        (sys.executable, "-I", "-c", model),
+                        "",
+                        tmp_path / "model",
+                        True,
+                    )
+                ],
+                deadline=time.monotonic() + 10,
+                validate=lambda _: pytest.fail("Nonzero model cannot validate"),
+            )
+        _empty(owners)
+        assert not caught.value.cleanup_proven
+        detached = int(ready.read_text())
+        assert detached != owners[0].process.pid
+        assert os.getpgid(detached) == detached
+        os.kill(detached, 0)  # Still alive before cooperative fixture rescue.
+    finally:
+        release.touch()
+        if ready.exists():
+            _wait_for_orphan_group_exit(
+                int(ready.read_text()), deadline=time.monotonic() + 6
+            )
+
+
+def test_normal_attested_model_completion_and_preflight_failure_are_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owners = _track(monkeypatch)
+    invocation = execution.Invocation(
+        "model", (sys.executable, "-I", "-c", "pass"), "", tmp_path / "model", True
+    )
+    events: list[str] = []
+    result = execution.run_invocations(
+        tmp_path,
+        [invocation],
+        deadline=time.monotonic() + 10,
+        validate=lambda item: events.append(f"validated:{item.id}"),
+        on_admission=lambda item: events.append(f"admitted:{item.id}"),
+    )
+    assert events == ["admitted:model", "validated:model"]
+    assert result == [{"id": "model", "exit_code": 0, "owned_tree_empty": True}]
+    _empty(owners)
+    with pytest.raises(execution.ExecutionError, match="deadline"):
+        execution.run_invocations(
+            tmp_path,
+            [invocation],
+            deadline=time.monotonic(),
+            validate=lambda _: pytest.fail("Expired preflight cannot validate"),
+            on_admission=lambda _: pytest.fail("Expired preflight cannot admit"),
+        )
+    assert len(owners) == 1
