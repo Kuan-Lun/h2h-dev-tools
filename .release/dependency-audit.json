@@ -1,16 +1,16 @@
 {
-  "checked_at": "2026-11-05T15:54:27+00:00",
+  "checked_at": "2026-11-13T05:16:32+00:00",
   "manifest_sha256": "aa20257539103591105ade67f7411e0eaff74f1ae5ce1d94a1bd0763f654f9c7",
   "node": [
     {
       "declared": ">=0.23.2",
-      "latest": "0.24.0",
+      "latest": "0.24.1",
       "latest_satisfies": true,
       "name": "markdownlint-cli2",
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.12.0",
+  "project_version": "0.13.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -114,7 +114,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.3",
+      "latest": "0.17.5",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -124,7 +124,7 @@
     }
   ],
   "review": {
-    "note": "2026-11-05 h2h-dev-tools 0.12.0 dependency review. Direct dependencies, bounds and Python >=3.14 remain unchanged. Fresh official PyPI/npm metadata reports hatchling 1.33.0, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.1, pytest 9.2.0, pytest-xdist 3.8.0, ruff 0.17.3 and markdownlint-cli2 0.24.0; all stable releases satisfy existing lower-only bounds, with no out-of-bound stable candidate. Declared Python requirements admit 3.14; distlib has no Requires-Python field, which is not execution evidence. markdownlint-cli2 requires Node >=22. Reviewed upstream notes for Python 3.15 additions, launcher/archive hardening, packaging marker/specifier fixes, build's Windows symlink regression fix, mypy overload fixes, pytest plugin-error/cache changes, xdist loadscope controls and Ruff f-string/default changes. No concrete latest-release incompatibility requiring a new bound was identified. Existing explicit Ruff py314/rule settings and canonical source-authority/xdist regressions remain applicable. This metadata/release-note review does not claim new dependency installation, test execution or native Windows validation. Separately, the accepted normal/diagnostic lifetime author set passed 285 tests under Python 3.14.8 and existing local dependencies; final current-environment fast/full/artifact gates remain required. Sources: https://hatch.pypa.io/dev/history/hatchling/ ; https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib ; https://packaging.pypa.io/en/stable/changelog.html ; https://build.pypa.io/en/stable/changelog.html ; https://mypy.readthedocs.io/en/stable/changelog.html ; https://docs.pytest.org/en/stable/changelog.html#pytest-9-2-0-2026-10-27 ; https://pytest-xdist.readthedocs.io/en/latest/changelog.html ; https://raw.githubusercontent.com/astral-sh/ruff/0.17.3/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md ; per-project https://pypi.org/pypi/PROJECT/json ; https://registry.npmjs.org/markdownlint-cli2/latest",
+    "note": "2026-11-13 h2h-dev-tools 0.13.0 dependency review. Official PyPI/npm metadata checked at 2026-11-13T05:11:52Z reports hatchling 1.33.0, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.1, pytest 9.2.0, pytest-xdist 3.8.0, ruff 0.17.5 and markdownlint-cli2 0.24.1. All latest stable releases satisfy the unchanged lower-only bounds; no out-of-bound stable candidate exists. Declared minimum releases are not yanked and their metadata admits Python 3.14; latest metadata also admits 3.14. Distlib has a 3.14 classifier but no Requires-Python field; pytest-xdist declares >=3.9 without a 3.14 classifier or explicit 3.14 release-note support. These are metadata observations, not execution proof. Markdownlint-cli2 minimum and latest both require Node >=22. Reviewed official notes for hatchling Python 3.15/plugin-interface changes, distlib launcher/archive hardening, packaging marker/specifier corrections, build Windows symlink regression repair, mypy native-parser/overload changes, pytest plugin exit codes/hash-based rewritten caches/parametrize and cache changes, xdist loadscope ordering, Ruff 0.17 defaults plus 0.17.4-0.17.5 parser/BOM/stderr/autofix/B008 changes, and markdownlint-cli2 dependency updates. Existing explicit Ruff py314/rule settings remain relevant. No concrete incompatibility requiring a new upper bound or exclusion was identified. This read-only review performed no dependency installation, tests, registry-backed clean resolution or native Windows validation; normal candidate fast/full/artifact gates remain separate evidence. Sources: https://hatch.pypa.io/dev/history/hatchling/ ; https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib ; https://packaging.pypa.io/en/stable/changelog.html ; https://build.pypa.io/en/stable/changelog.html ; https://mypy.readthedocs.io/en/stable/changelog.html ; https://docs.pytest.org/en/stable/changelog.html#pytest-9-2-0-2026-10-27 ; https://pytest-xdist.readthedocs.io/en/latest/changelog.html ; https://raw.githubusercontent.com/astral-sh/ruff/0.17.5/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.1/CHANGELOG.md ; per-project https://pypi.org/pypi/PROJECT/json and declared-minimum version JSON ; https://registry.npmjs.org/markdownlint-cli2 .",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
