@@ -149,6 +149,12 @@
   相符的 candidate；外部漂移、來源不明或 cleanup 未證明時保留 candidate、task
   與 admission，不自動回收 stale lock。已確認完成的 merge commit 不得 abort；
   cleanup 已證明時釋放 admission，讓正常 `--cleanup-only` 可以重試。
+- Merge command、workflow diagnostic 與最外層 launcher 的 ownership-error 125
+  出口，盡力由同程序寫入最多 64 KiB 的 `cleanup-N.failure.json`，保留有界
+  exception／cause／context／notes。它固定為 non-authoritative、cleanup unknown，
+  不是 receipt，不允許 recovery、解除 admission 或證明 cleanup；不另啟 writer、
+  不增加 deadline，寫入失敗仍退出 125。Partial／無效 JSON 不可採信；同步
+  filesystem syscall 不保證在原期限內回傳。
 - Merge workflow 的 checkout、merge、failure recovery 與 task branch deletion
   統一由 canonical process owner 管理 Git hooks。包括已合併 task 的 cleanup
   都需要 repository-local `.venv`；缺少時先執行 `scripts/rebuild-env.sh`。

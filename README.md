@@ -482,6 +482,15 @@ The diagnostic launcher shares the workflow's tracked PID, signal handoff and
 cleanup-receipt checks.
 Missing diagnostic cleanup proof retains the candidate and owner files and
 stops both further diagnostics and Git recovery.
+At the three ownership-error exits in the merge command, workflow diagnostic and
+outer launcher, the same process attempts to preserve bounded exception, cause,
+context and notes in `cleanup-N.failure.json` (at most 64 KiB). This sidecar has
+`authoritative=false` and `cleanup_state=unknown`; it is not a cleanup receipt and
+cannot authorize recovery, release admission or prove cleanup. It starts no writer
+and receives no new deadline. Write failure still returns 125, and partial or invalid
+JSON must not be trusted. Synchronous filesystem calls have no guaranteed return
+time within the original budget. This diagnostic does not repair or establish the
+cause of an ownership failure.
 Preflight messages before an owner exists retain normal stdio behavior; no Git
 mutation or owned child has started at that point.
 A failed abort prevents the recovery checkout; recovery never rolls back an

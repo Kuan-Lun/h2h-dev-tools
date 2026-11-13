@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import runpy
 import sys
@@ -27,6 +28,103 @@ REVIEW_OWNER_ENVIRONMENT = (
 )
 RECOVERY_TIMEOUT_SECONDS = 10.0
 RECOVERY_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024
+OWNERSHIP_FAILURE_LIMIT_BYTES = 64 * 1024
+
+
+def _ownership_failure_payload(error: BaseException, *, boundary: str) -> bytes:
+    """Describe retained exceptions without source, locals, or owner inspection."""
+    truncated = False
+
+    def text(value: str, limit: int) -> str:
+        nonlocal truncated
+        # Count escaped JSON bytes, including quotes; slicing first also bounds
+        # encoding work for an unusually large message or note.
+        low, high = 0, min(len(value), limit)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if len(json.dumps(value[:middle], ensure_ascii=True)) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        truncated |= low < len(value)
+        return value[:low]
+
+    pending = [error]
+    identities = {id(error): 0}
+
+    def reference(related: BaseException | None) -> int | str | None:
+        nonlocal truncated
+        if related is None:
+            return None
+        if id(related) in identities:
+            return identities[id(related)]
+        if len(pending) == 8:
+            truncated = True
+            return "omitted"
+        identities[id(related)] = len(pending)
+        pending.append(related)
+        return identities[id(related)]
+
+    exceptions: list[dict[str, object]] = []
+    for current in pending:
+        notes = getattr(current, "__notes__", ())
+        if not isinstance(notes, (list, tuple)):
+            notes = ()
+            truncated = True
+        truncated |= len(notes) > 8
+        exceptions.append(
+            {
+                "type": text(
+                    f"{type(current).__module__}.{type(current).__qualname__}", 256
+                ),
+                "message": text(str(current), 2048),
+                "notes": [text(note, 512) for note in notes[:8]],
+                "cause": reference(current.__cause__),
+                "context": reference(
+                    None if current.__suppress_context__ else current.__context__
+                ),
+                "context_suppressed": current.__suppress_context__,
+            }
+        )
+    document = {
+        "schema": 1,
+        "kind": "merge-owner-failure-diagnostic",
+        "authoritative": False,
+        "exit_code": 125,
+        "cleanup_state": "unknown",
+        "boundary": text(boundary, 128),
+        "exceptions": exceptions,
+        "truncated": truncated,
+    }
+    payload = (
+        json.dumps(document, ensure_ascii=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    if len(payload) > OWNERSHIP_FAILURE_LIMIT_BYTES:
+        raise ValueError("Ownership failure diagnostic exceeds its byte limit")
+    return payload
+
+
+def _record_ownership_failure(
+    receipt: Path, error: BaseException, *, boundary: str
+) -> None:
+    """Best-effort terminal metadata, never a cleanup receipt or a new writer.
+
+    A single write may fail or be partial; readers must reject invalid JSON.
+    No retry, fsync, new deadline or process is admitted. Like other filesystem
+    metadata operations, this does not guarantee syscall completion by a deadline.
+    """
+    try:
+        payload = _ownership_failure_payload(error, boundary=boundary)
+        destination = receipt.with_name(receipt.name + ".failure.json")
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+    except Exception:
+        # Optional diagnostics cannot replace the original ownership failure or
+        # admit fallback output after cleanup has become unknown.
+        pass
 
 
 def without_review_owner(environment: Mapping[str, str]) -> dict[str, str]:
@@ -297,7 +395,16 @@ def _execute(
                 deadline=recovery_deadline,
             )
             _write_cleanup_receipt(receipt)
-    except process.ProcessOwnershipError:
+    except process.ProcessOwnershipError as error:
+        _record_ownership_failure(
+            receipt,
+            error,
+            boundary="execute.review"
+            if review
+            else "execute.recovery"
+            if recovery
+            else "execute.git",
+        )
         return process.TERMINATION_FAILED_EXIT_CODE
     except (KeyboardInterrupt, process.RunnerSignalInterrupt) as error:
         if not review:
@@ -366,7 +473,12 @@ def _workflow_diagnostic(
             process.report_diagnostic(
                 message if completion else f"git-flow-merge: {message}"
             )
-    except process.ProcessOwnershipError:
+    except process.ProcessOwnershipError as error:
+        _record_ownership_failure(
+            receipt,
+            error,
+            boundary="workflow.completion" if completion else "workflow.diagnostic",
+        )
         return process.TERMINATION_FAILED_EXIT_CODE
     _write_cleanup_receipt(receipt)
     return 0
@@ -423,7 +535,8 @@ def main() -> int:
                 receipt=arguments.cleanup_receipt,
                 release_workflow=arguments.release_workflow,
             )
-        except process.ProcessOwnershipError:
+        except process.ProcessOwnershipError as error:
+            _record_ownership_failure(arguments.cleanup_receipt, error, boundary="main")
             return process.TERMINATION_FAILED_EXIT_CODE
         except OSError:
             # Receipt/publication I/O can fail after the owned command and its
