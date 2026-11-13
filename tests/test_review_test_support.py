@@ -24,7 +24,9 @@ def _assignment() -> dict[str, Any]:
         "plan_digest": "a" * 64,
         "shard_id": "shard-0000",
         "response_limits": review_plan.response_limits(integration=True),
-        "units": [{"id": "unit-a", "related_paths": ["decode.py"]}],
+        "units": [
+            {"id": "unit-a", "related_paths": ["decode.py"], "correspondences": []}
+        ],
         "integration_obligations": ["cross-module-contract"],
     }
 
@@ -51,6 +53,7 @@ def test_response_preserves_the_assignment_and_marks_synthetic_output() -> None:
                 "unit_id": "unit-a",
                 "method": "Synthetic fixture response; no code review performed.",
                 "related_paths": ["decode.py"],
+                "correspondence_ids": [],
             }
         ],
         "integration_reviews": [
@@ -90,7 +93,7 @@ def test_responses_satisfy_real_coverage_but_faults_remain_rejected(
         for index, path in enumerate(("AGENTS.md", source_path))
     )
     plan = review_plan.Plan(
-        target={},
+        target={"tree": "candidate"},
         scope={},
         inventory=tuple({"path": unit.path} for unit in units),
         units=units,

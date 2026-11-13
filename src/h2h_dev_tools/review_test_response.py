@@ -102,6 +102,7 @@ def synthetic_review_response(prompt: str) -> dict[str, object]:
                 "related_paths": _texts(
                     unit.get("related_paths"), allow_whitespace=True
                 ),
+                "correspondence_ids": _texts(unit.get("correspondences")),
             }
         )
     if (shard == "integration" and (reviews or not obligations)) or (
@@ -119,7 +120,26 @@ def synthetic_review_response(prompt: str) -> dict[str, object]:
             {
                 "obligation": obligation,
                 "analysis": text,
-                "source_paths": ["AGENTS.md"],
+                "source_paths": (
+                    list(
+                        dict.fromkeys(
+                            [relation["artifact"]["path"]]
+                            + [source["path"] for source in relation["sources"]]
+                        )
+                    )
+                    if (
+                        relation := next(
+                            (
+                                item
+                                for item in assignment.get("correspondences", [])
+                                if obligation == f"artifact-correspondence:{item['id']}"
+                            ),
+                            None,
+                        )
+                    )
+                    is not None
+                    else ["AGENTS.md"]
+                ),
             }
             for obligation in obligations
         ],

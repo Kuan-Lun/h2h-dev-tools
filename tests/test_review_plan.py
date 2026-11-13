@@ -101,7 +101,7 @@ def test_text_ranges_and_shards_cover_exact_utf8_bytes(repository: Path) -> None
     assert "".join(plan.payloads[unit.id] for unit in selected).encode() == data
     assert len(plan.shards) > 1
     assert all(
-        len(planning.canonical(plan.assignment(i))) < planning.SHARD_BYTES + 4096
+        len(planning.wire(plan.assignment(i))) <= planning.SHARD_BYTES
         for i in range(len(plan.shards))
     )
 
@@ -123,10 +123,11 @@ def test_deleted_binary_uses_parent_declaration_and_related_source(
     plan = _plan(repository, base=base)
     old = next(unit for unit in plan.units if unit.path == "data.bin")
     assert old.origin == base
-    assert old.related_paths == ("decode.py",)
-    assert plan.historical_related[0]["blob"] == _git(
-        repository, "rev-parse", f"{base}:decode.py"
-    )
+    assert old.correspondences
+    assert plan.correspondences[0]["declaration"]["related-paths"] == ["decode.py"]
+    assert next(
+        entry for entry in plan.historical_related if entry["path"] == "decode.py"
+    )["blob"] == _git(repository, "rev-parse", f"{base}:decode.py")
     if rename:
         new = next(unit for unit in plan.units if unit.path == "renamed.bin")
         assert old.blob == new.blob and old.origin != new.origin
@@ -244,6 +245,9 @@ def _passing(plan: planning.Plan, index: int) -> dict[str, Any]:
         "unit_reviews": [
             {
                 "unit_id": key,
+                "correspondence_ids": list(
+                    next(unit for unit in plan.units if unit.id == key).correspondences
+                ),
                 "method": "Fixture method.",
                 "related_paths": list(
                     next(unit for unit in plan.units if unit.id == key).related_paths
@@ -255,9 +259,9 @@ def _passing(plan: planning.Plan, index: int) -> dict[str, Any]:
             {
                 "obligation": key,
                 "analysis": "Fixture analysis.",
-                "source_paths": ["AGENTS.md"],
+                "source_paths": list(plan.source_paths),
             }
-            for key in planning.INTEGRATION_OBLIGATIONS
+            for key in plan.integration_obligations
         ]
         if len(plan.shards) == 1
         else [],
@@ -508,11 +512,20 @@ def test_large_plan_preflights_full_handoff_wire_budget_and_coverage_map(
         == plan.integration_max_bytes
         <= planning.MAX_INTEGRATION_BYTES
     )
-    assert len(assignment["coverage_map"]) == len(plan.units)
-    for unit, entry in zip(plan.units, assignment["coverage_map"], strict=True):
-        assert entry == {
-            key: getattr(unit, key)
-            for key in ("id", "path", "origin", "member", "kind", "start", "end")
+    mapping = assignment["coverage_map"]
+    assert len(mapping["rows"]) == len(plan.units)
+    inventory = assignment["inventory"] + assignment["historical_related"]
+    for unit, row in zip(plan.units, mapping["rows"], strict=True):
+        entry = dict(zip(mapping["columns"], row, strict=True))
+        source = inventory[entry["source"]]
+        assert source["path"] == unit.path
+        assert source["blob"] == unit.blob
+        assert source["mode"] == unit.mode
+        assert source.get("origin", assignment["candidate_tree"]) == unit.origin
+        assert {
+            key: entry[key] for key in ("id", "member", "kind", "start", "end")
+        } == {
+            key: getattr(unit, key) for key in ("id", "member", "kind", "start", "end")
         }
     assert assignment["historical_related"] == list(plan.historical_related)
     assert [handoff["contracts"] for handoff in assignment["handoffs"]] == [
@@ -606,7 +619,8 @@ def test_gzip_binary_fixture_retains_explicit_decoder_contract(
     plan = _plan(repository)
     units = [unit for unit in plan.units if unit.path == "data.bin"]
     assert {unit.kind for unit in units} == {"binary-contract"}
-    assert all(unit.related_paths == ("decode.py",) for unit in units)
+    assert all(unit.correspondences for unit in units)
+    assert plan.correspondences[0]["declaration"]["related-paths"] == ["decode.py"]
 
 
 @pytest.mark.parametrize(
@@ -675,9 +689,7 @@ def test_changed_related_source_reexamines_unchanged_binary(repository: Path) ->
     (repository / "decode.py").write_text("value = 2\n")
     plan = _plan(repository, base=base)
     assert {unit.path for unit in plan.units} == {"data.bin", "decode.py"}
-    assert next(
-        unit for unit in plan.units if unit.path == "data.bin"
-    ).related_paths == ("decode.py",)
+    assert next(unit for unit in plan.units if unit.path == "data.bin").correspondences
 
 
 def test_unrelated_project_metadata_does_not_reassign_unchanged_binary(
@@ -1285,7 +1297,10 @@ def _maximum_response(plan: planning.Plan, index: int | None) -> dict[str, Any]:
         "unit_reviews": [
             {
                 "unit_id": unit.id,
-                "method": "\x01" * limits["unit_method_utf8_bytes"],
+                "correspondence_ids": list(unit.correspondences),
+                "method": ("\x01" * 170 + "xx")
+                if unit.correspondences
+                else "\x01" * planning.method_limit(unit),
                 "related_paths": list(unit.related_paths),
             }
             for unit in plan.units
@@ -1297,7 +1312,7 @@ def _maximum_response(plan: planning.Plan, index: int | None) -> dict[str, Any]:
                 "analysis": "\x01" * limits["integration_analysis_utf8_bytes"],
                 "source_paths": list(plan.source_paths),
             }
-            for obligation in planning.INTEGRATION_OBLIGATIONS
+            for obligation in plan.integration_obligations
         ]
         if index is None or len(plan.shards) == 1
         else [],
@@ -1328,7 +1343,7 @@ def _many_related_sources(repository: Path, *, escaped: bool) -> list[str]:
 
 
 @pytest.mark.parametrize("escaped", [False, True])
-def test_response_planning_reserves_all_repeated_artifact_sources_and_text(
+def test_response_planning_reserves_distributed_correspondence_and_text(
     repository: Path, escaped: bool
 ) -> None:
     related = _many_related_sources(repository, escaped=escaped)
@@ -1337,7 +1352,7 @@ def test_response_planning_reserves_all_repeated_artifact_sources_and_text(
     artifact_units = {unit.id for unit in plan.units if unit.path == "data.bin"}
     assert len(plan.shards) > 1
     # The former input-only planner assigned 24 such units to its first shard.
-    assert max(len(set(shard) & artifact_units) for shard in plan.shards) < 24
+    assert all(len(shard) <= planning.SHARD_UNITS for shard in plan.shards)
     assert len(artifact_units) == 31  # Archive inventory and all 30 embedded sources.
     # The old input-only first shard contained 24 artifact units. Their mandatory
     # path lists alone exceeded its 256 KiB raw output cap, even without prose.
@@ -1357,15 +1372,22 @@ def test_response_planning_reserves_all_repeated_artifact_sources_and_text(
         )
         for review in result["unit_reviews"]:
             if review["unit_id"] in artifact_units:
-                assert review["related_paths"] == related
+                assert review["related_paths"] == []
         assignment = (
-            plan.integration_assignment([[] for _ in plan.shards])
+            plan.integration_assignment(
+                [[] for _ in plan.shards],
+                {
+                    unit.id: "Fixture correspondence method."
+                    for unit in plan.units
+                    if unit.correspondences
+                },
+            )
             if index is None
             else plan.assignment(index)
         )
         assert assignment["response_limits"] == plan.response_limits(index)
         assignment["integration_obligations"] = (
-            list(planning.INTEGRATION_OBLIGATIONS) if index is None else []
+            list(plan.integration_obligations) if index is None else []
         )
         synthetic = review_test_response.synthetic_review_response(
             review_test_response.ASSIGNMENT_MARKER
@@ -1415,7 +1437,7 @@ def test_single_unit_without_full_response_capacity_fails_before_review(
 ) -> None:
     _many_related_sources(repository, escaped=False)
     # A smaller declared cap isolates the one-unit boundary without huge fixtures.
-    monkeypatch.setattr(planning, "SHARD_RESULT_BYTES", 80 * 1024)
+    monkeypatch.setattr(planning, "SHARD_RESULT_BYTES", 50 * 1024)
     with pytest.raises(planning.PlanError, match="single review unit"):
         _plan(repository)
 
@@ -1563,3 +1585,238 @@ def test_unknown_source_citations_remain_rejected_with_specific_diagnostics(
     # No normalization, omission or mutation may turn a rejected citation into
     # accepted candidate coverage.
     assert entries[0][field] == [reference]
+
+
+def test_large_related_source_is_owned_once_by_exact_source_ranges(
+    repository: Path,
+) -> None:
+    _declare(repository, role="generated")
+    data = ("schema_entry = '來源契約'\n" * 50000).encode()
+    (repository / "decode.py").write_bytes(data)
+    (repository / "data.bin").write_bytes(b"\0generated")
+    plan = _plan(repository)
+    planning.validate_plan(plan.document())
+    relation = plan.correspondences[0]
+    sources = [unit for unit in plan.units if unit.id in relation["source_units"]]
+    assert len(sources) > 1
+    assert b"".join(plan.payloads[unit.id].encode() for unit in sources) == data
+    assert {unit.path for unit in sources} == {"decode.py"}
+    assert all(unit.correspondences == (relation["id"],) for unit in sources)
+    assert sum(unit.end - unit.start for unit in sources) == len(data)
+    artifact = next(unit for unit in plan.units if unit.path == "data.bin")
+    assert artifact.related_paths == ()
+    assert len(plan.shards) > 1
+    assert all(
+        len(planning.wire(plan.assignment(index))) <= planning.SHARD_BYTES
+        for index in range(len(plan.shards))
+    )
+    methods = {
+        unit.id: "Reviewed the full assigned range and its generation contract."
+        for unit in plan.units
+        if unit.correspondences
+    }
+    integration = plan.integration_assignment([[] for _ in plan.shards], methods)
+    assert integration["correspondence_methods"] == methods
+    assert (
+        len(planning.wire(integration))
+        <= plan.integration_max_bytes
+        <= planning.MAX_INTEGRATION_BYTES
+    )
+    unit_map = {unit.id: unit for unit in plan.units}
+    for boundary in integration["correspondence_boundaries"]:
+        unit = unit_map[boundary["unit_id"]]
+        raw = plan.payloads[unit.id].encode()
+        start, end = boundary["start"] - unit.start, boundary["end"] - unit.start
+        assert boundary["content"].encode() == raw[start:end]
+        assert len(boundary["content"].encode()) <= 2 * planning.BOUNDARY_BYTES
+    assert sum(
+        len(item["content"].encode())
+        for item in integration["correspondence_boundaries"]
+    ) < len(data)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing",
+        "duplicate",
+        "wrong-target",
+        "wrong-origin",
+        "wrong-blob",
+        "missing-responsibility",
+        "short-range",
+    ],
+)
+def test_correspondence_graph_rejects_incomplete_source_ownership(
+    repository: Path, corruption: str
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "decode.py").write_text("value = 1\n" * 10000)
+    (repository / "data.bin").write_bytes(b"\0generated")
+    document = _plan(repository).document()
+    relation = document["correspondences"][0]
+    key = relation["source_units"][0]
+    unit = next(unit for unit in document["units"] if unit["id"] == key)
+    if corruption == "missing":
+        relation["source_units"].pop()
+    elif corruption == "duplicate":
+        relation["source_units"].append(key)
+    elif corruption == "wrong-target":
+        relation["source_units"][0] = relation["artifact_units"][0]
+    elif corruption == "wrong-origin":
+        relation["sources"][0]["origin"] = "wrong"
+    elif corruption == "wrong-blob":
+        relation["sources"][0]["blob"] = "wrong"
+    elif corruption == "missing-responsibility":
+        unit["correspondences"] = []
+    else:
+        unit["end"] -= 1
+    with pytest.raises(planning.PlanError):
+        planning.validate_plan(document)
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing", "unknown", "utf8-limit", "wire-limit"]
+)
+def test_correspondence_handoff_is_complete_and_never_truncated(
+    repository: Path, corruption: str
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "data.bin").write_bytes(b"\0generated")
+    plan = _plan(repository)
+    methods = {
+        unit.id: "Complete semantic source review."
+        for unit in plan.units
+        if unit.correspondences
+    }
+    key = next(iter(methods))
+    if corruption == "missing":
+        methods.pop(key)
+    elif corruption == "unknown":
+        methods["unknown"] = methods.pop(key)
+    elif corruption == "utf8-limit":
+        methods[key] = "x" * (planning.CORRESPONDENCE_METHOD_UTF8_BYTES + 1)
+    else:
+        methods[key] = "\x01" * 171
+    with pytest.raises(planning.PlanError, match="correspondence handoff"):
+        plan.integration_assignment([[] for _ in plan.shards], methods)
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing-obligation", "missing-path", "oversize-method"]
+)
+def test_correspondence_attestations_require_integration_and_bounded_semantics(
+    repository: Path, corruption: str
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "data.bin").write_bytes(b"\0generated")
+    plan = _plan(repository)
+    assert len(plan.shards) == 1
+    result = _passing(plan, 0)
+    coverage.validate_attestation(result, plan, 0)
+    if corruption == "missing-obligation":
+        result["integration_reviews"].pop()
+    elif corruption == "missing-path":
+        result["integration_reviews"][-1]["source_paths"] = ["data.bin"]
+    else:
+        key = next(unit.id for unit in plan.units if unit.correspondences)
+        next(item for item in result["unit_reviews"] if item["unit_id"] == key)[
+            "method"
+        ] = "\x01" * 171
+    with pytest.raises(planning.PlanError):
+        coverage.validate_attestation(result, plan, 0)
+
+
+def test_deleted_artifact_correspondence_retains_old_and_new_source_bytes(
+    repository: Path,
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "data.bin").write_bytes(b"\0generated")
+    old = (repository / "decode.py").read_bytes()
+    base = _commit(repository)
+    (repository / "data.bin").unlink()
+    (repository / "pyproject.toml").unlink()
+    (repository / "decode.py").write_text("value = 2\n")
+    plan = _plan(repository, base=base)
+    planning.validate_plan(plan.document())
+    relation = plan.correspondences[0]
+    old_units = [unit for unit in plan.units if unit.id in relation["source_units"]]
+    assert old_units and all(unit.origin == base for unit in old_units)
+    assert b"".join(plan.payloads[unit.id].encode() for unit in old_units) == old
+    current = [
+        unit
+        for unit in plan.units
+        if unit.path == "decode.py" and unit.origin == plan.target["tree"]
+    ]
+    assert len(current) == 1 and plan.payloads[current[0].id] == "value = 2\n"
+    assert not current[0].correspondences
+
+
+def test_changed_artifact_adds_unchanged_related_sources_to_incremental_scope(
+    repository: Path,
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "data.bin").write_bytes(b"\0old")
+    base = _commit(repository)
+    (repository / "data.bin").write_bytes(b"\0new")
+    plan = _plan(repository, base=base)
+    planning.validate_plan(plan.document())
+    assert {unit.path for unit in plan.units} == {"data.bin", "decode.py"}
+    assert plan.correspondences[0]["source_units"]
+
+
+def test_correspondence_integration_worst_wire_budget_includes_every_raw_boundary(
+    repository: Path,
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "decode.py").write_text("value = '完整來源'\n" * 30000)
+    (repository / "data.bin").write_bytes(b"\0generated")
+    plan = _plan(repository)
+    assert len(plan.shards) > 1
+    method = "\x01" * 170 + "xx"
+    assert len(planning.wire(method)) == planning.CORRESPONDENCE_METHOD_WIRE_BYTES
+    methods = {unit.id: method for unit in plan.units if unit.correspondences}
+    contracts = _fill_handoff(plan.handoff_budget, escaped=True)
+    assignment = plan.integration_assignment([contracts for _ in plan.shards], methods)
+    assert len(planning.wire(assignment)) == plan.integration_max_bytes
+    assert plan.integration_max_bytes <= planning.MAX_INTEGRATION_BYTES
+    assert assignment["correspondence_methods"] == methods
+    assert assignment["correspondence_boundaries"] == plan.correspondence_boundaries()
+    assert len(assignment["coverage_map"]["rows"]) == len(plan.units)
+
+
+def test_correspondence_metadata_is_bounded_before_reading_source_payloads(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _many_related_sources(repository, escaped=False)
+    monkeypatch.setattr(planning, "MAX_UNIT_METADATA_BYTES", 4096)
+
+    def no_payload_read(*args: Any, **kwargs: Any) -> dict[str, bytes]:
+        raise AssertionError(
+            "Relationship metadata must be rejected before blob admission"
+        )
+
+    monkeypatch.setattr(planning, "_blobs", no_payload_read)
+    with pytest.raises(planning.PlanError, match="Correspondence metadata"):
+        _plan(repository)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "duplicate", "wrong-target"])
+def test_unit_explicitly_attests_every_correspondence_responsibility(
+    repository: Path,
+    corruption: str,
+) -> None:
+    _declare(repository, role="generated")
+    (repository / "data.bin").write_bytes(b"\0generated")
+    plan = _plan(repository)
+    result = _passing(plan, 0)
+    review = next(item for item in result["unit_reviews"] if item["correspondence_ids"])
+    if corruption == "missing":
+        review["correspondence_ids"].clear()
+    elif corruption == "duplicate":
+        review["correspondence_ids"] *= 2
+    else:
+        review["correspondence_ids"] = ["wrong-target"]
+    with pytest.raises(planning.PlanError, match="correspondence attestation"):
+        coverage.validate_attestation(result, plan, 0)
