@@ -29,7 +29,8 @@ from h2h_dev_tools import (
 from h2h_dev_tools.executable_fixture import write_python_executable
 
 _ROOT = Path(__file__).resolve().parents[1]
-_REVIEWER = """import runpy
+_REVIEWER = """import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +48,7 @@ mode = sys.argv[1]
 with (directory / "fixture-review-events").open("a") as events:
     events.write(mode + "\\n")
 if mode == "run" and (directory / "reject-review").exists():
-    raise SystemExit(1)
+    os.environ["H2H_FIXTURE_REVIEW_FINDINGS"] = "1"
 main(root)
 """
 
@@ -56,6 +57,12 @@ _PASS_REVIEW = (
     review_test_support.synthetic_review_response_source()
     + """
 result = synthetic_review_response(prompt)
+if __import__("os").environ.get("H2H_FIXTURE_REVIEW_FINDINGS") == "1":
+    result["verdict"] = "changes_requested"
+    result["findings"] = [{
+        "priority": 2, "title": "Fixture defect", "body": "Completed review finding",
+        "file": "README.md", "line_start": 1, "line_end": 1,
+    }]
 output.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 """
 )
@@ -1294,6 +1301,11 @@ def test_review_failure_aborts_merge_and_preserves_task(
     assert not (root / ".git/MERGE_HEAD").exists()
     expected = "run\n" if failure == "review" else "run\nverify\nverify\n"
     assert (root / ".git/fixture-review-events").read_text() == expected
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert not list((root / ".git/h2h-review/locks").glob("*.unproven.json"))
+    if failure == "review":
+        assert "Completed review finding" in result.stderr
+        assert not list((root / ".git/h2h-review/receipts").glob("*.json"))
 
 
 def test_documentation_merge_does_not_run_or_verify_review(tmp_path: Path) -> None:
@@ -1330,11 +1342,12 @@ def test_full_review_success_without_pending_evidence_is_rejected(
         timeout=15,
     )
     assert result.returncode != 0, result.stdout + result.stderr
-    assert "No valid code review" in result.stderr
     assert not (root / ".git/fixture-gate").exists()
-    assert not (root / ".git/MERGE_HEAD").exists()
+    assert (root / ".git/MERGE_HEAD").exists()
+    assert (root / ".git/h2h-merge-workflow.lock").is_dir()
+    assert list((root / ".git/h2h-review/locks").glob("*.unproven.json"))
     assert git(root, "rev-parse", "master") == base
-    assert git(root, "branch", "--show-current") == "task"
+    assert git(root, "branch", "--show-current") == "master"
 
 
 def test_missing_environment_leaves_task_checkout_and_primary_untouched(
@@ -1952,6 +1965,8 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True)
+    receipts = tmp_path / "registered-review-receipts"
+    record_workflow_receipts(root, receipts)
     (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
     (root / "AGENTS.md").write_text("# Review policy\n\nReport concrete defects.\n")
     shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
@@ -2053,7 +2068,12 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
         assert (result.returncode == 0) is not surviving_child, (
             result.stdout + result.stderr
         )
-        assert not (root / ".git/MERGE_HEAD").exists()
+        assert (root / ".git/MERGE_HEAD").exists() is surviving_child
+        assert (root / ".git/h2h-merge-workflow.lock").exists() is surviving_child
+        assert (
+            bool(list((root / ".git/h2h-review/locks").glob("*.unproven.json")))
+            is surviving_child
+        )
         observed_groups = list(groups.iterdir())
         assert bool(observed_groups) is surviving_child
         for group_file in observed_groups:
@@ -2064,10 +2084,17 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
             assert git(root, "rev-parse", "master") == base
             assert git(root, "rev-parse", "task") == task
             assert not (root / ".git/fixture-gate").exists()
-            # Recreating the exact failed candidate must not resurrect a passing
-            # result written before its outer process owner rejected the stage.
-            git(root, "switch", "master")
-            git(root, "merge", "--no-ff", "--no-commit", "task")
+            recorded = [line.split("\t") for line in receipts.read_text().splitlines()]
+            review_receipts = [
+                Path(path) for kind, path in recorded if kind == "review"
+            ]
+            assert len(review_receipts) == 1
+            assert not review_receipts[0].exists()
+            # The exact candidate stays staged. Native group cleanup does not
+            # supply the missing normal tool/helper completion assertion.
+            assert git(root, "branch", "--show-current") == "master"
+            assert git(root, "rev-parse", "MERGE_HEAD") == task
+            assert not list((root / ".git/h2h-review/receipts").glob("*.json"))
             verification = subprocess.run(
                 (sys.executable, "scripts/review-code.py", "verify", "--index"),
                 cwd=root,
@@ -2076,7 +2103,7 @@ def test_passing_managed_review_requires_an_empty_stage_before_commit(
                 check=False,
             )
             assert verification.returncode != 0, verification.stdout
-            git(root, "merge", "--abort")
+            assert verification.returncode == process.TERMINATION_FAILED_EXIT_CODE
         else:
             assert git(root, "show", "-s", "--format=%P", "master").split() == [
                 base,
@@ -2114,29 +2141,32 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
 ) -> None:
     root = tmp_path / "repository"
     base = fixture_repository(root, succeeds=True)
+    receipts = tmp_path / "registered-review-receipts"
+    record_workflow_receipts(root, receipts)
     (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
     shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
     owner = root / "src/h2h_dev_tools/merge_command.py"
     injection = (
-        "original_run_owned = _run_owned\n"
-        "def _run_owned(phase, **kwargs):\n"
-        "    status = original_run_owned(phase, **kwargs)\n"
-        "    if phase.label == 'Code review':\n"
-        "        import time as hold_clock\n"
-        "        state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
-        "        (state / 'ready').touch()\n"
-        "        while not (state / 'release').exists():\n"
-        "            hold_clock.sleep(0.01)\n"
-        f"        if {owner_result!r} == 'crash':\n"
-        "            os._exit(1)\n"
-        f"        if {owner_result!r} == 'corrupt':\n"
-        "            Path(phase.environment['H2H_REVIEW_PENDING_RECEIPT']).write_text('{}')\n"
-        "    return status\n\n"
+        "import time as hold_clock\n"
+        "state = Path(os.environ['REVIEW_OWNER_STATE'])\n"
+        "(state / 'ready').touch()\n"
+        "while not (state / 'release').exists():\n"
+        "    hold_clock.sleep(0.01)\n"
+        f"if {owner_result!r} == 'crash':\n"
+        "    os._exit(1)\n"
+        f"if {owner_result!r} == 'corrupt':\n"
+        "    Path(environment['H2H_REVIEW_PENDING_RECEIPT']).write_text('{}')\n"
     )
     source = owner.read_text()
-    anchor = 'if __name__ == "__main__":'
+    # The actual process.run_command has returned and proved managed cleanup;
+    # neither substitute its status nor skip the subsequent terminal handshake.
+    anchor = "                    _require_review_completion(\n"
     assert source.count(anchor) == 1
-    source = source.replace(anchor, injection + anchor)
+    source = source.replace(
+        anchor,
+        "".join(" " * 20 + line for line in injection.splitlines(keepends=True))
+        + anchor,
+    )
     compile(source, str(owner), "exec")
     owner.write_text(source)
     git(root, "add", ".")
@@ -2208,16 +2238,19 @@ def test_managed_review_lock_covers_cleanup_and_evidence_publication(
             else:
                 assert git(root, "rev-parse", "master") == base
                 assert git(root, "branch", "--list", "task")
-                if owner_result == "corrupt":
-                    assert not (root / ".git/MERGE_HEAD").exists()
-                    git(root, "switch", "master")
-                    git(root, "merge", "--no-ff", "--no-commit", "task")
-                else:
-                    assert (root / ".git/MERGE_HEAD").exists()
-                    assert (
-                        "git-flow-merge: process cleanup unproven"
-                        not in (state / "output").read_text()
-                    )
+                assert (root / ".git/MERGE_HEAD").exists()
+                assert (root / ".git/h2h-merge-workflow.lock").is_dir()
+                recorded = [
+                    line.split("\t") for line in receipts.read_text().splitlines()
+                ]
+                review_receipts = [
+                    Path(path) for kind, path in recorded if kind == "review"
+                ]
+                assert len(review_receipts) == 1
+                assert not review_receipts[0].exists()
+                assert list((root / ".git/h2h-review/locks").glob("*.unproven.json"))
+                assert git(root, "branch", "--show-current") == "master"
+                assert not list((root / ".git/h2h-review/receipts").glob("*.json"))
                 verify_arguments = ("--index",)
             verification = subprocess.run(
                 (sys.executable, "scripts/review-code.py", "verify", *verify_arguments),
@@ -2316,6 +2349,8 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
     base = fixture_repository(root, succeeds=True)
     state = tmp_path / "state"
     state.mkdir()
+    receipts = state / "registered-receipts"
+    record_workflow_receipts(root, receipts)
     (root / ".gitignore").write_text(".venv/\n__pycache__/\n")
     (root / "AGENTS.md").write_text("# Review policy\n\nReport concrete defects.\n")
     shutil.copy2(_ROOT / "scripts/review-code.py", root / "scripts/review-code.py")
@@ -2461,21 +2496,43 @@ def test_merge_review_stage_owns_preflight_and_crashed_reviewer_descendants(
                 assert wrapper.returncode == 143
             # Wrapper exit and released locks cannot discharge nested obligations.
             # The canonical outer owner must prove cleanup before fixture rescue.
+            retained_review = stage != "classifier"
             _assert_interrupted_workflow_cleanup(
-                owner, (state / "output").read_text(), deadline=cleanup_deadline
+                owner,
+                (state / "output").read_text(),
+                deadline=cleanup_deadline,
+                review_completion_unproven=retained_review,
             )
             with pytest.raises(ProcessLookupError):
                 os.killpg(int((state / "group").read_text()), 0)
             clean = True
             _assert_gate_lock_released(state / "leader-lock")
             _assert_gate_lock_released(state / "child-lock")
-            assert not (root / ".git/MERGE_HEAD").exists()
+            assert (root / ".git/MERGE_HEAD").exists() is retained_review
             assert git(root, "rev-parse", "master") == base
             assert git(root, "rev-parse", "task") == task
-            assert git(root, "branch", "--show-current") == "task"
-            if piped_output:
-                assert (state / "restore-hook-ran").exists()
-            assert git(root, "status", "--porcelain") == ""
+            assert git(root, "branch", "--show-current") == (
+                "master" if retained_review else "task"
+            )
+            assert (root / ".git/h2h-merge-workflow.lock").exists() is retained_review
+            assert (
+                bool(list((root / ".git/h2h-review/locks").glob("*.unproven.json")))
+                is retained_review
+            )
+            assert not list((root / ".git/h2h-review/receipts").glob("*.json"))
+            recorded = [line.split("\t") for line in receipts.read_text().splitlines()]
+            review_receipts = [
+                Path(path) for kind, path in recorded if kind == "review"
+            ]
+            assert len(review_receipts) == 1
+            if retained_review:
+                # Even a version-stage cancellation has no terminal not-started
+                # record: the parent cannot infer progress from the fixture label.
+                assert git(root, "rev-parse", "MERGE_HEAD") == task
+                assert not review_receipts[0].exists()
+                assert not (state / "restore-hook-ran").exists()
+            else:
+                assert git(root, "status", "--porcelain") == ""
         finally:
             if owner is not None and not clean:
                 # Rescue cannot turn unknown cleanup into a passing assertion.
@@ -2495,9 +2552,11 @@ def _assert_interrupted_workflow_cleanup(
     *,
     deadline: float,
     poll_deadline: float | None = None,
+    review_completion_unproven: bool = False,
 ) -> None:
-    assert "process cleanup unproven" not in output, output
-    assert "cleanup could not be proven" not in output, output
+    if not review_completion_unproven:
+        assert "process cleanup unproven" not in output, output
+        assert "cleanup could not be proven" not in output, output
     assert process.wait_for_owned_tree_exit(
         owner, deadline=deadline, poll_deadline=poll_deadline
     ), output
@@ -3369,7 +3428,7 @@ def test_interruption_fixtures_clean_owner_when_deferred_launch_raises(
                     tmp_path, "ordinary", "write"
                 )
             else:
-                test_cancel_merge_during_receipt_publication_restores_task(
+                test_cancel_merge_during_receipt_publication_honors_completion_boundary(
                     tmp_path, fixture.removeprefix("publication-")
                 )
         if signal_number == signal.SIGINT:
@@ -4374,7 +4433,33 @@ def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: int
 ) -> None:
     root = tmp_path / "repository"
-    fixture_repository(root, succeeds=True)
+    base = fixture_repository(root, succeeds=True)
+    preflight_boundary = tmp_path / "expired-before-review-admission"
+    if timeout == 1:
+        # Pin the tiny-budget oracle to known pre-admission work. Otherwise host
+        # speed decides whether metadata expires before the marker or reaches the
+        # managed runner, whose missing terminal record must conservatively retain.
+        # Consume the original deadline without starting a reviewer or extending it.
+        owner_source = root / "src/h2h_dev_tools/merge_command.py"
+        anchor = (
+            "    with review_execution.within_deadline(deadline):\n"
+            "        target = reviewer._target(index=True)\n"
+        )
+        source = owner_source.read_text()
+        assert source.count(anchor) == 1
+        hold = (
+            "    with review_execution.within_deadline(deadline):\n"
+            f"        Path({str(preflight_boundary)!r}).write_text(str(deadline))\n"
+            "        while time.monotonic() < deadline:\n"
+            "            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))\n"
+            "        review_execution.remaining()\n"
+            "        raise AssertionError('expired pre-admission deadline was ignored')\n"
+            "        target = reviewer._target(index=True)\n"
+        )
+        owner_source.write_text(source.replace(anchor, hold))
+        git(root, "add", ".")
+        git(root, "commit", "-m", "test: exhaust tiny review budget before admission")
+    task = git(root, "rev-parse", "HEAD")
     binary = tmp_path / "stall-version"
     binary.mkdir()
     marker = tmp_path / "version-started"
@@ -4403,7 +4488,19 @@ def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
     elapsed_limit = min(timeout + 10, 30)
     assert time.monotonic() - started < elapsed_limit, result.stdout + result.stderr
     assert git(root, "branch", "--show-current") == "task"
+    assert git(root, "rev-parse", "master") == base
+    assert git(root, "rev-parse", "task") == task
     assert not (root / ".git/MERGE_HEAD").exists()
+    assert not (root / ".git/h2h-merge-workflow.lock").exists()
+    assert not list((root / ".git/h2h-review/locks").glob("*.unproven.json"))
+    if timeout == 1:
+        assert preflight_boundary.is_file()
+        assert float(preflight_boundary.read_text()) <= time.monotonic()
+        assert not (root / ".git/fixture-review-events").exists()
+        assert not (root / ".git/h2h-review").exists()
+    else:
+        assert not preflight_boundary.exists()
+        assert (root / ".git/fixture-review-events").read_text() == "run\n"
     assert not list((root / ".git/h2h-review").glob("receipts/*.json"))
     assert "owned_tree_empty=True" in result.stdout + result.stderr
     if timeout == 40:
@@ -4422,7 +4519,7 @@ def test_review_owner_deadline_covers_tiny_budget_and_stalled_version(
 
 @pytest.mark.skipif(os.name != "posix", reason="Real POSIX merge wrapper cancellation")
 @pytest.mark.parametrize("phase", ["stage", "terminal"])
-def test_cancel_merge_during_receipt_publication_restores_task(
+def test_cancel_merge_during_receipt_publication_honors_completion_boundary(
     tmp_path: Path, phase: str
 ) -> None:
     root = tmp_path / "repository"
@@ -4527,7 +4624,10 @@ def test_cancel_merge_during_receipt_publication_restores_task(
                     wrapper.wait(timeout=max(0.0, deadline - time.monotonic())) == 143
                 ), output_path.read_text()
                 _assert_interrupted_workflow_cleanup(
-                    owner, output_path.read_text(), deadline=deadline
+                    owner,
+                    output_path.read_text(),
+                    deadline=deadline,
+                    review_completion_unproven=not committed,
                 )
                 clean = True
                 with pytest.raises(ProcessLookupError):
@@ -4563,25 +4663,34 @@ def test_cancel_merge_during_receipt_publication_restores_task(
                 assert not tuple(receipts_directory.glob("*.pending"))
                 assert not marker.with_suffix(".release").exists()
                 reviewer = code_review.Reviewer(root)
-                with reviewer._review_lock(target, exclusive=False):
-                    if committed:
+                if committed:
+                    with reviewer._review_lock(target, exclusive=False):
                         assert receipt.read_bytes() == prepared_bytes
                         assert marker.with_suffix(".signal").read_text() == str(
                             signal.SIGTERM
                         )
                         assert reviewer._verify(target) == receipt
-                    else:
-                        with pytest.raises(code_review.ReviewError):
-                            reviewer._verify(target)
-                # Recovery restored the task's index, not the captured merge target.
+                    # All cleanup preceded the terminal rename. Recovery restores
+                    # the task index while retaining the already committed receipt.
+                    assert git(root, "status", "--porcelain") == ""
+                else:
+                    with pytest.raises(process.ProcessOwnershipError):
+                        with reviewer._review_lock(target, exclusive=False):
+                            pytest.fail(
+                                "Unfinished publication lost its admission marker"
+                            )
+                    assert git(root, "rev-parse", "MERGE_HEAD") == task
                 assert verification.returncode != 0
-                assert not (root / ".git/MERGE_HEAD").exists(), output_path.read_text()
-                assert not (root / ".git/h2h-merge-workflow.lock").exists()
+                assert (root / ".git/MERGE_HEAD").exists() is not committed, (
+                    output_path.read_text()
+                )
+                assert (root / ".git/h2h-merge-workflow.lock").exists() is not committed
                 assert not (root / ".git/fixture-gate").exists()
                 assert git(root, "rev-parse", "master") == base
                 assert git(root, "rev-parse", "task") == task
-                assert git(root, "branch", "--show-current") == "task"
-                assert git(root, "status", "--porcelain") == ""
+                assert git(root, "branch", "--show-current") == (
+                    "task" if committed else "master"
+                )
             finally:
                 with controller.defer():
                     try:
@@ -4641,7 +4750,9 @@ def test_publication_fixture_closes_owner_when_release_marker_write_fails(
     monkeypatch.setattr(Path, "touch", refuse_marker)
     try:
         with pytest.raises(OSError) as caught:
-            test_cancel_merge_during_receipt_publication_restores_task(tmp_path, phase)
+            test_cancel_merge_during_receipt_publication_honors_completion_boundary(
+                tmp_path, phase
+            )
         assert caught.value is marker_error
         assert len(owners) == 1
         owner, deadline = owners[0]

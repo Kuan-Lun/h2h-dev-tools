@@ -29,6 +29,10 @@ class ExecutionError(RuntimeError):
     """An invocation failed; no aggregate evidence may be published."""
 
 
+class ReviewCompletionUnproven(process.ProcessOwnershipError):
+    """Managed groups may be empty while admitted review tools are unconfirmed."""
+
+
 class GitCommandError(ExecutionError):
     """A query was rejected before admission or after proven process cleanup."""
 
@@ -264,6 +268,7 @@ class Invocation:
     command: tuple[str, ...]
     prompt: str
     directory: Path
+    needs_completion: bool
 
 
 @dataclass
@@ -306,6 +311,7 @@ def run_invocations(
     *,
     deadline: float,
     validate: Callable[[Invocation], None],
+    on_admission: Callable[[Invocation], None] | None = None,
 ) -> list[dict[str, object]]:
     """Share one deadline; inspect results only after that invocation is empty.
 
@@ -314,12 +320,16 @@ def run_invocations(
     Independent owners clean concurrently within the same absolute deadline.
     No invocation result, including a late passing file, rescues a failed run.
     Streams close with each completed owner, so concurrency also bounds FDs.
+    A model invocation additionally needs validated normal work completion.
+    Cleaning its registered group cannot establish that independent tool groups
+    have ended; failed/cancelled/unvalidated model work remains unproven.
     """
     if os.name != "posix":
         raise ExecutionError("Online review ownership currently requires POSIX")
     active: dict[int, _Active] = {}
     completed: list[dict[str, object]] = []
     next_index = 0
+    unconfirmed: dict[int, Invocation] = {}
     execution_deadline = deadline - CLEANUP_RESERVE
     collection_ownership_error: process.ProcessOwnershipError | None = None
     cleanup_ready = Event()
@@ -389,6 +399,7 @@ def run_invocations(
                 remaining()
                 validate(invocation)
                 remaining()  # Late validation is never admitted as evidence.
+                unconfirmed.pop(id(invocation), None)
                 completed.append(
                     {
                         "id": invocation.id,
@@ -452,6 +463,12 @@ def run_invocations(
                             collect_completed()
                             remaining()
                             with controller.defer():
+                                if invocation.needs_completion:
+                                    # Admission precedes spawn: an interrupted or
+                                    # failed handoff is conservatively unknown.
+                                    unconfirmed[id(invocation)] = invocation
+                                    if on_admission is not None:
+                                        on_admission(invocation)
                                 owned = process.start_owned_process(
                                     phase,
                                     deadline=deadline,
@@ -488,6 +505,19 @@ def run_invocations(
                             (False, [f"Review cleanup worker failed: {error}"])
                         )
                 failed_cleanup = any(not empty for empty, _messages in results)
+                if unconfirmed:
+                    failure = ReviewCompletionUnproven(
+                        "Review work completion is unproven for: "
+                        + ", ".join(item.id for item in unconfirmed.values())
+                        + "; retain candidate, task and admission until cleanup "
+                        "has been independently checked"
+                    )
+                    for _empty, messages in results:
+                        for message in messages:
+                            failure.add_note(message)
+                    if failed_cleanup:
+                        failure.add_note("Registered process cleanup is also unproven")
+                    raise failure
                 if failed_cleanup:
                     details = "; ".join(
                         message for _empty, messages in results for message in messages

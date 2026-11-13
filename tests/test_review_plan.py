@@ -240,6 +240,10 @@ def _passing(plan: planning.Plan, index: int) -> dict[str, Any]:
         "verdict": "pass",
         "summary": "Synthetic attestation, not semantic proof.",
         "findings": [],
+        "work_completion": {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+        },
         "plan_digest": plan.fingerprint,
         "shard_id": f"shard-{index:04d}",
         "unit_reviews": [
@@ -336,6 +340,97 @@ def test_duplicate_and_oversize_json_cannot_be_accepted() -> None:
     ]:
         with pytest.raises(planning.PlanError):
             coverage.strict_json(data)
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        None,
+        {},
+        True,
+        {"helpers_complete": True},
+        {"helpers_complete": True, "tool_sessions_complete": False},
+        {"helpers_complete": False, "tool_sessions_complete": True},
+        {"helpers_complete": 1, "tool_sessions_complete": True},
+        {"helpers_complete": True, "tool_sessions_complete": "true"},
+        {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+            "all_descendants_empty": True,
+        },
+    ],
+)
+@pytest.mark.parametrize("stage_index", [0, 1, 2])
+def test_offline_aggregate_requires_work_completion_from_every_stage(
+    repository: Path, completion: object, stage_index: int
+) -> None:
+    plan = _plan(repository)
+    assert len(plan.units) == 2
+    plan = replace(plan, shards=tuple((unit.id,) for unit in plan.units))
+    results = [_passing(plan, index) for index in range(2)]
+    integration = deepcopy(results[0])
+    integration.update(
+        shard_id="integration",
+        unit_reviews=[],
+        integration_reviews=[
+            {
+                "obligation": key,
+                "analysis": "Synthetic integration of completed fixture work.",
+                "source_paths": list(plan.source_paths),
+            }
+            for key in plan.integration_obligations
+        ],
+    )
+    results.append(integration)
+    stages = [
+        {
+            "id": result["shard_id"],
+            "review": result,
+            "review_sha256": planning.digest(planning.canonical(result)),
+            "owned_tree_empty": True,
+        }
+        for result in results
+    ]
+    aggregate = {
+        "plan": plan.document(),
+        "plan_digest": plan.fingerprint,
+        "stages": stages,
+    }
+    coverage.validate_aggregate(aggregate, plan)
+    result = results[stage_index]
+    if completion is None:
+        del result["work_completion"]
+    else:
+        result["work_completion"] = completion
+    # Neither an empty registered group nor a newly matching result hash can
+    # replace the reviewer's separate helper/tool completion attestation.
+    stages[stage_index]["review_sha256"] = planning.digest(planning.canonical(result))
+    assert not coverage.work_completion_confirmed(result)
+    with pytest.raises(planning.PlanError, match="completion is unproven"):
+        coverage.validate_aggregate(aggregate, plan)
+
+
+def test_complete_finding_retains_normal_work_completion(repository: Path) -> None:
+    plan = _plan(repository)
+    result = _passing(plan, 0)
+    result.update(
+        verdict="changes_requested",
+        findings=[
+            {
+                "priority": 2,
+                "title": "Synthetic finding",
+                "body": "Fixture condition and consequence.",
+                "file": "decode.py",
+                "line_start": 1,
+                "line_end": 1,
+            }
+        ],
+    )
+    assert coverage.work_completion_confirmed(result)
+    coverage.validate_attestation(code_review._result(result), plan, 0)
+    code_review._require_complete(result)
+    with pytest.raises(code_review.ReviewError, match="blocked the merge"):
+        code_review._require_pass(result)
 
 
 @pytest.mark.parametrize("batch_limit", [planning.BLOB_BATCH_BYTES, 512])
@@ -1292,6 +1387,10 @@ def _maximum_response(plan: planning.Plan, index: int | None) -> dict[str, Any]:
         "verdict": "pass",
         "summary": "\x01" * limits["summary_utf8_bytes"],
         "findings": [],
+        "work_completion": {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+        },
         "plan_digest": plan.fingerprint,
         "shard_id": "integration" if index is None else f"shard-{index:04d}",
         "unit_reviews": [

@@ -113,6 +113,10 @@ def synthetic_review_response(prompt: str) -> dict[str, object]:
         "verdict": "pass",
         "summary": text,
         "findings": [],
+        "work_completion": {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+        },
         "plan_digest": fingerprint,
         "shard_id": shard,
         "unit_reviews": reviews,

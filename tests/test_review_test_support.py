@@ -46,6 +46,10 @@ def test_response_preserves_the_assignment_and_marks_synthetic_output() -> None:
         "verdict": "pass",
         "summary": "Synthetic fixture response; no code review performed.",
         "findings": [],
+        "work_completion": {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+        },
         "plan_digest": "a" * 64,
         "shard_id": "shard-0000",
         "unit_reviews": [

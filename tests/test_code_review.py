@@ -85,6 +85,9 @@ mode = os.environ.get("FAKE_CODEX_MODE", "pass")
 stage_id = schema['properties']['shard_id']['enum'][0]
 stage_modes = json.loads(os.environ.get("FAKE_CODEX_STAGE_MODES", "{}"))
 mode = stage_modes.get(stage_id, mode)
+# These tests deliberately track one descendant/owner, not an arbitrary shard count.
+if mode in {"timeout", "passing-child", "change-tree", "hide-index-change", "change-worktree"} and stage_id != "shard-0000":
+    mode = "pass"
 if os.environ.get("FAKE_CODEX_HOLD_OTHER_SHARDS") and stage_id != 'shard-0000':
     while True:
         time.sleep(0.01)
@@ -175,6 +178,12 @@ elif mode == "unknown-verdict":
     result["verdict"] = "approved"
 elif mode == "missing-findings":
     del result["findings"]
+elif mode == "missing-work-completion":
+    del result["work_completion"]
+elif mode == "active-tool-session":
+    result["work_completion"]["tool_sessions_complete"] = False
+elif mode == "active-helper":
+    result["work_completion"]["helpers_complete"] = False
 elif mode == "empty-changes":
     result["verdict"] = "changes_requested"
 if corruption == 'p2-missing-unit':
@@ -419,6 +428,65 @@ def _assert_invocation_schema(call: dict[str, object]) -> Path:
     return schema_path
 
 
+def _assert_review_rounds(calls: list[dict[str, object]], *complete: bool) -> None:
+    """Check actual planned stage identities without assuming a fixed shard count."""
+    rounds: dict[Path, list[str]] = {}
+    for call in calls:
+        schema_path = _assert_invocation_schema(call)
+        schema = call["schema"]
+        assert isinstance(schema, dict)
+        identifier = schema["properties"]["shard_id"]["enum"][0]
+        rounds.setdefault(schema_path.parent, []).append(identifier)
+    assert len(rounds) == len(complete), "Unexpected extra or missing review invocation"
+    for (run, identifiers), finished in zip(rounds.items(), complete, strict=True):
+        plan = json.loads((run / "plan.json").read_text())
+        plan_digest = review_plan.digest(review_plan.canonical(plan))
+        for call in calls:
+            arguments = call["args"]
+            assert isinstance(arguments, list)
+            if (
+                Path(
+                    arguments[arguments.index("--output-last-message") + 1]
+                ).parent.parent
+                == run
+            ):
+                schema = call["schema"]
+                assert isinstance(schema, dict)
+                assert schema["properties"]["plan_digest"]["enum"] == [plan_digest]
+        shards = [f"shard-{index:04d}" for index in range(len(plan["shards"]))]
+        expected = [*shards, *(["integration"] if len(shards) > 1 else [])]
+        assert identifiers and len(identifiers) == len(set(identifiers))
+        assert set(identifiers) <= set(expected)
+        if finished:
+            assert set(identifiers) == set(expected)
+        if "integration" in identifiers:
+            assert identifiers[-1] == "integration"
+            assert set(identifiers[:-1]) == set(shards)
+
+
+def _assert_planned_scope(
+    reviewer: code_review.Reviewer, target: code_review.Target, scope: str
+) -> None:
+    plans = [
+        json.loads(path.read_text())
+        for path in reviewer._directory().glob("runs/*/plan.json")
+    ]
+    (plan,) = [plan for plan in plans if plan["target"] == target.document()]
+    assert plan["coverage"]["scope"] == scope
+
+
+def _retained_review_failure(
+    reviewer: code_review.Reviewer, target: code_review.Target
+) -> str:
+    marker = reviewer._pending_review_path(target)
+    assert marker.exists()
+    diagnostic = json.loads(marker.with_name(marker.name + ".failure.json").read_text())
+    assert diagnostic["authoritative"] is False
+    assert diagnostic["cleanup_state"] == "unknown"
+    assert diagnostic["exit_code"] == process.TERMINATION_FAILED_EXIT_CODE
+    return "\n".join(item["message"] for item in diagnostic["exceptions"])
+
+
 @pytest.mark.parametrize("model", [None, "fixture-model"], ids=["default", "explicit"])
 def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
     review_repository: ReviewRepository, model: str | None
@@ -429,53 +497,58 @@ def test_review_binds_the_real_merge_candidate_and_verifies_after_commit(
     model_arguments = () if model is None else ("--model", model)
     _assert_passed(repo.review("run", "--index", *model_arguments))
     calls = repo.calls()
-    assert len(calls) == 1
-    _assert_invocation_schema(calls[0])
-    arguments = calls[0]["args"]
-    assert isinstance(arguments, list)
-    assert arguments[0] == "exec"
-    assert arguments[arguments.index("--sandbox") + 1] == "read-only"
-    if model is None:
-        assert "--model" not in arguments
-    else:
-        assert arguments[arguments.index("--model") + 1] == model
-    configuration = [
-        arguments[index + 1] for index, value in enumerate(arguments) if value == "-c"
-    ]
-    assert configuration == ['approval_policy="never"', "notify=[]"]
-    assert all(
-        isinstance(value, str)
-        and '"' not in value.partition("=")[0]
-        and "'" not in value.partition("=")[0]
-        for value in configuration
-    )
-    # Preserve normal CLI session persistence so subagent spawning can resolve
-    # its parent thread. Only completion notifications are disabled.
-    assert "--ephemeral" not in arguments
-    # Do not suppress user model,
-    # authentication, tools/plugins, feature flags, or safety-hook settings.
-    expected_options = {
-        "--sandbox",
-        "-c",
-        "--json",
-        "--output-schema",
-        "--output-last-message",
-        "-",
-    }
-    if model is not None:
-        expected_options.add("--model")
-    assert {
-        value for value in arguments if isinstance(value, str) and value.startswith("-")
-    } == expected_options
-    assert {
-        "--json",
-        "--output-schema",
-        "--output-last-message",
-        "-",
-    } <= set(arguments)
-    prompt = str(calls[0]["prompt"])
-    assert base in prompt
-    assert tree in prompt
+    _assert_review_rounds(calls, True)
+    for call in calls:
+        _assert_invocation_schema(call)
+        arguments = call["args"]
+        assert isinstance(arguments, list)
+        assert arguments[0] == "exec"
+        assert arguments[arguments.index("--sandbox") + 1] == "read-only"
+        if model is None:
+            assert "--model" not in arguments
+        else:
+            assert arguments[arguments.index("--model") + 1] == model
+        configuration = [
+            arguments[index + 1]
+            for index, value in enumerate(arguments)
+            if value == "-c"
+        ]
+        assert configuration == ['approval_policy="never"', "notify=[]"]
+        assert all(
+            isinstance(value, str)
+            and '"' not in value.partition("=")[0]
+            and "'" not in value.partition("=")[0]
+            for value in configuration
+        )
+        # Preserve normal CLI session persistence so subagent spawning can resolve
+        # its parent thread. Only completion notifications are disabled.
+        assert "--ephemeral" not in arguments
+        # Do not suppress user model,
+        # authentication, tools/plugins, feature flags, or safety-hook settings.
+        expected_options = {
+            "--sandbox",
+            "-c",
+            "--json",
+            "--output-schema",
+            "--output-last-message",
+            "-",
+        }
+        if model is not None:
+            expected_options.add("--model")
+        assert {
+            value
+            for value in arguments
+            if isinstance(value, str) and value.startswith("-")
+        } == expected_options
+        assert {
+            "--json",
+            "--output-schema",
+            "--output-last-message",
+            "-",
+        } <= set(arguments)
+        prompt = str(call["prompt"])
+        assert base in prompt
+        assert tree in prompt
     _assert_passed(repo.review("verify", "--index", mode="nonzero"))
     repo.git("commit", "-m", "Merge task/example")
     _assert_passed(repo.review("verify", "--revision", "HEAD", mode="nonzero"))
@@ -505,7 +578,7 @@ def test_review_fails_closed_without_a_complete_clean_result(
     repo = review_repository
     _assert_blocked(repo.review("run", "--index", mode=mode))
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), mode in {"p0", "p1", "p2"})
 
 
 @pytest.mark.parametrize(
@@ -547,7 +620,7 @@ def test_review_accepts_a_clean_candidate_with_whitespace_paths(
     )
     _assert_passed(repo.review("run", "--index"))
     _assert_passed(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 @pytest.mark.parametrize(
@@ -568,8 +641,17 @@ def test_review_rejects_worktree_drift_before_publishing_a_receipt(
     repo.environment["FAKE_CODEX_DRIFT_PATH"] = name
     result = repo.review("run", "--index", mode="change-worktree")
     _assert_blocked(result)
-    assert "no unstaged or untracked files" in result.stderr
-    assert len(repo.calls()) == 1
+    assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE
+    marker = reviewer._pending_review_path(target)
+    assert marker.exists()
+    diagnostic = json.loads(marker.with_name(marker.name + ".failure.json").read_text())
+    assert diagnostic["authoritative"] is False
+    assert diagnostic["cleanup_state"] == "unknown"
+    assert any(
+        "no unstaged or untracked files" in item["message"]
+        for item in diagnostic["exceptions"]
+    )
+    _assert_review_rounds(repo.calls(), False)
     assert (repo.path / name).read_text() == "Unreviewed local changes.\n"
     assert reviewer._target(index=True) == target
     assert not reviewer._receipt_path(target).exists()
@@ -618,7 +700,7 @@ def test_review_receipt_does_not_cover_changed_code_policy_or_runner(
     if (path.parent / "manifest.json").exists():
         repo.git("add", str(path.parent.relative_to(repo.path) / "manifest.json"))
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_review_receipt_does_not_cover_a_new_base_with_the_same_tree(
@@ -639,7 +721,7 @@ def test_review_receipt_does_not_cover_a_new_base_with_the_same_tree(
     repo.git("update-ref", "refs/heads/main", replacement, old_base)
     assert repo.git("write-tree") == candidate_tree
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_review_index_requires_a_pending_merge(
@@ -658,7 +740,7 @@ def test_explicit_failed_rerun_invalidates_the_previous_pass(
     _assert_passed(repo.review("run", "--index"))
     _assert_blocked(repo.review("run", "--index", mode="p1"))
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 2
+    _assert_review_rounds(repo.calls(), True, True)
 
 
 @pytest.mark.parametrize("alias_kind", ["file", "directory"])
@@ -703,7 +785,7 @@ def test_review_preserves_separate_metadata_path_and_shared_lock(
         competing = linked.review("run", "--index")
         _assert_blocked(competing)
         assert "already running" in competing.stderr.lower()
-        assert len(repo.calls()) == 2, "The shared lock must reject a second reviewer"
+        _assert_review_rounds(repo.calls(), True, False)
         (repo.state / "release").touch()
         stdout, stderr = owner.communicate(timeout=5)
         assert owner.returncode == 0, stdout + stderr
@@ -711,7 +793,7 @@ def test_review_preserves_separate_metadata_path_and_shared_lock(
     _assert_blocked(linked.review("run", "--index", mode="p2"))
     assert not receipt.exists()
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 3
+    _assert_review_rounds(repo.calls(), True, True, True)
     assert (lock.stat().st_dev, lock.stat().st_ino) == (
         lock_identity.st_dev,
         lock_identity.st_ino,
@@ -764,7 +846,7 @@ def test_review_verification_rejects_a_different_expected_tree(
     _assert_passed(repo.review("verify", *scope, "--expected-tree", candidate_tree))
     _assert_blocked(repo.review("verify", *scope, "--expected-tree", other_tree))
     _assert_passed(repo.review("verify", *scope, "--expected-tree", candidate_tree))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 @pytest.mark.parametrize(
@@ -797,7 +879,7 @@ def test_failed_review_preflight_invalidates_the_previous_pass(
     path.write_bytes(original)
     assert repo.git("diff", "--name-only") == ""
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1, "Preflight failures must occur before invoking Codex"
+    _assert_review_rounds(repo.calls(), True)
 
 
 @pytest.mark.parametrize("managed", [False, True], ids=["standalone", "managed"])
@@ -861,7 +943,7 @@ def test_four_hour_review_accepts_a_declared_schedule(
     assert budget["aggregate_timeout_seconds"] == 14400
     assert budget["minimum_shard_seconds"] == 900
     assert budget["required_seconds"] <= budget["available_seconds"]
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_preparation_cannot_spend_the_declared_shard_capacity(
@@ -916,7 +998,7 @@ def test_concurrent_review_rejects_a_second_owner_without_invoking_codex(
         )
         _assert_blocked(competing)
         assert "already running" in (competing.stdout + competing.stderr).lower()
-        assert len(repo.calls()) == 2, "A competing run must not invoke Codex"
+        _assert_review_rounds(repo.calls(), True, False)
         _assert_blocked(repo.review("verify", "--index"))
         (repo.state / "release").write_text("release review", encoding="utf-8")
         stdout, stderr = owner.communicate(timeout=5)
@@ -926,12 +1008,19 @@ def test_concurrent_review_rejects_a_second_owner_without_invoking_codex(
         else:
             assert owner.returncode != 0, stdout + stderr
             _assert_blocked(repo.review("verify", "--index"))
-    _assert_passed(repo.review("run", "--index"))
-    _assert_passed(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 3
+    if mode == "hold-pass":
+        _assert_passed(repo.review("run", "--index"))
+        _assert_passed(repo.review("verify", "--index"))
+        _assert_review_rounds(repo.calls(), True, True, True)
+    else:
+        assert (
+            repo.review("run", "--index").returncode
+            == process.TERMINATION_FAILED_EXIT_CODE
+        )
+        _assert_review_rounds(repo.calls(), True, False)
 
 
-def test_terminated_review_releases_its_lock_without_a_passing_receipt(
+def test_terminated_review_retains_candidate_barrier_without_a_passing_receipt(
     review_repository: ReviewRepository,
 ) -> None:
     repo = review_repository
@@ -942,17 +1031,25 @@ def test_terminated_review_releases_its_lock_without_a_passing_receipt(
         stdout, stderr = owner.communicate(timeout=5)
         assert owner.returncode != 0, stdout + stderr
         _assert_blocked(repo.review("verify", "--index"))
-    _assert_passed(repo.review("run", "--index"))
-    _assert_passed(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 3
+    reviewer = code_review.Reviewer(repo.path)
+    marker = reviewer._pending_review_path(reviewer._target(index=True))
+    assert marker.exists()
+    assert (
+        repo.review("run", "--index").returncode == process.TERMINATION_FAILED_EXIT_CODE
+    )
+    assert (
+        repo.review("verify", "--index").returncode
+        == process.TERMINATION_FAILED_EXIT_CODE
+    )
+    _assert_review_rounds(repo.calls(), True, False)
 
 
 @pytest.mark.parametrize(
     "mode,stream_name,expected",
     [
         ("hold-pass", "stdout", 0),
-        ("hold-failure", "stdout", 1),
-        ("hold-failure", "stderr", 1),
+        ("hold-failure", "stdout", 125),
+        ("hold-failure", "stderr", 125),
     ],
 )
 def test_standalone_review_preserves_result_after_diagnostic_reader_closes(
@@ -980,7 +1077,7 @@ def test_standalone_review_preserves_result_after_diagnostic_reader_closes(
     else:
         assert not receipt.exists()
         _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), expected == 0)
     assert owner.returncode == expected, (stdout or "") + (stderr or "")
 
 
@@ -1009,7 +1106,7 @@ def test_offline_verify_succeeds_when_stdout_has_no_reader(
         os.close(writer)
 
     assert receipt.read_bytes() == original_receipt
-    assert len(repo.calls()) == 1, "Offline verify must not invoke Codex"
+    _assert_review_rounds(repo.calls(), True)
     assert result.returncode == 0, result.stderr
 
 
@@ -1019,7 +1116,7 @@ def test_candidate_changes_during_review_cannot_receive_a_passing_receipt(
     repo = review_repository
     _assert_blocked(repo.review("run", "--index", mode="change-tree"))
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), False)
 
 
 def test_review_can_explicitly_cover_an_existing_commit(
@@ -1029,7 +1126,7 @@ def test_review_can_explicitly_cover_an_existing_commit(
     repo.git("merge", "--abort")
     _assert_passed(repo.review("run"))
     _assert_passed(repo.review("verify"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def _child_released_lock(state: Path) -> bool:
@@ -1169,12 +1266,18 @@ def test_review_timeout_terminates_the_codex_descendant(
 ) -> None:
     repo = review_repository
     try:
+        # Keep the short-budget oracle on a genuinely reviewed incremental scope.
+        _merge_full_baseline(repo)
+        _next_candidate(repo)
+        reviewer = code_review.Reviewer(repo.path)
+        target = reviewer._target(index=True)
         started = time.monotonic()
         result = repo.review("run", "--index", "--timeout-seconds", "8", mode="timeout")
         elapsed = time.monotonic() - started
         pid_path = repo.state / "child-pid"
         assert pid_path.exists(), "The timeout oracle must exercise a real descendant"
         _assert_blocked(result)
+        _assert_planned_scope(reviewer, target, "incremental")
         assert elapsed < 10, result.stdout + result.stderr
         _assert_review_tree_cleaned(repo.state)
         assert _child_released_lock(repo.state), "The Codex descendant survived timeout"
@@ -1348,6 +1451,10 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = review_repository
+    # Keep this short-budget lifecycle oracle on a genuinely reviewed incremental
+    # candidate. The complete generated snapshot is covered by the real baseline.
+    _merge_full_baseline(repo)
+    _next_candidate(repo)
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
     original_start = process.start_owned_process
@@ -1365,7 +1472,11 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
 
     def launch(phase: process.ProcessCommand, **kwargs: Any) -> process.OwnedProcess:
         owner = original_start(phase, **kwargs)
-        if "review_worker.py" in str(phase.argv) and "exec" in phase.argv:
+        if (
+            "review_worker.py" in str(phase.argv)
+            and "exec" in phase.argv
+            and any("shard-0000/" in argument for argument in phase.argv)
+        ):
             review_processes.append(owner.process)
         return owner
 
@@ -1383,7 +1494,7 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
     monkeypatch.setattr(process, "terminate_owned_tree", remember_owner)
     try:
         started = time.monotonic()
-        with pytest.raises(process.ProcessOwnershipError, match=r"cleanup.*proven"):
+        with pytest.raises(review_execution.ReviewCompletionUnproven, match="unproven"):
             reviewer._run(
                 target,
                 index=True,
@@ -1393,6 +1504,7 @@ def test_standalone_review_cannot_publish_when_group_cleanup_is_unproven(
                 destination=repo.state / "prepared.json",
             )
         assert time.monotonic() - started < 10
+        _assert_planned_scope(reviewer, target, "incremental")
         assert len(review_processes) == 1
         assert review_processes[0].poll() == 0
         assert not reviewer._receipt_path(target).exists()
@@ -1423,7 +1535,7 @@ def test_review_receipt_binds_executed_shared_bytes_even_for_unchanged_revision(
         stream.write("\n# Executed implementation changed without staging.\n")
     _refresh_snapshot_manifest(repo)
     _assert_blocked(repo.review("verify", "--revision", revision))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_review_closure_changes_follow_the_exported_component_contract(
@@ -1451,7 +1563,7 @@ def test_review_closure_changes_follow_the_exported_component_contract(
     dependency.write_text("value = 2\n", encoding="utf-8")
     _refresh_snapshot_manifest(repo)
     _assert_blocked(repo.review("verify"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_review_rejects_a_relocated_loaded_bundle_verifier(
@@ -1489,6 +1601,10 @@ def _write_fixture_receipt(
             "verdict": "pass",
             "summary": "Synthetic offline verification fixture.",
             "findings": [],
+            "work_completion": {
+                "helpers_complete": True,
+                "tool_sessions_complete": True,
+            },
             "plan_digest": plan.fingerprint,
             "shard_id": identifier,
             "unit_reviews": [
@@ -1573,6 +1689,13 @@ def test_windows_offline_verification_does_not_require_codex_or_posix_locks(
         with reviewer._review_lock(target, exclusive=True):
             pytest.fail("Windows must reject online review before starting Codex")
     assert repo.calls() == []
+    marker = reviewer._mark_review_pending(target)
+    assert marker
+    with pytest.raises(
+        review_execution.ReviewCompletionUnproven, match="manual verification"
+    ):
+        with reviewer._review_lock(target, exclusive=False):
+            pytest.fail("Windows verify must not accept retained unknown work")
 
 
 @pytest.mark.parametrize(
@@ -1681,6 +1804,10 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
     interrupt_handoff: bool,
 ) -> None:
     repo = review_repository
+    # Keep this short-budget lifecycle oracle on a genuinely reviewed incremental
+    # candidate. The complete generated snapshot is covered by the real baseline.
+    _merge_full_baseline(repo)
+    _next_candidate(repo)
     reviewer = code_review.Reviewer(repo.path)
     target = reviewer._target(index=True)
     signal_number = int(getattr(signal, signal_name))
@@ -1748,7 +1875,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
     monkeypatch.setattr(process, "terminate_owned_tree", stop_with_repeated_signals)
     signal.signal(signal_number, unprotected_signal)
     try:
-        with pytest.raises(code_review.ReviewError, match="interrupted by signal"):
+        with pytest.raises(review_execution.ReviewCompletionUnproven, match="unproven"):
             reviewer._run(
                 target,
                 index=True,
@@ -1757,6 +1884,7 @@ def test_review_signals_cannot_interrupt_spawn_ownership_or_tree_cleanup(
                 model=None,
                 destination=repo.state / "prepared.json",
             )
+        _assert_planned_scope(reviewer, target, "incremental")
         assert len(owned) == 1
         child = owned[0].process
         assert cleanup_started == [child.pid]
@@ -1828,7 +1956,7 @@ def test_first_review_covers_existing_repository_and_verifies_before_merge(
     assert receipt["scope"] == "repository"
     assert receipt["baseline"] is None
     _assert_passed(repo.review("verify", "--index", mode="nonzero"))
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_merged_repository_review_supports_a_continuous_incremental_chain(
@@ -2442,13 +2570,13 @@ def test_result_diagnostic_failure_cannot_publish_standalone_evidence(
             target,
             index=True,
             revision="HEAD",
-            timeout=10,
+            timeout=60,
             model=None,
             destination=repo.state / "prepared.json",
         )
     assert raised.value is failure
     assert not reviewer._receipt_path(target).exists()
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_owner_diagnostic_failure_precedes_managed_evidence_publication(
@@ -2470,7 +2598,9 @@ def test_owner_diagnostic_failure_precedes_managed_evidence_publication(
     failure = process.ProcessOwnershipError("diagnostic cleanup unproven")
 
     def report(message: str, **options: Any) -> None:
-        if message.startswith("Code review cleanup verified; publishing"):
+        if message.startswith(
+            "Code review managed cleanup and normal completion verified; publishing"
+        ):
             raise failure
         original(message, **options)
 
@@ -2484,9 +2614,10 @@ def test_owner_diagnostic_failure_precedes_managed_evidence_publication(
         ),
     ):
         pytest.fail("Diagnostic failure must precede publication")
-    assert raised.value is failure
+    assert isinstance(raised.value, review_execution.ReviewCompletionUnproven)
+    assert raised.value.__cause__ is failure
     assert not reviewer._receipt_path(target).exists()
-    assert len(repo.calls()) == 1
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_cli_does_not_launch_diagnostic_after_unknown_review_cleanup(
@@ -2663,8 +2794,9 @@ def test_review_rejects_index_visibility_drift_before_publishing(
     repo.environment["FAKE_CODEX_INDEX_FLAG"] = flag
     result = repo.review("run", "--index", mode="hide-index-change")
     _assert_blocked(result)
-    assert "index" in result.stderr.lower()
-    assert len(repo.calls()) == 1
+    assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE
+    assert "index" in _retained_review_failure(reviewer, target).lower()
+    _assert_review_rounds(repo.calls(), False)
     assert repo.git("diff", "--name-only") == ""
     assert (repo.path / "feature.py").read_text() == "value = 'unreviewed'\n"
     assert repo.git("write-tree") == target.tree
@@ -2706,8 +2838,12 @@ def test_partitioned_review_requires_every_shard_and_integration(
     schema_paths = [_assert_invocation_schema(call) for call in calls]
     assert len(schema_paths) == len(set(schema_paths))
     if "wrong-" in mode:
-        assert "Review attestation targets a different plan or shard" in result.stderr
+        assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE
         reviewer = code_review.Reviewer(repo.path)
+        assert (
+            "Review attestation targets a different plan or shard"
+            in _retained_review_failure(reviewer, reviewer._target(index=True))
+        )
         assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
     assignments = [
         json.loads(
@@ -2824,7 +2960,12 @@ def test_invalid_finding_round_stops_before_more_waves_or_integration(
     result = repo.review("run", "--index")
 
     _assert_blocked(result)
-    assert message in result.stderr.lower()
+    assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE
+    reviewer = code_review.Reviewer(repo.path)
+    assert (
+        message
+        in _retained_review_failure(reviewer, reviewer._target(index=True)).lower()
+    )
     calls = repo.calls()
     identifiers = []
     for call in calls:
@@ -3106,12 +3247,12 @@ def test_managed_precommit_failure_prevents_canonical_receipt(
         )
     elif boundary == "pending-cleanup":
         script += (
-            "original = merge_command.tempfile.TemporaryDirectory\n"
-            "class PendingDirectory(original):\n"
-            "    def cleanup(self):\n"
-            "        super().cleanup()\n"
-            "        if Path(self.name).name.startswith('pending-'): expire()\n"
-            "merge_command.tempfile.TemporaryDirectory = PendingDirectory\n"
+            "original = merge_command.shutil.rmtree\n"
+            "def remove(path, *args, **kwargs):\n"
+            "    result = original(path, *args, **kwargs)\n"
+            "    if Path(path).name.startswith('pending-'): expire()\n"
+            "    return result\n"
+            "merge_command.shutil.rmtree = remove\n"
         )
     else:
         script += (
@@ -3239,12 +3380,12 @@ def test_managed_precommit_signal_prevents_canonical_receipt(
         )
     elif boundary == "pending-cleanup":
         script += (
-            "original = merge_command.tempfile.TemporaryDirectory\n"
-            "class PendingDirectory(original):\n"
-            "    def cleanup(self):\n"
-            "        super().cleanup()\n"
-            "        if Path(self.name).name.startswith('pending-'): interrupt()\n"
-            "merge_command.tempfile.TemporaryDirectory = PendingDirectory\n"
+            "original = merge_command.shutil.rmtree\n"
+            "def remove(path, *args, **kwargs):\n"
+            "    result = original(path, *args, **kwargs)\n"
+            "    if Path(path).name.startswith('pending-'): interrupt()\n"
+            "    return result\n"
+            "merge_command.shutil.rmtree = remove\n"
         )
     else:
         script += (
@@ -3304,8 +3445,24 @@ def test_managed_precommit_signal_prevents_canonical_receipt(
     )
     assert not receipt.exists(), result.stdout + result.stderr
     _assert_blocked(verification)
-    assert result.returncode == 128 + int(getattr(signal, signal_name))
-    assert cleanup.read_text() == "owned_tree_empty\n"
+    assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE
+    assert not cleanup.exists()
+    assert reviewer._pending_review_path(reviewer._target(index=True)).exists()
+    failure = json.loads(cleanup.with_name(cleanup.name + ".failure.json").read_text())
+    assert failure["cleanup_state"] == "unknown"
+    assert failure["authoritative"] is False
+    assert any(
+        "Signal" in item["type"] or "KeyboardInterrupt" in item["type"]
+        for item in failure["exceptions"]
+    )
+    raw_results = list(reviewer._directory().glob("runs/*/shard-*/result.json"))
+    assert raw_results
+    for path in raw_results:
+        result_document = json.loads(path.read_text())
+        assert result_document["work_completion"] == {
+            "helpers_complete": True,
+            "tool_sessions_complete": True,
+        }
 
 
 def test_managed_admission_diagnostic_cleanup_failure_exits_125(
@@ -3562,7 +3719,7 @@ def test_non_utf8_metadata_receipt_round_trips_through_publication(
     _assert_blocked(run("p2"))
     assert not receipts[0].exists()
     _assert_blocked(repo.review("verify", "--index"))
-    assert len(repo.calls()) == 2
+    _assert_review_rounds(repo.calls(), True, True)
 
 
 @pytest.mark.parametrize("managed", [False, True], ids=["standalone", "managed"])
@@ -3656,7 +3813,7 @@ def test_incomplete_publication_remains_unverifiable_if_stage_removal_fails(
     )
     assert not receipt.exists(), "An incomplete attempt must never become canonical"
     _assert_blocked(verification)
-    assert len(repo.calls()) == 1, "Offline verify must not launch a reviewer"
+    _assert_review_rounds(repo.calls(), True)
 
 
 def test_receipt_json_preserves_filesystem_surrogates(
@@ -3733,3 +3890,98 @@ def test_distributed_correspondence_forwards_complete_methods_to_integration(
         len(review_plan.wire(assignment)) <= review_plan.MAX_PROMPT_BYTES
         for assignment in assignments
     )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["missing-work-completion", "active-tool-session", "active-helper", "incomplete"],
+)
+def test_unknown_normal_work_completion_retains_standalone_candidate(
+    review_repository: ReviewRepository, mode: str
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    result = repo.review("run", "--index", mode=mode)
+    assert result.returncode == process.TERMINATION_FAILED_EXIT_CODE
+    assert reviewer._pending_review_path(target).exists()
+    assert not reviewer._receipt_path(target).exists()
+    assert (
+        repo.review("run", "--index").returncode == process.TERMINATION_FAILED_EXIT_CODE
+    )
+    assert (
+        repo.review("verify", "--index").returncode
+        == process.TERMINATION_FAILED_EXIT_CODE
+    )
+    _assert_review_rounds(repo.calls(), False)
+
+
+def test_completed_findings_clear_retention_but_do_not_pass(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    result = repo.review("run", "--index", mode="p2")
+    assert result.returncode == 1
+    assert not reviewer._pending_review_path(target).exists()
+    assert not reviewer._receipt_path(target).exists()
+    _assert_passed(repo.review("run", "--index"))
+    _assert_passed(repo.review("verify", "--index"))
+    _assert_review_rounds(repo.calls(), True, True)
+
+
+def test_safe_finding_report_failure_keeps_standalone_retention(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    original = process.report_diagnostic
+
+    def fail_error_report(message: str, **options: Any) -> None:
+        if message.startswith("h2h code review: Code review completed with findings"):
+            raise process.ProcessOwnershipError("synthetic diagnostic cleanup unproven")
+        original(message, **options)
+
+    monkeypatch.setenv("PATH", repo.environment["PATH"])
+    monkeypatch.setenv("FAKE_CODEX_STATE", str(repo.state))
+    monkeypatch.setenv("FAKE_CODEX_MODE", "p2")
+    monkeypatch.setattr(sys, "argv", ["review-code.py", "run", "--index"])
+    monkeypatch.setattr(process, "report_diagnostic", fail_error_report)
+    with pytest.raises(SystemExit) as caught:
+        code_review.main(repo.path)
+    assert caught.value.code == process.TERMINATION_FAILED_EXIT_CODE
+    marker = reviewer._pending_review_path(target)
+    assert marker.exists()
+    diagnostic = json.loads(marker.with_name(marker.name + ".failure.json").read_text())
+    assert diagnostic["boundary"] == "code-review-main"
+    assert diagnostic["authoritative"] is False
+    assert any(
+        "diagnostic cleanup unproven" in item["message"]
+        for item in diagnostic["exceptions"]
+    )
+    assert not reviewer._receipt_path(target).exists()
+    _assert_review_rounds(repo.calls(), True)
+
+
+def test_retention_marker_requires_its_exact_generation(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    original = reviewer._mark_review_pending(target)
+    path = reviewer._pending_review_path(target)
+    replacement = original + b" "
+    path.write_bytes(replacement)
+    with pytest.raises(
+        review_execution.ReviewCompletionUnproven, match="safely cleared"
+    ):
+        reviewer._clear_review_pending(target, original)
+    assert path.read_bytes() == replacement
+    with pytest.raises(
+        review_execution.ReviewCompletionUnproven, match="manual verification"
+    ):
+        with reviewer._review_lock(target, exclusive=True):
+            pytest.fail("Unknown previous work must block another review")
