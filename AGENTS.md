@@ -149,6 +149,12 @@
   相符的 candidate；外部漂移、來源不明或 cleanup 未證明時保留 candidate、task
   與 admission，不自動回收 stale lock。已確認完成的 merge commit 不得 abort；
   cleanup 已證明時釋放 admission，讓正常 `--cleanup-only` 可以重試。
+- Merge command、workflow diagnostic 與最外層 launcher 的 ownership-error 125
+  出口，盡力由同程序寫入最多 64 KiB 的 `cleanup-N.failure.json`，保留有界
+  exception／cause／context／notes。它固定為 non-authoritative、cleanup unknown，
+  不是 receipt，不允許 recovery、解除 admission 或證明 cleanup；不另啟 writer、
+  不增加 deadline，寫入失敗仍退出 125。Partial／無效 JSON 不可採信；同步
+  filesystem syscall 不保證在原期限內回傳。
 - Merge workflow 的 checkout、merge、failure recovery 與 task branch deletion
   統一由 canonical process owner 管理 Git hooks。包括已合併 task 的 cleanup
   都需要 repository-local `.venv`；缺少時先執行 `scripts/rebuild-env.sh`。
@@ -350,8 +356,16 @@
   失敗不得沿用舊結果；POSIX verify 在 review 執行中也拒絕。
 - 全專案 manifest 涵蓋所有 tracked path/mode/blob 與文字半開 byte ranges；
   每片可讀完整 candidate，最後 integration 必須讀 raw sources 並檢查跨片契約。
-  Planning 依完整 inventory 與 coverage map 預算每片 contracts 的 UTF-8 JSON 大小，
-  最壞可接受交接與 root policy 必須先確認可容納；不得事後截斷契約或覆蓋範圍。
+  Artifact 的每個 related source 以 immutable path/blob/mode/origin 及完整、
+  不重疊 byte ranges 分配全文閱讀責任，可沿用既有 source units；每個 unit
+  必須回報精確 correspondence_ids，不能以其他 unit 的名字或 hash 代替閱讀。
+  每個 artifact 另有 artifact-correspondence integration obligation，核對所有
+  分段方法、generator／decoder／validator／consumer 契約與供應的 exact raw
+  boundary context，必要時讀額外 exact raw ranges。Boundary 不是全文抽樣替代，
+  無法解決的跨段對應回報 incomplete，不把整個巨大 source closure 再集中閱讀。
+  Planning 預算包含完整 assignment、metadata、coverage map、correspondence
+  methods、raw boundary context、最壞可接受 contracts 交接、root policy／prompt
+  及 response；reviewer admission 前確認可容納，不得事後截斷契約或覆蓋範圍。
   unit coverage 是 reviewer attestation，不是 hash、tool-call count 或模型實讀
   語義的機器證明。缺片、重複、wrong target、finding 或 incomplete 皆 fail closed。
   Planning、preflight、四片排程、validation、integration 及 cleanup 共用單一
@@ -372,7 +386,9 @@
   Embedded source 必須全文審查。只有 historical-evidence archive 明列的
   sampled-data-members 可作完整 JSON syntax/hash 與有限結構／值抽樣；不宣稱
   重算歷史數值。Generated data 須審查 generator、restricted decoder、validator、
-  consumer 與 source correspondence。增量刪除使用 primary parent 的歷史宣告。
+  consumer 與 source correspondence。增量刪除使用 primary parent 的歷史宣告與
+  完整歷史 related-source bytes。0.13 的 correspondence attestation 不接受舊結果
+  補欄位轉換或 fallback；更新 reviewer closure 後重新建立 full-repository baseline。
 - `review-code.py verify` 只離線驗證，絕不啟動 Codex。既有 full release gate
   在 checks 前後驗證同一 candidate 的 review；不得另建第二套 gate。Review
   與測試是不同證據，AI 未發現缺陷不是正確性證明，local receipt 不是防竄改

@@ -6,12 +6,13 @@ import json
 from typing import Any
 
 from .review_plan import (
-    INTEGRATION_OBLIGATIONS,
+    CORRESPONDENCE_METHOD_WIRE_BYTES,
     MAX_RESULT_BYTES,
     Plan,
     PlanError,
     canonical,
     digest,
+    method_limit,
     validate_plan,
     wire,
 )
@@ -27,8 +28,9 @@ ATTESTATION_PROPERTIES = {
                 "unit_id": {"type": "string"},
                 "method": {"type": "string"},
                 "related_paths": {"type": "array", "items": {"type": "string"}},
+                "correspondence_ids": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["unit_id", "method", "related_paths"],
+            "required": ["unit_id", "method", "related_paths", "correspondence_ids"],
             "additionalProperties": False,
         },
     },
@@ -95,7 +97,8 @@ def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) 
     for review in reviews:
         if (
             not isinstance(review, dict)
-            or set(review) != {"unit_id", "method", "related_paths"}
+            or set(review)
+            != {"unit_id", "method", "related_paths", "correspondence_ids"}
             or not _text(review["method"], limits["unit_method_utf8_bytes"])
             or not isinstance(review["related_paths"], list)
             or any(not isinstance(path, str) for path in review["related_paths"])
@@ -117,7 +120,25 @@ def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) 
         raise PlanError("Missing, duplicate or wrong-unit coverage")
     unit_map = {unit.id: unit for unit in plan.units}
     for review in reviews:
-        required = set(unit_map[review["unit_id"]].related_paths)
+        unit = unit_map[review["unit_id"]]
+        responsibilities = review["correspondence_ids"]
+        if (
+            not isinstance(responsibilities, list)
+            or any(not isinstance(key, str) for key in responsibilities)
+            or len(responsibilities) != len(set(responsibilities))
+            or set(responsibilities) != set(unit.correspondences)
+        ):
+            raise PlanError(
+                "Missing, duplicate or wrong-target correspondence attestation"
+            )
+        if len(review["method"].encode("utf-8")) > method_limit(unit) or (
+            unit.correspondences
+            and len(wire(review["method"])) > CORRESPONDENCE_METHOD_WIRE_BYTES
+        ):
+            raise PlanError(
+                "Correspondence method exceeds its bounded integration handoff"
+            )
+        required = set(unit.related_paths)
         if not required <= set(review["related_paths"]):
             raise PlanError(
                 "Binary examination omitted declared generator/decoder/consumer sources"
@@ -145,7 +166,7 @@ def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) 
                 )
         obligations.append(review["obligation"])
     expected = (
-        set(INTEGRATION_OBLIGATIONS)
+        set(plan.integration_obligations)
         if index is None or len(plan.shards) == 1
         else set()
     )
@@ -155,6 +176,17 @@ def validate_attestation(result: dict[str, Any], plan: Plan, index: int | None) 
         or set(obligations) != expected
     ):
         raise PlanError("Incomplete integration obligations")
+    for relation in plan.correspondences if expected else ():
+        review = next(
+            item
+            for item in integrations
+            if item["obligation"] == f"artifact-correspondence:{relation['id']}"
+        )
+        required = {relation["artifact"]["path"]} | {
+            source["path"] for source in relation["sources"]
+        }
+        if not required <= set(review["source_paths"]):
+            raise PlanError("Correspondence integration omitted a declared source part")
     contracts = result.get("contracts")
     if (
         not isinstance(contracts, list)

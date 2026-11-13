@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from test_merge_workflow import owned_fixture_process
@@ -24,6 +25,253 @@ from h2h_dev_tools import (
     review_execution,
     review_plan,
 )
+
+
+def _retained_ownership_error() -> process.ProcessOwnershipError:
+    error = process.ProcessOwnershipError("native cleanup unavailable")
+    error.__cause__ = OSError("scope close failed")
+    error.__context__ = RuntimeError("command termination failed")
+    error.__suppress_context__ = False
+    error.add_note("retained nested obligation")
+    return error
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "execute.git",
+        "execute.recovery",
+        "execute.review",
+        "workflow.diagnostic",
+        "workflow.completion",
+        "main",
+    ],
+)
+def test_ownership_failure_sidecar_preserves_details_without_new_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    receipt = tmp_path / "cleanup-7"
+    error = _retained_ownership_error()
+    reporter = Mock(side_effect=error)
+    spawn = Mock(side_effect=AssertionError("must not admit a new process"))
+    monkeypatch.setattr(process, "report_diagnostic", reporter)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(merge_command, "_run_git", Mock(side_effect=error))
+
+    @contextmanager
+    def destination(*_args: object, **_kwargs: object) -> Iterator[io.StringIO]:
+        yield io.StringIO()
+
+    monkeypatch.setattr(merge_command, "_review", Mock(side_effect=error))
+    if boundary.startswith("execute."):
+        status = merge_command._execute(
+            tmp_path,
+            ("fixture",),
+            review=boundary == "execute.review",
+            recovery=boundary == "execute.recovery",
+            receipt=receipt,
+        )
+    elif boundary.startswith("workflow."):
+        monkeypatch.setattr(os, "fdopen", destination)
+        status = merge_command._workflow_diagnostic(
+            "fixture", receipt, completion=boundary == "workflow.completion"
+        )
+    else:
+        monkeypatch.setattr(merge_command, "_execute", Mock(side_effect=error))
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["merge-command", "--cleanup-receipt", str(receipt), str(tmp_path), "git"],
+        )
+        status = merge_command.main()
+
+    assert status == 125
+    assert not receipt.exists()
+    assert reporter.call_count == int(boundary.startswith("workflow."))
+    spawn.assert_not_called()
+    document = json.loads((tmp_path / "cleanup-7.failure.json").read_bytes())
+    assert document == {
+        "schema": 1,
+        "kind": "merge-owner-failure-diagnostic",
+        "authoritative": False,
+        "exit_code": 125,
+        "cleanup_state": "unknown",
+        "boundary": boundary,
+        "exceptions": [
+            {
+                "type": "h2h_dev_tools.process.ProcessOwnershipError",
+                "message": "native cleanup unavailable",
+                "notes": ["retained nested obligation"],
+                "cause": 1,
+                "context": 2,
+                "context_suppressed": False,
+            },
+            {
+                "type": "builtins.OSError",
+                "message": "scope close failed",
+                "notes": [],
+                "cause": None,
+                "context": None,
+                "context_suppressed": False,
+            },
+            {
+                "type": "builtins.RuntimeError",
+                "message": "command termination failed",
+                "notes": [],
+                "cause": None,
+                "context": None,
+                "context_suppressed": False,
+            },
+        ],
+        "truncated": False,
+    }
+    assert not error.cleanup_proven
+    assert error.__notes__ == ["retained nested obligation"]
+
+
+@pytest.mark.parametrize("status", [0, 7, 125])
+def test_clean_command_does_not_create_failure_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    receipt = tmp_path / "cleanup"
+    monkeypatch.setattr(merge_command, "_run_git", Mock(return_value=status))
+    result = merge_command._execute(
+        tmp_path, ("fixture",), review=False, recovery=False, receipt=receipt
+    )
+    assert result == (1 if status == 125 else status)
+    assert receipt.read_text() == "owned_tree_empty\n"
+    assert not (tmp_path / "cleanup.failure.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["open", "write", "short", "close", "existing"])
+def test_failure_sidecar_io_cannot_replace_125_or_create_cleanup_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    receipt = tmp_path / "cleanup"
+    destination = tmp_path / "cleanup.failure.json"
+    error = _retained_ownership_error()
+    monkeypatch.setattr(merge_command, "_run_git", Mock(side_effect=error))
+    report = Mock(side_effect=AssertionError("must not emit fallback output"))
+    monkeypatch.setattr(process, "report_diagnostic", report)
+    original_write, original_close = os.write, os.close
+    if fault == "existing":
+        destination.write_bytes(b"retain earlier diagnostic")
+
+    def close(descriptor: int) -> None:
+        original_close(descriptor)
+        raise OSError("close failed")
+
+    with monkeypatch.context() as io_fault:
+        if fault == "open":
+            io_fault.setattr(os, "open", Mock(side_effect=OSError("open failed")))
+        write = Mock(
+            side_effect=OSError("write failed")
+            if fault == "write"
+            else lambda descriptor, payload: original_write(
+                descriptor, b"{" if fault == "short" else payload
+            )
+        )
+        io_fault.setattr(os, "write", write)
+        if fault == "close":
+            io_fault.setattr(os, "close", close)
+        status = merge_command._execute(
+            tmp_path, ("fixture",), review=False, recovery=False, receipt=receipt
+        )
+    assert status == 125
+    assert not receipt.exists()
+    assert write.call_count == (0 if fault in {"open", "existing"} else 1)
+    report.assert_not_called()
+    assert not error.cleanup_proven
+    if fault == "existing":
+        assert destination.read_bytes() == b"retain earlier diagnostic"
+    elif fault in {"write", "short"}:
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(destination.read_bytes())
+
+
+def test_failure_sidecar_bounds_unicode_notes_and_exception_graph() -> None:
+    error = _retained_ownership_error()
+    current: BaseException = error
+    for _ in range(10):
+        cause = RuntimeError('漢字\n"' * 4096)
+        current.__cause__ = cause
+        for _ in range(10):
+            current.add_note('漢字\n"' * 4096)
+        current = cause
+    payload = merge_command._ownership_failure_payload(error, boundary="execute.git")
+    assert len(payload) <= merge_command.OWNERSHIP_FAILURE_LIMIT_BYTES
+    document = json.loads(payload)
+    assert document["truncated"]
+    assert len(document["exceptions"]) == 8
+    assert any(node["cause"] == "omitted" for node in document["exceptions"])
+    assert all(len(node["notes"]) <= 8 for node in document["exceptions"])
+    assert "漢字" in document["exceptions"][1]["message"]
+
+    error.__cause__ = error
+    error.__suppress_context__ = True
+    document = json.loads(
+        merge_command._ownership_failure_payload(error, boundary="execute.git")
+    )
+    assert len(document["exceptions"]) == 1
+    assert document["exceptions"][0]["cause"] == 0
+    assert document["exceptions"][0]["context"] is None
+    assert document["exceptions"][0]["context_suppressed"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Exercises POSIX pipe backpressure")
+def test_ownership_failure_sidecar_ignores_full_output_pipe(tmp_path: Path) -> None:
+    package = Path(process.__file__).resolve().parent
+    actor = f"""import runpy, subprocess
+from pathlib import Path
+package = Path({str(package)!r})
+runpy.run_path(str(package / 'source_loader.py'))['load_package'](package, 'h2h_dev_tools')
+from h2h_dev_tools import merge_command, process
+error = process.ProcessOwnershipError('synthetic unproven cleanup')
+error.__cause__ = OSError('retained scope failure')
+error.add_note('retained terminal note')
+def fail(*args, **kwargs):
+    raise error
+def forbidden(*args, **kwargs):
+    raise AssertionError('no new reporter or process is allowed')
+merge_command._run_git = fail
+process.report_diagnostic = forbidden
+subprocess.Popen = forbidden
+raise SystemExit(merge_command._execute(
+    Path({str(tmp_path)!r}), ('fixture',), review=False, recovery=True,
+    receipt=Path({str(tmp_path / "cleanup")!r}),
+))
+"""
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        os.set_blocking(write_descriptor, False)
+        try:
+            while True:
+                os.write(write_descriptor, b"x" * 8192)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_descriptor, True)
+        with owned_fixture_process(
+            process.ProcessCommand(
+                "terminal ownership diagnostic with full output pipe",
+                (sys.executable, "-I", "-B", "-c", actor),
+                tmp_path,
+                stdout=write_descriptor,
+                stderr=write_descriptor,
+            ),
+            deadline=time.monotonic() + 10,
+        ) as owned:
+            # The parent never reads the full pipe; a traceback or new reporter
+            # must not be needed for the synthetic failure's natural exit.
+            assert owned.process.wait(timeout=5) == 125
+            assert os.get_blocking(write_descriptor)
+            assert not (tmp_path / "cleanup").exists()
+            document = json.loads((tmp_path / "cleanup.failure.json").read_bytes())
+            assert document["cleanup_state"] == "unknown"
+            assert document["exceptions"][0]["notes"] == ["retained terminal note"]
+            assert document["exceptions"][1]["message"] == "retained scope failure"
+    finally:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
 
 
 @pytest.mark.parametrize("completion", [False, True])

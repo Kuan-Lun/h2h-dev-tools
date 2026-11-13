@@ -44,6 +44,9 @@ MAX_RESULT_BYTES = 1024 * 1024
 SHARD_RESULT_BYTES = 512 * 1024
 SUMMARY_UTF8_BYTES = 8 * 1024
 UNIT_METHOD_UTF8_BYTES = 2 * 1024
+CORRESPONDENCE_METHOD_UTF8_BYTES = 512
+CORRESPONDENCE_METHOD_WIRE_BYTES = 1024
+BOUNDARY_BYTES = 512
 INTEGRATION_ANALYSIS_UTF8_BYTES = 8 * 1024
 CONTRACT_UTF8_BYTES = 1024
 MAX_CONTRACTS = 8
@@ -111,6 +114,38 @@ class Unit:
     sha256: str
     examination: str
     related_paths: tuple[str, ...]
+    correspondences: tuple[str, ...] = ()
+
+
+def method_limit(unit: Unit) -> int:
+    return (
+        CORRESPONDENCE_METHOD_UTF8_BYTES
+        if unit.correspondences
+        else UNIT_METHOD_UTF8_BYTES
+    )
+
+
+def _shard_instructions(obligations: tuple[str, ...], handoff: int) -> dict[str, Any]:
+    return {
+        "integration_obligations": list(obligations),
+        "integration_instruction": (
+            "For each assigned obligation read related raw candidate sources and "
+            "trace cross-module behavior; explain non-applicability explicitly. "
+            "Do not merely concatenate summaries. All general and artifact "
+            "correspondence obligations are required for a single-shard review."
+        ),
+        "handoff_instruction": (
+            "At most 8 concise interface/ownership obligations in contracts "
+            "(each <=1024 UTF-8 bytes). The entire compact ensure_ascii=False "
+            f"UTF-8 JSON contracts array must be <= {handoff} bytes. Cover all "
+            "relevant cross-shard obligations within that declared budget; "
+            "report incomplete rather than omit obligations. No result is truncated."
+        ),
+        "correspondence_method_limits": {
+            "utf8_bytes": CORRESPONDENCE_METHOD_UTF8_BYTES,
+            "wire_bytes": CORRESPONDENCE_METHOD_WIRE_BYTES,
+        },
+    }
 
 
 def response_capacity(
@@ -120,6 +155,7 @@ def response_capacity(
     shard_id: str,
     integration: bool,
     contracts_wire_bytes: int = MAX_HANDOFF_BYTES,
+    obligations: tuple[str, ...] = INTEGRATION_OBLIGATIONS,
 ) -> int:
     """Reserve complete mandatory coverage and bounded semantic text.
 
@@ -136,21 +172,32 @@ def response_capacity(
         "plan_digest": "0" * 64,
         "shard_id": shard_id,
         "unit_reviews": [
-            {"unit_id": unit.id, "method": "", "related_paths": unit.related_paths}
+            {
+                "unit_id": unit.id,
+                "method": "",
+                "related_paths": unit.related_paths,
+                "correspondence_ids": unit.correspondences,
+            }
             for unit in units
         ],
         "integration_reviews": [
             {"obligation": obligation, "analysis": "", "source_paths": source_paths}
-            for obligation in INTEGRATION_OBLIGATIONS
+            for obligation in obligations
         ]
         if integration
         else [],
         "contracts": [],
     }
-    text_bytes = SUMMARY_UTF8_BYTES + len(units) * UNIT_METHOD_UTF8_BYTES
+    text_bytes = SUMMARY_UTF8_BYTES
     if integration:
-        text_bytes += len(INTEGRATION_OBLIGATIONS) * INTEGRATION_ANALYSIS_UTF8_BYTES
-    return len(wire(result)) + 6 * text_bytes + contracts_wire_bytes - 2
+        text_bytes += len(obligations) * INTEGRATION_ANALYSIS_UTF8_BYTES
+    methods = sum(
+        CORRESPONDENCE_METHOD_WIRE_BYTES - 2
+        if unit.correspondences
+        else 6 * UNIT_METHOD_UTF8_BYTES
+        for unit in units
+    )
+    return len(wire(result)) + 6 * text_bytes + methods + contracts_wire_bytes - 2
 
 
 @dataclass(frozen=True)
@@ -162,6 +209,7 @@ class Plan:
     shards: tuple[tuple[str, ...], ...]
     payloads: dict[str, str]
     historical_related: tuple[dict[str, Any], ...] = ()
+    correspondences: tuple[dict[str, Any], ...] = ()
 
     def document(self) -> dict[str, Any]:
         return {
@@ -169,13 +217,17 @@ class Plan:
             "coverage": self.scope,
             "inventory": list(self.inventory),
             "historical_related": list(self.historical_related),
+            "correspondences": list(self.correspondences),
             "units": [asdict(unit) for unit in self.units],
             "shards": [list(shard) for shard in self.shards],
-            "integration_obligations": list(INTEGRATION_OBLIGATIONS),
+            "integration_obligations": list(self.integration_obligations),
             "limits": {
                 "unit_bytes": UNIT_BYTES,
                 "shard_bytes": SHARD_BYTES,
                 "shard_units": SHARD_UNITS,
+                "correspondence_method_utf8_bytes": CORRESPONDENCE_METHOD_UTF8_BYTES,
+                "correspondence_method_wire_bytes": CORRESPONDENCE_METHOD_WIRE_BYTES,
+                "boundary_bytes": BOUNDARY_BYTES,
                 "blob_bytes": MAX_BLOB_BYTES,
                 "expanded_bytes": MAX_EXPANDED_BYTES,
                 "members": MAX_MEMBERS,
@@ -207,14 +259,36 @@ class Plan:
         ids = self.shards[index]
         selected = {unit.id: unit for unit in self.units}
         return {
+            **_shard_instructions(
+                self.integration_obligations if len(self.shards) == 1 else (),
+                self.handoff_budget,
+            ),
             "plan_digest": self.fingerprint,
             "shard_id": f"shard-{index:04d}",
             "response_limits": self.response_limits(index),
             "historical_related": list(self.historical_related),
+            "correspondences": self._selected_correspondences(ids),
             "units": [
                 {**asdict(selected[key]), "content": self.payloads[key]} for key in ids
             ],
         }
+
+    def _selected_correspondences(self, ids: tuple[str, ...]) -> list[dict[str, Any]]:
+        selected = set(ids)
+        return [
+            relation
+            for relation in self.correspondences
+            if selected.intersection(
+                relation["artifact_units"] + relation["source_units"]
+            )
+        ]
+
+    @property
+    def integration_obligations(self) -> tuple[str, ...]:
+        return INTEGRATION_OBLIGATIONS + tuple(
+            f"artifact-correspondence:{relation['id']}"
+            for relation in self.correspondences
+        )
 
     def response_limits(self, index: int | None) -> dict[str, int]:
         return response_limits(
@@ -241,6 +315,7 @@ class Plan:
             shard_id="integration" if index is None else f"shard-{index:04d}",
             integration=index is None or len(self.shards) == 1,
             contracts_wire_bytes=self.response_limits(index)["contracts_wire_bytes"],
+            obligations=self.integration_obligations,
         )
 
     def validate_response_capacity(self) -> None:
@@ -258,14 +333,24 @@ class Plan:
                 )
 
     def _integration(
-        self, contracts: list[list[str]], fingerprint: str
+        self,
+        contracts: list[list[str]],
+        fingerprint: str,
+        correspondence_methods: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        source_indices = {
+            (entry.get("origin", self.target["tree"]), entry["path"]): index
+            for index, entry in enumerate((*self.inventory, *self.historical_related))
+        }
         return {
             "plan_digest": fingerprint,
             "shard_id": "integration",
             "response_limits": self.response_limits(None),
             "units": [],
-            "integration_obligations": list(INTEGRATION_OBLIGATIONS),
+            "integration_obligations": list(self.integration_obligations),
+            "correspondences": list(self.correspondences),
+            "correspondence_methods": correspondence_methods or {},
+            "correspondence_boundaries": self.correspondence_boundaries(),
             "handoffs": [
                 {
                     "shard_id": f"shard-{index:04d}",
@@ -278,36 +363,78 @@ class Plan:
             ],
             "inventory": list(self.inventory),
             "historical_related": list(self.historical_related),
-            "coverage_map": [
-                {
-                    key: getattr(unit, key)
-                    for key in (
-                        "id",
-                        "path",
-                        "origin",
-                        "member",
-                        "kind",
-                        "start",
-                        "end",
-                    )
-                }
-                for unit in self.units
-            ],
+            "candidate_tree": self.target["tree"],
+            "coverage_map": {
+                "columns": ["id", "source", "member", "kind", "start", "end"],
+                "rows": [
+                    [
+                        unit.id,
+                        source_indices[(unit.origin, unit.path)],
+                        unit.member,
+                        unit.kind,
+                        unit.start,
+                        unit.end,
+                    ]
+                    for unit in self.units
+                ],
+            },
             "integration_instruction": (
-                "Read raw source using this exact "
-                "id/path/origin/member/range map across every reported "
+                "The coverage_map columns describe every row without truncation. "
+                "Its source index addresses inventory followed by historical_related; "
+                "inventory entries use candidate_tree as origin. These entries bind "
+                "each source to its exact path, blob and mode. Read raw source using "
+                "this exact id/source/member/range map across every reported "
                 "contract and all shard boundaries. Read deleted source "
                 "and its related contracts from their historical origin. "
                 "Reconcile conflicting assumptions, large-file splits, "
                 "generator/validator/runtime, fixtures/tests and "
                 "callers. This stage attests interactions, not merely "
-                "summary consistency."
+                "summary consistency. Each artifact-correspondence obligation "
+                "must reconcile every source and artifact part, their methods, "
+                "generation/decoding/validation/consumer contracts and raw boundary "
+                "content below. Each boundary unit_id resolves through coverage_map. "
+                "Source parts have already "
+                "received full raw review; "
+                "do not repeat their entire files. Read additional exact raw ranges "
+                "needed to resolve cross-part claims. Unresolved correspondence is "
+                "incomplete, never assumed from hashes or handoff consistency."
             ),
         }
 
+    def correspondence_boundaries(self) -> list[dict[str, Any]]:
+        """Exact raw edge context, not sampled replacement for full unit review."""
+        result = []
+        for unit in self.units:
+            if not unit.correspondences:
+                continue
+            data = self.payloads[unit.id].encode("utf-8")
+            if len(data) <= 2 * BOUNDARY_BYTES:
+                ranges = [(0, len(data))]
+            else:
+                left, right = BOUNDARY_BYTES, len(data) - BOUNDARY_BYTES
+                while left and data[left] & 0xC0 == 0x80:
+                    left -= 1
+                while right < len(data) and data[right] & 0xC0 == 0x80:
+                    right += 1
+                ranges = [(0, left), (right, len(data))]
+            for start, end in ranges:
+                result.append(
+                    {
+                        "unit_id": unit.id,
+                        "start": unit.start + start,
+                        "end": unit.start + end,
+                        "content": data[start:end].decode("utf-8"),
+                    }
+                )
+        return result
+
     def _integration_base_bytes(self) -> int:
         # A fixed-width digest breaks the budget/document/fingerprint dependency.
-        return len(wire(self._integration([[] for _ in self.shards], "0" * 64)))
+        # Every participating unit's bounded semantic method is forwarded intact.
+        methods = {unit.id: "" for unit in self.units if unit.correspondences}
+        return len(
+            wire(self._integration([[] for _ in self.shards], "0" * 64, methods))
+        ) + len(methods) * (CORRESPONDENCE_METHOD_WIRE_BYTES - 2)
 
     @property
     def handoff_budget(self) -> int:
@@ -331,20 +458,43 @@ class Plan:
             self.handoff_budget - 2
         )
 
-    def integration_assignment(self, contracts: list[list[str]]) -> dict[str, Any]:
+    def integration_assignment(
+        self,
+        contracts: list[list[str]],
+        correspondence_methods: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        methods = correspondence_methods or {}
+        expected = {unit.id for unit in self.units if unit.correspondences}
+        if set(methods) != expected or any(
+            not isinstance(method, str)
+            or not method.strip()
+            or len(method.encode("utf-8")) > CORRESPONDENCE_METHOD_UTF8_BYTES
+            or len(wire(method)) > CORRESPONDENCE_METHOD_WIRE_BYTES
+            for method in methods.values()
+        ):
+            raise PlanError("Missing or invalid exact correspondence handoff methods")
         if len(contracts) != len(self.shards) or any(
             len(wire(summaries)) > self.handoff_budget for summaries in contracts
         ):
             raise PlanError(
                 "Integration handoff exceeds the preflight per-shard wire budget"
             )
-        assignment = self._integration(contracts, self.fingerprint)
+        assignment = self._integration(contracts, self.fingerprint, methods)
         if len(wire(assignment)) > MAX_INTEGRATION_BYTES:
             raise PlanError("Integration assignment exceeds its preflight bound")
         return assignment
 
     def validate_prompt_capacity(self, prefix: str) -> None:
         self.validate_response_capacity()
+        for index in range(len(self.shards)):
+            size = len(wire(self.assignment(index)))
+            if (
+                size > SHARD_BYTES
+                or size + len(prefix.encode("utf-8")) > MAX_PROMPT_BYTES
+            ):
+                raise PlanError(
+                    "Mandatory shard reading closure exceeds its input budget before review"
+                )
         if (
             len(self.shards) > 1
             and len(prefix.encode("utf-8")) + self.integration_max_bytes
@@ -952,6 +1102,7 @@ def build_plan(
             declarations, historical_declarations, selected, deadline=deadline
         )
         for path in selected - paths:
+            historical_related[path] = {**previous[path], "origin": base}
             for related_path in historical_declarations.get(path, {}).get(
                 "related-paths", []
             ):
@@ -961,15 +1112,54 @@ def build_plan(
                 }
             by_path[path] = previous[path]
             origins[path] = base
+    # Materialize the complete declared relationship closure at each immutable
+    # origin. A deleted artifact's source may differ from the candidate's path.
+    records = {(origins[path], path): by_path[path] for path in sorted(selected)}
+    pending_records = list(records)
+    relations: list[dict[str, Any]] = []
+    relation_metadata_bytes = 0
+    while pending_records:
+        check_deadline(deadline)
+        origin, path = pending_records.pop(0)
+        applicable = declarations if origin == tree else historical_declarations
+        if path not in applicable:
+            continue
+        declaration = applicable[path]
+        related_inventory = by_path if origin == tree else previous
+        relations.append(
+            {
+                "id": f"a{len(relations):06d}",
+                "artifact": {**records[(origin, path)], "origin": origin},
+                "declaration": declaration,
+                "sources": [
+                    {**related_inventory[related], "origin": origin}
+                    for related in declaration["related-paths"]
+                ],
+            }
+        )
+        relation_metadata_bytes += len(canonical(relations[-1]))
+        if relation_metadata_bytes > MAX_UNIT_METADATA_BYTES:
+            raise PlanError(
+                "Correspondence metadata exceeds the review metadata budget"
+            )
+        for related in declaration["related-paths"]:
+            identity = (origin, related)
+            if origin != tree:
+                historical_related[related] = {
+                    **related_inventory[related],
+                    "origin": origin,
+                }
+            if identity not in records:
+                records[identity] = related_inventory[related]
+                pending_records.append(identity)
     units: list[Unit] = []
     payloads: dict[str, str] = {}
     binary_paths = set()
     budget = _PlanBudget()
-    blobs = _blobs(repository, [by_path[path] for path in sorted(selected)], deadline)
-    for path in sorted(selected):
+    blobs = _blobs(repository, list(records.values()), deadline)
+    for (origin, path), item in sorted(records.items()):
         check_deadline(deadline)
-        applicable = declarations if path in paths else historical_declarations
-        item = by_path[path]
+        applicable = declarations if origin == tree else historical_declarations
         data = blobs[item["blob"]]
         if len(data) != item["size"]:
             raise PlanError("Git blob size drift")
@@ -979,9 +1169,9 @@ def build_plan(
                     f"Text cannot be excluded through a binary declaration: {path}"
                 )
             views: list[tuple[str | None, str, bytes]] = [
-                (None, "text" if path in paths else "deleted-text", data)
+                (None, "text" if origin == tree else "deleted-text", data)
             ]
-            related: tuple[str, ...] = ()
+            unit_related: tuple[str, ...] = ()
             examination = (
                 "Read every assigned byte range and its complete "
                 "file/related contracts; symlink payload is a link "
@@ -996,7 +1186,9 @@ def build_plan(
             binary_paths.add(path)
             declaration = applicable[path]
             views = _binary_views(data, declaration, deadline=deadline, budget=budget)
-            related = tuple(declaration["related-paths"])
+            # The relation graph assigns all related bytes to their own source
+            # units. An artifact unit no longer repeats that entire reading load.
+            unit_related = ()
             examination = declaration["reason"]
         for member, kind, content in views:
             budget.retain_view(len(content))
@@ -1013,7 +1205,7 @@ def build_plan(
                     path,
                     item["blob"],
                     item["mode"],
-                    origins[path],
+                    origin,
                     member,
                     kind,
                     start,
@@ -1021,7 +1213,7 @@ def build_plan(
                     len(content),
                     content_digest,
                     examination,
-                    related,
+                    unit_related,
                 )
                 budget.retain_unit(unit, len(units))
                 units.append(unit)
@@ -1031,12 +1223,81 @@ def build_plan(
                 start = end
     if scope["scope"] == "repository" and set(declarations) != binary_paths:
         raise PlanError("Artifact declarations must exactly match the binary inventory")
+    for relation in relations:
+        check_deadline(deadline)
+        artifact = relation["artifact"]
+        relation["artifact_units"] = [
+            unit.id
+            for unit in units
+            if (unit.origin, unit.path) == (artifact["origin"], artifact["path"])
+        ]
+        source_keys = {
+            (source["origin"], source["path"]) for source in relation["sources"]
+        }
+        relation["source_units"] = [
+            unit.id for unit in units if (unit.origin, unit.path) in source_keys
+        ]
+    units = [
+        replace(
+            unit,
+            correspondences=tuple(
+                relation["id"]
+                for relation in relations
+                if unit.id in relation["artifact_units"] + relation["source_units"]
+            ),
+        )
+        for unit in units
+    ]
+    if (
+        sum(len(canonical(asdict(unit))) for unit in units)
+        + sum(len(canonical(relation)) for relation in relations)
+        > MAX_UNIT_METADATA_BYTES
+    ):
+        raise PlanError(
+            "Unit and correspondence metadata exceed the review metadata budget"
+        )
+
+    def reading_bytes(assigned: list[Unit]) -> int:
+        ids = {unit.id for unit in assigned}
+        return len(
+            wire(
+                {
+                    **_shard_instructions(
+                        INTEGRATION_OBLIGATIONS
+                        + tuple(
+                            f"artifact-correspondence:{relation['id']}"
+                            for relation in relations
+                        ),
+                        MAX_HANDOFF_BYTES,
+                    ),
+                    "plan_digest": "0" * 64,
+                    "shard_id": "shard-0000",
+                    "response_limits": response_limits(integration=True),
+                    "historical_related": list(historical_related.values()),
+                    "correspondences": [
+                        relation
+                        for relation in relations
+                        if ids.intersection(
+                            relation["artifact_units"] + relation["source_units"]
+                        )
+                    ],
+                    "units": [
+                        {**asdict(unit), "content": payloads[unit.id]}
+                        for unit in assigned
+                    ],
+                }
+            )
+        )
+
     shards: list[tuple[str, ...]] = []
     pending: list[str] = []
     pending_units: list[Unit] = []
-    size = 0
     for unit in units:
-        cost = len(canonical({**asdict(unit), "content": payloads[unit.id]}))
+        check_deadline(deadline)
+        if reading_bytes([unit]) > SHARD_BYTES:
+            raise PlanError(
+                "A single mandatory reading closure exceeds the shard budget"
+            )
         if (
             response_capacity(
                 (unit,), source_paths=(), shard_id="shard-0000", integration=False
@@ -1045,7 +1306,7 @@ def build_plan(
         ):
             raise PlanError("A single review unit exceeds the response wire budget")
         if pending and (
-            size + cost > SHARD_BYTES
+            reading_bytes([*pending_units, unit]) > SHARD_BYTES
             or len(pending) >= SHARD_UNITS
             or response_capacity(
                 (*pending_units, unit),
@@ -1056,10 +1317,9 @@ def build_plan(
             > SHARD_RESULT_BYTES
         ):
             shards.append(tuple(pending))
-            pending, pending_units, size = [], [], 0
+            pending, pending_units = [], []
         pending.append(unit.id)
         pending_units.append(unit)
-        size += cost
     if pending:
         shards.append(tuple(pending))
     if not units:
@@ -1073,6 +1333,7 @@ def build_plan(
         tuple(shards),
         payloads,
         tuple(historical_related[path] for path in sorted(historical_related)),
+        tuple(relations),
     )
     # One shard also performs integration. If the combined response cannot fit,
     # preserve all units and use separate shard and integration invocations.
@@ -1101,7 +1362,7 @@ def validate_plan(document: object) -> None:
     if not isinstance(units, list) or not units or not isinstance(shards, list):
         raise PlanError("Missing review units/shards")
     identities = set()
-    ranges: dict[tuple[str, str | None, str], list[dict[str, Any]]] = {}
+    ranges: dict[tuple[str, str, str | None, str], list[dict[str, Any]]] = {}
     for unit in units:
         if not isinstance(unit, dict) or set(unit) != set(Unit.__dataclass_fields__):
             raise PlanError("Malformed review unit")
@@ -1109,6 +1370,12 @@ def validate_plan(document: object) -> None:
         if not isinstance(key, str) or key in identities:
             raise PlanError("Duplicate/invalid review unit")
         identities.add(key)
+        if (
+            not isinstance(unit["correspondences"], (list, tuple))
+            or any(not isinstance(value, str) for value in unit["correspondences"])
+            or len(unit["correspondences"]) != len(set(unit["correspondences"]))
+        ):
+            raise PlanError("Malformed correspondence responsibility")
         for field in ("start", "end", "size"):
             if type(unit[field]) is not int:
                 raise PlanError("Review byte ranges must be exact integers")
@@ -1117,7 +1384,9 @@ def validate_plan(document: object) -> None:
             or unit["end"] - unit["start"] > UNIT_BYTES
         ):
             raise PlanError("Malformed review byte range")
-        ranges.setdefault((unit["path"], unit["member"], unit["kind"]), []).append(unit)
+        ranges.setdefault(
+            (unit["origin"], unit["path"], unit["member"], unit["kind"]), []
+        ).append(unit)
     for group in ranges.values():
         end = 0
         for unit in sorted(group, key=lambda item: item["start"]):
@@ -1133,3 +1402,71 @@ def validate_plan(document: object) -> None:
     assigned = [key for shard in shards for key in shard]
     if len(assigned) != len(set(assigned)) or set(assigned) != identities:
         raise PlanError("Missing, duplicate or unknown unit assignment")
+    relations = document.get("correspondences")
+    if not isinstance(relations, list):
+        raise PlanError("Missing correspondence responsibility graph")
+    relation_ids: set[str] = set()
+    expected_membership: dict[str, set[str]] = {key: set() for key in identities}
+    for relation in relations:
+        if not isinstance(relation, dict) or set(relation) != {
+            "id",
+            "artifact",
+            "declaration",
+            "sources",
+            "artifact_units",
+            "source_units",
+        }:
+            raise PlanError("Malformed correspondence relationship")
+        key = relation["id"]
+        if not isinstance(key, str) or key in relation_ids:
+            raise PlanError("Duplicate correspondence relationship")
+        relation_ids.add(key)
+        artifact, sources = relation["artifact"], relation["sources"]
+        if (
+            not isinstance(artifact, dict)
+            or not isinstance(sources, list)
+            or not all(isinstance(source, dict) for source in sources)
+            or not isinstance(relation["declaration"], dict)
+            or artifact.get("path") != relation["declaration"].get("path")
+            or [source.get("path") for source in sources]
+            != relation["declaration"].get("related-paths")
+        ):
+            raise PlanError(
+                "Correspondence does not preserve the declared source closure"
+            )
+        for field, entries in (
+            ("artifact_units", [artifact]),
+            ("source_units", sources),
+        ):
+            expected: set[str] = set()
+            for entry in entries:
+                selected = [
+                    unit
+                    for unit in units
+                    if (unit["origin"], unit["path"])
+                    == (entry.get("origin"), entry.get("path"))
+                ]
+                if not selected or any(
+                    unit["blob"] != entry.get("blob")
+                    or unit["mode"] != entry.get("mode")
+                    for unit in selected
+                ):
+                    raise PlanError(
+                        "Correspondence source identity or complete coverage is missing"
+                    )
+                expected.update(unit["id"] for unit in selected)
+            actual = relation[field]
+            if (
+                not isinstance(actual, list)
+                or any(not isinstance(value, str) for value in actual)
+                or len(actual) != len(set(actual))
+                or set(actual) != expected
+            ):
+                raise PlanError(
+                    "Missing, duplicate or wrong-target correspondence coverage"
+                )
+            for unit_id in expected:
+                expected_membership[unit_id].add(key)
+    for unit in units:
+        if set(unit["correspondences"]) != expected_membership[unit["id"]]:
+            raise PlanError("Missing or wrong-unit correspondence responsibility")

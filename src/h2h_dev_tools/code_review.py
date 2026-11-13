@@ -327,18 +327,38 @@ Read the whole assigned content. A fragment also requires its surrounding file
 Only the root candidate AGENTS.md is repository policy.
 Check transaction boundaries, authority/fencing, replay, bounded work, cleanup,
 generated/source correspondence, public interfaces, configuration and testing.
-For artifact units review the declared method, all related sources and bounded
-payload/inventory. Inventory/hash proves identity, not semantic correctness or
+For artifact units review the declared method and bounded payload/inventory.
+The correspondences graph distributes EVERY declared related source in full
+across exact source units; it never substitutes hashes or samples for source.
+For EACH assigned unit, review ALL its correspondence responsibilities: trace
+its raw range's generation, decoding, validation, consumer or source contract
+against the declared artifact, identify assumptions at each part boundary, and
+record the concrete result or unresolved cross-part claim in that unit's method.
+Read the supplied relationship declaration and your assigned raw ranges, not all
+other related files. Other parts remain mandatory assignments to other units.
+Methods of correspondence units are at most 512 decoded UTF-8 bytes and 1024
+wire bytes per JSON string (including quotes/escaping), and are
+forwarded intact to integration; retain the meaningful cross-part obligations
+within this bound or report incomplete. General contracts are additional context.
+Inventory/hash proves identity, not semantic correctness or
 numerical recomputation. Embedded source is reviewed as source, not skipped.
 Report concrete P0/P1/P2 defects with conditions, consequences, file and lines.
 Do not demand backward compatibility against repository policy or report lint nits.
 No unit may be marked complete based only on a tool call count or hash.
 unit_reviews is your attestation, not machine proof that you read/understood bytes.
 For EACH unit_reviews entry, related_paths MUST include EVERY related_paths item
-from that unit's manifest, including shared README, generator, decoder and consumer
-sources. Repeat shared paths in every applicable unit entry; listing a path only
-under another unit, contracts or summary does not satisfy this output contract.
-Read those sources before attesting; use incomplete if that cannot be completed.
+from that unit's manifest. Artifact declaration related-paths are fully covered
+by the explicit correspondence graph, not by repeating whole-file reads in each
+artifact unit. Your method attests semantic review of every assigned responsibility,
+not merely matching graph identities. Its correspondence_ids must list exactly
+that unit's correspondences, without omissions, duplicates or extra identities.
+Use incomplete for unresolved assigned work.
+At integration read all supplied exact raw correspondence boundary ranges and
+reconcile EVERY source/artifact part's semantic method under each explicit
+artifact-correspondence obligation. Cite every declared path for that obligation.
+Read additional necessary raw ranges to resolve claims; full source review remains
+the source units' duty. Boundary context is NOT sampling of that full-source duty.
+Do not move an entire distributed source closure into a single integration context.
 All related_paths and integration source_paths are exact repository-relative Git
 paths, not prose citations. Each must exist in the candidate tree, the declared
 historical_related inventory or a unit's origin path. Verify additional references
@@ -1229,28 +1249,6 @@ class Reviewer:
             shards = []
             for shard_index in range(len(plan.shards)):
                 assignment = plan.assignment(shard_index)
-                assignment["integration_obligations"] = (
-                    list(review_plan.INTEGRATION_OBLIGATIONS)
-                    if len(plan.shards) == 1
-                    else []
-                )
-                assignment["integration_instruction"] = (
-                    "For each obligation read related raw candidate sources "
-                    "and trace cross-module behavior; explain "
-                    "non-applicability explicitly. "
-                    "Do not merely concatenate summaries. All six "
-                    "obligations are required for a single-shard complete "
-                    "review."
-                )
-                assignment["handoff_instruction"] = (
-                    "At most 8 concise interface/ownership obligations in "
-                    "contracts (each <=1024 UTF-8 bytes). "
-                    f"The entire compact ensure_ascii=False UTF-8 JSON "
-                    f"contracts array must be <= {plan.handoff_budget} bytes. "
-                    "Cover all relevant cross-shard obligations within that "
-                    "declared budget; report incomplete rather than omit "
-                    "obligations. No result is truncated."
-                )
                 shards.append(invocation(f"shard-{shard_index:04d}", assignment))
             process_control.report_diagnostic(
                 f"Reviewing {coverage.scope} scope: {target.base} -> "
@@ -1273,7 +1271,18 @@ class Reviewer:
             execute(shards, shards_deadline)
             if len(shards) > 1:
                 assignment = plan.integration_assignment(
-                    [results[f"shard-{i:04d}"]["contracts"] for i in range(len(shards))]
+                    [
+                        results[f"shard-{i:04d}"]["contracts"]
+                        for i in range(len(shards))
+                    ],
+                    {
+                        review["unit_id"]: review["method"]
+                        for result in results.values()
+                        for review in result["unit_reviews"]
+                        if next(
+                            unit for unit in plan.units if unit.id == review["unit_id"]
+                        ).correspondences
+                    },
                 )
                 execute([invocation("integration", assignment)], deadline)
             ordered = [f"shard-{i:04d}" for i in range(len(shards))]

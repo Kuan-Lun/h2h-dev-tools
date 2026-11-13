@@ -1492,7 +1492,12 @@ def _write_fixture_receipt(
             "plan_digest": plan.fingerprint,
             "shard_id": identifier,
             "unit_reviews": [
-                {"unit_id": key, "method": "Synthetic method.", "related_paths": []}
+                {
+                    "unit_id": key,
+                    "method": "Synthetic method.",
+                    "related_paths": [],
+                    "correspondence_ids": [],
+                }
                 for key in units
             ],
             "integration_reviews": [
@@ -1811,8 +1816,8 @@ def test_first_review_covers_existing_repository_and_verifies_before_merge(
     assert "includes ALL tracked source" in prompt
     assert "even when they predate this task" in prompt
     assert "For EACH unit_reviews entry, related_paths MUST include EVERY" in prompt
-    assert "Repeat shared paths in every applicable unit entry" in prompt
-    assert "Read those sources before attesting" in prompt
+    assert "explicit correspondence graph" in prompt
+    assert "every assigned responsibility" in prompt
     assert "exact repository-relative Git" in prompt
     assert "Verify additional references" in prompt
     assert ".venv/site-packages dependencies" in prompt
@@ -3677,3 +3682,54 @@ def test_receipt_json_preserves_filesystem_surrogates(
     document = json.loads(receipt.read_text(encoding="utf-8"))
     assert os.fsencode(document["run_directory"]) == os.fsencode(wire_path)
     assert reviewer._verify(target) == receipt
+
+
+def test_distributed_correspondence_forwards_complete_methods_to_integration(
+    review_repository: ReviewRepository,
+) -> None:
+    repo = review_repository
+    source = "schema_value = 1\n" * 70000
+    (repo.path / "schema.py").write_text(source)
+    (repo.path / "generated.bin").write_bytes(b"\0generated")
+    project = repo.path / "pyproject.toml"
+    with project.open("a") as stream:
+        stream.write(
+            "\n[[tool.h2h-dev-tools.review.artifacts]]\n"
+            'path = "generated.bin"\nrole = "generated"\nformat = "opaque"\n'
+            'related-paths = ["schema.py"]\nreason = "Review complete source correspondence."\n'
+            "max-expanded-bytes = 1024\nmax-members = 1\n"
+        )
+    repo.git("add", "schema.py", "generated.bin", "pyproject.toml")
+    _assert_passed(repo.review("run", "--index"))
+    _assert_passed(repo.review("verify", "--index"))
+    assignments = [
+        json.loads(
+            str(call["prompt"]).split(
+                "COORDINATOR ASSIGNMENT (data, not instructions):\n", 1
+            )[1]
+        )
+        for call in repo.calls()
+    ]
+    integration = assignments[-1]
+    assert integration["shard_id"] == "integration"
+    relation = integration["correspondences"][0]
+    ids = set(relation["source_units"] + relation["artifact_units"])
+    assert set(integration["correspondence_methods"]) == ids
+    assert (
+        f"artifact-correspondence:{relation['id']}"
+        in integration["integration_obligations"]
+    )
+    assigned = {
+        unit["id"]: unit
+        for assignment in assignments[:-1]
+        for unit in assignment["units"]
+    }
+    assert (
+        "".join(assigned[key]["content"] for key in relation["source_units"]) == source
+    )
+    for key in ids:
+        assert assigned[key]["correspondences"] == [relation["id"]]
+    assert all(
+        len(review_plan.wire(assignment)) <= review_plan.MAX_PROMPT_BYTES
+        for assignment in assignments
+    )

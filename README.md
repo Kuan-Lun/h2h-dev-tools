@@ -6,18 +6,18 @@ run offline against the code present in that repository's Git tree.
 
 ## Install and synchronize
 
-Use Python 3.14 or newer. When version 0.9.0 is available on your selected
+Use Python 3.14 or newer. When version 0.13.0 is available on your selected
 index, install it in a development environment:
 
 ```bash
-python -m pip install h2h-dev-tools==0.9.0
+python -m pip install h2h-dev-tools==0.13.0
 ```
 
 For candidate validation, install an explicitly supplied wheel instead. These
 examples do not assert publication status:
 
 ```bash
-python -m pip install /absolute/path/to/h2h_dev_tools-0.9.0-py3-none-any.whl
+python -m pip install /absolute/path/to/h2h_dev_tools-0.13.0-py3-none-any.whl
 ```
 
 Declare the components the consumer actually uses in its `pyproject.toml`:
@@ -482,6 +482,15 @@ The diagnostic launcher shares the workflow's tracked PID, signal handoff and
 cleanup-receipt checks.
 Missing diagnostic cleanup proof retains the candidate and owner files and
 stops both further diagnostics and Git recovery.
+At the three ownership-error exits in the merge command, workflow diagnostic and
+outer launcher, the same process attempts to preserve bounded exception, cause,
+context and notes in `cleanup-N.failure.json` (at most 64 KiB). This sidecar has
+`authoritative=false` and `cleanup_state=unknown`; it is not a cleanup receipt and
+cannot authorize recovery, release admission or prove cleanup. It starts no writer
+and receives no new deadline. Write failure still returns 125, and partial or invalid
+JSON must not be trusted. Synchronous filesystem calls have no guaranteed return
+time within the original budget. This diagnostic does not repair or establish the
+cause of an ownership failure.
 Preflight messages before an owner exists retain normal stdio behavior; no Git
 mutation or owned child has started at that point.
 A failed abort prevents the recovery checkout; recovery never rolls back an
@@ -602,6 +611,12 @@ converted: run the new review to establish evidence for the current implementati
 V3 also rejects V2 evidence and partial-run continuation. Updating the shared reviewer
 closure requires a fresh full-repository baseline in every updated consumer; historical
 receipts remain historical evidence, and are never rewritten into new coverage.
+Version 0.13 changes reviewer responses and evidence by requiring exact distributed
+artifact correspondence attestations. Old results cannot acquire those semantic
+attestations through a field conversion; there is no compatibility fallback.
+Artifact TOML declarations and the snapshot schema are unchanged. No consumer
+runtime or data migration is required; generate updated snapshots with the standard
+CLI and establish a new full-repository review baseline.
 
 Before starting Codex, review records its unit count, assigned bytes, shard count,
 concurrency, queued waves and remaining execution capacity in `time-budget.json`
@@ -630,20 +645,29 @@ planning data, not passing review evidence; partial runs are still not resumed.
 A deterministic plan binds every tracked path, mode, blob and text byte range.
 Fresh-context shards contain at most 32 units, each at most 64 KiB, packed into
 384 KiB assignments. Up to four registered owners run concurrently. Every shard
-can read any raw candidate source; all shards must pass, followed by a separate
-cross-module integration review (a single shard performs both roles). Coverage is
+can read any raw candidate source; all shards must return valid, complete results
+before a separate cross-module integration review (a single shard performs both
+roles). Any finding prevents passing evidence. Coverage is
 reviewer attestation, not machine proof that a model read or understood the bytes.
 The aggregate deadline includes planning, preflight, output validation and cleanup;
-it is never multiplied by shard count. Before review starts, the full inventory and
-id/path/origin/member/range map determine each shard's UTF-8 JSON handoff budget.
-Every accepted handoff, together with the policy and integration assignment,
-must fit the declared prompt bound; no contracts or coverage are truncated.
+it is never multiplied by shard count. Before review starts, packing budgets the
+complete assignment, including instructions and correspondence metadata. The full
+inventory and exact coverage map determine each shard's UTF-8 JSON handoff budget.
+Integration uses compact `coverage_map.columns` and `rows`: each `source` indexes
+`inventory` followed by `historical_related`, with `candidate_tree` as the former's
+origin. This preserves every path/blob/mode/origin/member/range identity without
+claiming semantic proof. Every accepted handoff, intact correspondence method,
+raw boundary context, policy and integration assignment must fit the declared
+prompt bound; no contracts or coverage are truncated.
 Each assignment also declares its response limits. Shard-only output is bounded
 to 512 KiB; integration and combined single-shard output to 1 MiB, including JSON
 escaping and whitespace. Packing reserves exact keys, identities and every required
-related source, plus up to 2 KiB of decoded UTF-8 per unit method, 8 KiB for the
-summary and 8 KiB per integration analysis, allowing six wire bytes per text byte.
-Each of the six integration obligations can cite every known source once.
+related source, plus up to 2 KiB of decoded UTF-8 per ordinary unit method, 8 KiB
+for the summary and 8 KiB per integration analysis, allowing six wire bytes per
+text byte. A correspondence unit's method has the additional limits of 512 decoded
+UTF-8 bytes and 1024 compact JSON string bytes; its full method reaches integration.
+Besides the six general integration obligations, each artifact has its own
+`artifact-correspondence:<id>` obligation. Each can cite every known source once.
 Contracts retain their per-shard wire budget, at most eight 1 KiB strings;
 integration output has a fixed 8256-byte contracts cap with no downstream handoff.
 Repeated paths within one source list are rejected. Optional extra references,
@@ -724,7 +748,16 @@ complete syntax parsing plus bounded structure/value samples; unlisted JSON rema
 full text. Samples and hashes do not prove historical numerical correctness.
 Generated opaque payloads require examination of their declared generator, restricted
 decoder, validator, consumer and source correspondence. Binary deletions and rename
-sources use the primary parent's declaration and related-source identities.
+sources use the primary parent's declaration and complete historical related-source
+bytes. Every related source receives complete, nonoverlapping immutable byte-range
+coverage, reusing existing source units where possible. Artifact and source units
+must attest their exact `correspondence_ids`; a path name or hash is not a substitute
+for their full assigned reading. Integration reconciles all participating methods
+and the generator/decoder/validator/consumer contracts, reads the supplied exact raw
+boundary context, and reads additional exact raw ranges needed to resolve cross-part
+claims. Boundaries do not replace full source review with sampling, and integration
+does not repeat an entire large source closure in one context. Unresolved
+correspondence is `incomplete` and blocks passing evidence.
 
 Process-owner and code-review human diagnostics use a small, finite writer
 process for POSIX descriptors and Windows pipes. It never changes inherited FD
