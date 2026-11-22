@@ -196,6 +196,28 @@ if stage_modes:
         result['contracts'] = ['Contract from ' + stage_id]
     for finding in result.get('findings', []):
         finding['title'] = 'Finding from ' + stage_id
+if os.environ.get('FAKE_CODEX_EXISTING_OBSERVATION'):
+    base = prompt.split('Primary parent: ', 1)[1].splitlines()[0]
+    tree = prompt.split('Candidate tree: ', 1)[1].splitlines()[0]
+    original = subprocess.run(
+        ['git', 'show', base + ':primary.txt'],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    changed_path = os.environ.get('FAKE_CODEX_COMPARE_PATH', 'feature.py')
+    diff = subprocess.run(
+        ['git', 'diff', '--no-ext-diff', '--no-textconv', base, tree, '--', changed_path],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert original == 'Concurrent primary work.\n'
+    assert '+value = ' in diff
+    result['summary'] += (
+        '\n另案觀察 [' + stage_id + ']: primary.txt:1; '
+        'synthetic inherited concern, not a runtime defect claim. '
+        'Trigger and impact require investigation; parent evidence: '
+        + base + ':primary.txt = ' + original.strip()
+        + '; compared complete changed path ' + changed_path + ' to ' + tree
+        + '. Not a regression introduced by the synthetic candidate.'
+    )
 output.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 print(json.dumps({"type": "turn.completed"}))
 '''
@@ -1949,7 +1971,11 @@ def test_first_review_covers_existing_repository_and_verifies_before_merge(
     assert "exact repository-relative Git" in prompt
     assert "Verify additional references" in prompt
     assert ".venv/site-packages dependencies" in prompt
-    assert "defects introduced by this complete change" not in prompt
+    assert "Reading scope and merge-blocking scope are different." in prompt
+    assert (
+        "array is ONLY for concrete P0/P1/P2 defects introduced or worsened" in prompt
+    )
+    assert "An unchanged file alone does not prove unchanged behavior." in prompt
     _, receipt = _candidate_receipt(repo)
     assert receipt["schema_version"] == 3
     assert receipt["target"]["profile"] == "h2h-code-review-v3"
@@ -1957,6 +1983,74 @@ def test_first_review_covers_existing_repository_and_verifies_before_merge(
     assert receipt["baseline"] is None
     _assert_passed(repo.review("verify", "--index", mode="nonzero"))
     _assert_review_rounds(repo.calls(), True)
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_existing_observations_preserve_every_stage_and_exact_parent_access(
+    review_repository: ReviewRepository, incremental: bool
+) -> None:
+    """Exercise storage/verification, not the model's semantic classification."""
+    repo = review_repository
+    if incremental:
+        _merge_full_baseline(repo)
+        _next_candidate(repo)
+        repo.environment["FAKE_CODEX_COMPARE_PATH"] = "next.py"
+    else:
+        # The first full-review candidate may remove a parent path. Reviewers
+        # must still be able to read its immutable original, outside the manifest.
+        repo.git("rm", "primary.txt")
+    (repo.path / "large.py").write_text("value = 1\n" * 100000)
+    repo.git("add", "large.py")
+    repo.environment["FAKE_CODEX_EXISTING_OBSERVATION"] = "1"
+
+    _assert_passed(repo.review("run", "--index"))
+
+    _, receipt = _candidate_receipt(repo)
+    assert receipt["scope"] == ("incremental" if incremental else "repository")
+    stages = receipt["execution"]["stages"]
+    assert len(stages) > 2
+    assert stages[-1]["id"] == "integration"
+    run = Path(receipt["run_directory"])
+    for stage in stages:
+        raw = json.loads((run / stage["id"] / "result.json").read_text())
+        assert stage["review"] == raw
+        assert f"另案觀察 [{stage['id']}]" in raw["summary"]
+        assert "primary.txt:1" in raw["summary"]
+        assert receipt["target"]["parents"][0] in raw["summary"]
+        assert raw["findings"] == []
+        assert stage["review_sha256"] == review_plan.digest(review_plan.canonical(raw))
+    calls = repo.calls()
+    _assert_passed(repo.review("verify", "--index", mode="nonzero"))
+    assert repo.calls() == calls
+
+
+@pytest.mark.parametrize("mode", ["p2", "incomplete"])
+def test_existing_observations_cannot_hide_blocking_or_unresolved_work(
+    review_repository: ReviewRepository, mode: str
+) -> None:
+    repo = review_repository
+    repo.environment["FAKE_CODEX_EXISTING_OBSERVATION"] = "1"
+
+    outcome = repo.review("run", "--index", mode=mode)
+
+    _assert_blocked(outcome)
+    raw_results = [
+        json.loads(path.read_text())
+        for path in (repo.path / ".git/h2h-review/runs").glob("*/shard-*/result.json")
+    ]
+    assert raw_results
+    assert all("另案觀察" in result["summary"] for result in raw_results)
+    assert any(
+        result["verdict"] == ("changes_requested" if mode == "p2" else "incomplete")
+        for result in raw_results
+    )
+    if mode == "p2":
+        assert "Changed behavior loses data" in outcome.stderr
+    reviewer = code_review.Reviewer(repo.path)
+    assert not reviewer._receipt_path(reviewer._target(index=True)).exists()
+    calls = repo.calls()
+    _assert_blocked(repo.review("verify", "--index"))
+    assert repo.calls() == calls
 
 
 def test_merged_repository_review_supports_a_continuous_incremental_chain(

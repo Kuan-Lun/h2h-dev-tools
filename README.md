@@ -540,7 +540,7 @@ Documentation export rejects backslashes and colons in Git path components on
 every platform: those otherwise valid POSIX names have Windows separator, drive
 or alternate-stream semantics. Export also checks resolved destination containment
 and refuses filesystem name collisions instead of overwriting another document.
-Review reads the repository's root `AGENTS.md`; findings, incomplete results,
+Review reads the repository's root `AGENTS.md`; blocking findings, incomplete results,
 timeouts and invalid output block the merge and preserve the task branch.
 Each review invocation sets `notify=[]`: asynchronous completion notifications
 can otherwise outlive the CLI and violate its process ownership contract.
@@ -611,6 +611,20 @@ checked by the exact-tree classifier. Missing evidence, unreviewed code in that
 history, or changed review policy/implementation requires a new repository review.
 Aborted candidates and old difference-only receipts cannot establish a baseline.
 
+Reading the complete repository does not make all inherited problems part of the
+current task. Reviewers compare the immutable primary parent and candidate:
+`findings` contains defects introduced or worsened by that change, or an evidenced
+failure of an explicitly agreed delivery requirement. An unchanged file alone
+does not establish that changed callers preserve its behavior. If the comparison
+cannot resolve a potentially relevant defect, the review remains `incomplete`.
+Unrelated existing problems belong in each stage's `summary` under `另案觀察`, with
+location, trigger, impact, comparison evidence and unverified limits. Original
+stage summaries remain in the results and passing evidence; integration can refer
+to them without duplicating every observation. The author records their issue
+links or other dispositions after the complete round, following the repository's
+`AGENTS.md`. Reviewers do not publish issues. An issue never excuses a blocking
+defect, and old failing results cannot be edited into passing receipts.
+
 Review evidence in Git common metadata `h2h-review` binds the exact tree, ordered
 parents, scope, baseline, root policy, local review entry points and shared reviewer,
 process and classification sources. Snapshot reviewer parent initializers also
@@ -679,7 +693,7 @@ Fresh-context shards contain at most 32 units, each at most 64 KiB, packed into
 384 KiB assignments. Up to four registered owners run concurrently. Every shard
 can read any raw candidate source; all shards must return valid, complete results
 before a separate cross-module integration review (a single shard performs both
-roles). Any finding prevents passing evidence. Coverage is
+roles). Any blocking finding prevents passing evidence. Coverage is
 reviewer attestation, not machine proof that a model read or understood the bytes.
 The aggregate deadline includes planning, preflight, output validation and cleanup;
 it is never multiplied by shard count. Before review starts, packing budgets the

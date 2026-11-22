@@ -55,7 +55,7 @@
 - 同一任務內，同類原因連續兩次阻止整合時，先分析共同根因、工作範圍與修正邊界，再重試；
   不以增加 timeout、重跑次數或新驗證層代替處理根因。候選與驗收範圍固定後
   才做最終整合；再有變更時，明確判斷受影響證據，避免重跑無關的手動驗收。
-- 上述規則不豁免首次全專案審查、exact-candidate gate、已確認 finding 或
+- 上述規則不豁免首次全專案審查、exact-candidate gate、本次阻擋 finding 或
   process cleanup 要求。品質標準是完成必要修正並改善可維護性，不是無限追求
   完美；不得以工期或差異過大為由偽造通過或略過必要檢查。
 
@@ -64,6 +64,38 @@
 
 [small-cls]: https://google.github.io/eng-practices/review/developer/small-cls.html
 [review-standard]: https://google.github.io/eng-practices/review/reviewer/standard.html
+
+## Issue 與任務範圍
+
+- 每批開始先在既有 issue 或任務紀錄明列目標、包含與不包含的範圍、必要驗收及
+  完成條件。品質優先適用於這個範圍；完成不要求清空 repository 的 issue。
+  發現、登記或評估 issue 不代表接手實作，也不自動擴大目前任務。
+- 每個 issue 聚焦一個可獨立追蹤的問題，以未參與對話的接手者為讀者。標題說明
+  問題或預期成果，開頭交代受影響功能、現況與影響，不以對話經過代替背景。
+- Bug 記錄環境、重現方式、預期與實際結果；未能重現時明列已知證據與限制。
+  改善工作列明能力缺口、範圍與完成條件；調查工作列明待解問題、已知證據及
+  結束調查的判準，不把推測或未完成審查的線索寫成已確認故障。
+- 背景、範圍與可觀察的驗收結果各寫在適當位置，不重複清單或強制套滿模板。
+  只列有助接手的檔案、符號、版本及契約參照，區分既定需求、建議與待決事項；
+  一般實作選擇不包裝成使用者必須決定的取捨。發布前確認內容不靠聊天或不可
+  存取的暫存日誌也能理解，查核既有 issue 去重並保留必要證據與相依關係。
+- 有 GitHub 的 repository 以 GitHub Issues 為唯一問題追蹤來源；同一 repository
+  的其他 checkout 或 NAS 副本不另建一套。純本機 repository 使用納入版本控制的
+  `issues/`，每項一份檔案，保留穩定編號、狀態、範圍、驗收及證據；關閉後保留
+  紀錄。沒有已知問題時不建立空 issue。尚未發布的草稿須明列待發布狀態。
+- 審查須區分「本次阻擋缺陷」與「另案觀察」。前者是本次變更引入或惡化的問題，
+  或有具體證據顯示未達事先約定的交付條件；必須修復並驗證。既存且與本次交付
+  無關的缺陷、改善及安全疑慮另開 issue，不因發現它們就阻止本次合併或擴大工作。
+  分類須核對基準、受查版本、觸發條件及影響；無法釐清是否影響本次交付時，
+  明示未完成核對，不假稱無關。若需要改變已約定範圍，先說明因果關係及選項。
+- 完整保留原始審查結果。Review 的 `findings` 只表示本次阻擋缺陷；另案觀察留在
+  各階段 `summary`，記錄位置、觸發、影響、基準依據與未驗證限制。Reviewer 維持
+  唯讀，不發布 issue。主代理在本輪收尾前將觀察連到 GitHub issue／本機編號；
+  重複、已修復或不成立的項目記錄對應連結、修正版本或理由，逐項核對去向。
+  發布失敗保留待發布項目，不宣稱成功；不得刪掉 finding 或改寫舊 receipt 以通過。
+- 本次阻擋問題整批修復、相關檢查通過後再審查最終候選；沒有本次未解缺陷且
+  必要 gate 通過才合併。另案 issue 的優先順序與實作另行選定；不得把 backlog
+  清空當成這次工作的完成條件。
 
 ## 長時間命令與終態處理
 
@@ -282,9 +314,9 @@
 
 - 每輪審查須完成該輪既定的完整 scope，彙整各片與 integration 的完整問題清單。
   有效且完整的 finding 結果屬審查結論，不是執行或驗證失敗；不得因此取消其餘
-  分片，仍須依既有原始來源與跨片契約要求完成 integration。當輪有任何 finding
+  分片，仍須依既有原始來源與跨片契約要求完成 integration。當輪有任何本次阻擋 finding
   即不通過，不發布 passing receipt；完整清單整批修正並固定最終 candidate 後，
-  才重新審查。無 finding 且必要 gate 通過才合併；無 finding 時毋須為修改而修改。
+  才重新審查。無本次阻擋 finding 且必要 gate 通過才合併；無阻擋時毋須為修改而修改。
   首輪 full baseline、後續完整 incremental scope、exact tree／ordered parents、
   既有 ownership、coverage 與 deadline 均維持不變。
 - CLI 非零退出、無效 schema／身分／coverage、`incomplete`、逾時或 cleanup
@@ -302,13 +334,16 @@
   candidate 可立即由 gate verify；只有其 tree 與 ordered parents 真正成為
   primary first-parent 歷史中的 commit 後，才可作為後續 incremental baseline。
   Aborted candidate、側分支或舊版只有差異的 receipt 都不是此基準。
+  全專案是閱讀與交互作用的覆蓋範圍，不代表必須修復所有既存問題；相對 primary
+  parent 核對本次變更，依「Issue 與任務範圍」區分阻擋 finding 與另案觀察。
 - Baseline 到 primary 的 first-parent 鏈中，每個非文件 commit 都須有相符的
   passing review；純文件由既有 exact-tree classifier 證明。缺少或損壞證據、
   中間未審查程式變更、新 clone 無本機紀錄，或政策／reviewer dependency
   closure 改變，均重新全專案 review。有效基準及完整鏈存在時，才僅審查
   primary parent 到 candidate 的完整差異。Offline verify 不會自動啟動 review。
-- Reviewer 完整閱讀本檔，檢查完整差異與相關未修改程式碼，只回報具有具體
-  觸發條件、影響、檔案及行號的 P0/P1/P2 缺陷。特別檢查 process ownership、
+- Reviewer 完整閱讀本檔，檢查完整差異與相關未修改程式碼，只將具有具體
+  觸發條件、影響、檔案及行號的 P0/P1/P2 本次阻擋缺陷列入 `findings`；另案觀察
+  保留於 `summary`，不能以嚴重度代替與任務的因果關係。特別檢查 process ownership、
   timeout/cleanup、candidate evidence、snapshot closure、版本及依賴政策。
   格式偏好交由 lint；已授權 breaking change 本身不是缺陷。
 - Review 使用 read-only sandbox，不得修改、merge、執行 gates、啟動服務或
