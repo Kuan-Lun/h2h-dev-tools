@@ -283,6 +283,32 @@ Candidate tree: {target.tree}
 Ordered parents: {" ".join(target.parents)}
 Primary parent: {target.base}
 {boundary}
+Reading scope and merge-blocking scope are different. Full-repository coverage
+does not make every pre-existing defect part of the current task. The findings
+array is ONLY for concrete P0/P1/P2 defects introduced or worsened by this complete
+primary-parent-to-candidate change, or failure of an explicitly agreed delivery
+requirement evidenced by the candidate policy and task sources. A general quality
+rule is not evidence that the task includes repairing unrelated existing behavior.
+Before classifying a defect, compare the exact primary parent and candidate,
+including changed callers, configuration and tests around an unchanged function.
+Both Git objects are available in this repository: use bounded reads of
+git diff --no-ext-diff --no-textconv {target.base} {target.tree} -- <paths>
+and git show {target.base}:<path> as needed; do not use a moving branch or remote.
+An unchanged file alone does not prove unchanged behavior. Parent bytes establish
+the comparison, not completion of required candidate-source coverage. Describe
+the actual causal change or explicit delivery obligation in each finding.
+Preserve unrelated pre-existing problems in summary under '另案觀察', with source
+location, trigger, impact, parent comparison evidence and any unverified limits.
+If detail is already in a unit method or integration analysis, cite that exact
+entry rather than duplicate it; do not displace mandatory coverage or contracts.
+Known issue references may be retained, but do not create or update issues during
+this read-only review. The author records these observations after the full round.
+Observations do not change a completed pass into changes_requested. They remain
+in each original stage result and in passing evidence; the final integration
+summary need not repeat every stage's observation. Do not omit or downgrade a
+blocking finding merely because an issue exists. If a potentially task-relevant
+defect cannot be classified with the available evidence, report incomplete and
+explain the missing comparison instead of silently declaring it unrelated.
 The coordinator's exact manifest defines this invocation's mandatory units.
 Every unit includes immutable blob identity, mode and half-open byte range.
 For text, archive-text and gzip-text units, inline content is the exact raw
@@ -343,7 +369,8 @@ forwarded intact to integration; retain the meaningful cross-part obligations
 within this bound or report incomplete. General contracts are additional context.
 Inventory/hash proves identity, not semantic correctness or
 numerical recomputation. Embedded source is reviewed as source, not skipped.
-Report concrete P0/P1/P2 defects with conditions, consequences, file and lines.
+Report blocking P0/P1/P2 findings with conditions, consequences, file and lines;
+retain unrelated existing problems as the separately identified observations above.
 Do not demand backward compatibility against repository policy or report lint nits.
 No unit may be marked complete based only on a tool call count or hash.
 unit_reviews is your attestation, not machine proof that you read/understood bytes.
@@ -399,7 +426,7 @@ Finding a defect does not end the assignment: complete every assigned unit,
 integration duty and bounded contract before returning changes_requested.
 Use incomplete if those obligations cannot be completed, retaining known findings.
 Return the required JSON only, with Traditional Chinese summary/findings.
-Pass requires the entire assignment examined and no actionable finding.
+Pass requires the entire assignment examined and no unresolved blocking finding.
 """
     )
 
