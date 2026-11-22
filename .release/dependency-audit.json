@@ -1,16 +1,16 @@
 {
-  "checked_at": "2026-11-13T18:05:17+00:00",
+  "checked_at": "2026-11-22T11:07:08+00:00",
   "manifest_sha256": "aa20257539103591105ade67f7411e0eaff74f1ae5ce1d94a1bd0763f654f9c7",
   "node": [
     {
       "declared": ">=0.23.2",
-      "latest": "0.24.1",
+      "latest": "0.24.2",
       "latest_satisfies": true,
       "name": "markdownlint-cli2",
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.14.0",
+  "project_version": "0.14.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -114,7 +114,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.5",
+      "latest": "0.17.6",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -124,7 +124,7 @@
     }
   ],
   "review": {
-    "note": "2026-11-14 Asia/Taipei h2h-dev-tools 0.14.0 dependency review. Official PyPI/npm metadata rechecked at 2026-11-13T16:32:33.960816+00:00 reports the same latest stable versions as the 0.13.0 audit: hatchling1.33.0, distlib0.4.4, packaging26.3, build1.6.1, mypy2.4.1, pytest9.2.0, pytest-xdist3.8.0, ruff0.17.5 and markdownlint-cli2 0.24.1. All satisfy unchanged lower-only bounds; there is no out-of-bound latest stable candidate. Latest releases are not wholly yanked; Python metadata admits3.14. Distlib has no Requires-Python field but a3.14 classifier; xdist has>=3.9 without a3.14 classifier. Node latest requires>=22. Reviewed current official notes for each latest release: hatchling Python3.15 support, distlib launcher/archive/marker fixes, packaging marker/specifier fixes, build Windows symlink repair, mypy native parser/overload fixes, pytest plugin exit codes and hash-based caches, xdist loadscope ordering, Ruff closed-stderr/autofix/B008 changes and markdownlint dependency updates. No concrete incompatibility requiring a new upper bound/exclusion identified. This metadata/notes review performed no installs or runtime compatibility validation; candidate fast/full/artifact gates and native Windows validation remain separate. Declared minimum version metadata was not refetched in this incremental review. Sources: https://hatch.pypa.io/dev/history/hatchling/ ; https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib ; https://packaging.pypa.io/en/stable/changelog.html ; https://build.pypa.io/en/stable/changelog.html ; https://mypy.readthedocs.io/en/stable/changelog.html ; https://docs.pytest.org/en/stable/changelog.html#pytest-9-2-0-2026-10-27 ; https://pytest-xdist.readthedocs.io/en/latest/changelog.html ; https://raw.githubusercontent.com/astral-sh/ruff/0.17.5/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.1/CHANGELOG.md",
+    "note": "2026-11-22 Asia/Taipei h2h-dev-tools 0.14.1 dependency review. Official PyPI/npm metadata re-fetched at 2026-11-22T11:04:42.990134+00:00 reports hatchling 1.33.0, distlib 0.4.4, packaging 26.3, build 1.6.1, mypy 2.4.1, pytest 9.2.0, pytest-xdist 3.8.0, Ruff 0.17.6 and markdownlint-cli2 0.24.2. Compared with the 0.14.0 audit, Ruff and markdownlint-cli2 advanced; other declared latest stable versions are unchanged. All satisfy unchanged lower-only bounds, with no out-of-bound latest stable candidate. Latest Python artifacts are not wholly yanked and their Requires-Python metadata does not exclude 3.14; distlib has no Requires-Python but advertises 3.14, whereas xdist declares >=3.9 without a 3.14 classifier. npm latest requires Node >=22. Re-read official latest release notes: Hatchling adds Python 3.15 support; distlib corrects marker/launcher/archive handling; packaging adds range APIs and fixes requirements/markers while dropping Python 3.8; build repairs a Windows symlink regression; mypy defaults to native parsing and repairs overload handling; pytest changes plugin failure exit codes, parametrization keywords and assertion caches; xdist adds loadscope-order control; Ruff 0.17.6 fixes duplicate/assignment handling and changes F841 handling; markdownlint-cli2 updates dependencies. No concrete incompatibility requiring a new upper bound or exclusion was identified from this review. No dependency was installed/upgraded and no bound changed during this audit step; metadata/notes are not runtime compatibility evidence. Candidate fast/full/artifact checks and native Windows validation remain separate. Declared minimum-release metadata was not re-fetched, and transitive dependencies were not individually audited. Sources: https://hatch.pypa.io/dev/history/hatchling/ ; https://distlib.readthedocs.io/en/latest/overview.html#change-log-for-distlib ; https://packaging.pypa.io/en/stable/changelog.html ; https://build.pypa.io/en/stable/changelog.html ; https://mypy.readthedocs.io/en/stable/changelog.html ; https://docs.pytest.org/en/stable/changelog.html#pytest-9-2-0-2026-10-27 ; https://pytest-xdist.readthedocs.io/en/latest/changelog.html ; https://raw.githubusercontent.com/astral-sh/ruff/0.17.6/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.2/CHANGELOG.md",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
