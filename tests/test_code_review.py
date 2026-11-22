@@ -853,6 +853,92 @@ def test_review_metadata_path_rejects_an_unterminated_git_record(
         code_review.Reviewer(tmp_path)._directory()
 
 
+def test_first_review_metadata_query_uses_the_original_deadline(
+    review_repository: ReviewRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = review_repository
+    original = process.run_command
+    deadlines: list[float | None] = []
+
+    def run(phase: process.ProcessCommand, **options: Any) -> int:
+        if phase.argv[-1] == "--git-common-dir":
+            deadlines.append(options.get("hard_deadline"))
+        return original(phase, **options)
+
+    monkeypatch.setattr(process, "run_command", run)
+    reviewer = code_review.Reviewer(repo.path)
+    deadline = time.monotonic() + 30
+    with review_execution.within_deadline(deadline):
+        assert reviewer._directory() == repo.path / ".git/h2h-review"
+    assert deadlines == [deadline]
+
+
+@pytest.mark.parametrize("entry", ["managed", "standalone-pass", "standalone-p2"])
+def test_review_metadata_queries_do_not_escape_the_review_deadline(
+    review_repository: ReviewRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    repo = review_repository
+    if entry == "managed":
+        (repo.path / "scripts/check_change_scope.py").write_text("print('full')\n")
+        repo.git("add", "scripts/check_change_scope.py")
+    original = review_execution.git_output
+    deadlines: list[float | None] = []
+
+    def git_output(repository: Path, *arguments: str, **options: Any) -> bytes:
+        if arguments == ("rev-parse", "--path-format=absolute", "--git-common-dir"):
+            deadlines.append(review_execution.current_deadline())
+        return original(repository, *arguments, **options)
+
+    # Observe the real complete lifecycle without blocking a Git process. The
+    # original defect reaches admission or terminal cleanup with deadline=None.
+    with monkeypatch.context() as patch:
+        patch.setattr(review_execution, "git_output", git_output)
+        if entry == "managed":
+            with merge_command._review(
+                repo.path,
+                (
+                    sys.executable,
+                    "scripts/review-code.py",
+                    "run",
+                    "--index",
+                    "--timeout-seconds",
+                    "60",
+                ),
+                repo.environment | {"H2H_CODE_REVIEW_TIMEOUT_SECONDS": "60"},
+            ) as status:
+                assert status == 0
+        else:
+            patch.setenv("PATH", repo.environment["PATH"])
+            patch.setenv("FAKE_CODEX_STATE", str(repo.state))
+            patch.setenv("FAKE_CODEX_MODE", "p2" if entry.endswith("p2") else "pass")
+            patch.setattr(
+                sys,
+                "argv",
+                ["review-code.py", "run", "--index", "--timeout-seconds", "60"],
+            )
+            if entry.endswith("p2"):
+                with pytest.raises(SystemExit) as caught:
+                    code_review.main(repo.path)
+                assert caught.value.code == 1
+            else:
+                code_review.main(repo.path)
+
+    # Use a fresh verifier after the monitored run: offline verification has no
+    # online review deadline and must continue to work independently.
+    reviewer = code_review.Reviewer(repo.path)
+    target = reviewer._target(index=True)
+    assert not reviewer._pending_review_path(target).exists()
+    if entry.endswith("p2"):
+        assert not reviewer._receipt_path(target).exists()
+        _assert_blocked(repo.review("verify", "--index"))
+    else:
+        _assert_passed(repo.review("verify", "--index"))
+    _assert_review_rounds(repo.calls(), True)
+    assert deadlines and all(value is not None for value in deadlines), deadlines
+
+
 @pytest.mark.parametrize("index", [False, True])
 def test_review_verification_rejects_a_different_expected_tree(
     review_repository: ReviewRepository, index: bool

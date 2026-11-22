@@ -17,6 +17,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NoReturn, cast
 from uuid import uuid4
@@ -771,11 +772,18 @@ class Reviewer:
             target.tree, self._implementation(target.tree), require_candidate_match=True
         )
 
-    def _directory(self) -> Path:
+    @cached_property
+    def _metadata_directory(self) -> Path:
+        # Resolve once during the caller's bounded preparation. Admission and
+        # terminal marker cleanup must not start new Git queries after leaving
+        # that deadline context. Offline verification keeps its own instance.
         return (
             self._git_path("rev-parse", "--path-format=absolute", "--git-common-dir")
             / "h2h-review"
         )
+
+    def _directory(self) -> Path:
+        return self._metadata_directory
 
     def _receipt_path(self, target: Target) -> Path:
         return self._directory() / "receipts" / f"{target.key}.json"
